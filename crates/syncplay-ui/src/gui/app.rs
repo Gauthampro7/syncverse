@@ -466,7 +466,7 @@ impl eframe::App for SyncplayApp {
 
 /// Constructs `eframe::NativeOptions` configured for Wayland/X11 and Windows.
 pub fn create_native_options() -> eframe::NativeOptions {
-    let mut viewport = ViewportBuilder::default()
+    let viewport = ViewportBuilder::default()
         .with_title("Syncplay-Alt — Desktop Media Player")
         .with_inner_size([1280.0, 720.0])
         .with_min_inner_size([640.0, 360.0])
@@ -475,9 +475,7 @@ pub fn create_native_options() -> eframe::NativeOptions {
         .with_drag_and_drop(true);
 
     #[cfg(target_os = "linux")]
-    {
-        viewport = viewport.with_app_id("syncplay-alt");
-    }
+    let viewport = viewport.with_app_id("syncplay-alt");
 
     eframe::NativeOptions {
         viewport,
