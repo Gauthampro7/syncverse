@@ -19,3 +19,8 @@ Thumbs.db
 # Logs & temp files
 *.log
 /tmp/
+
+# Dependency caches and builds
+.deps/usr/
+.deps/.rpm_cache/
+
