@@ -5,22 +5,26 @@
 //! the SPSC ring buffer for GPU viewport rendering, streams normalized audio to `AutoAudioSink`
 //! over a decoupled asynchronous channel, and publishes atomic UI snapshots to `TripleBufferSnapshotExchange`.
 
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use syncplay_chat::ChatRecord;
 use syncplay_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncplay_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
 use syncplay_demux::{Demuxer, TrackType, UniversalDemuxer};
-use syncplay_ui::{PlayerCommand, PlayerUiSnapshot, TripleBufferSnapshotExchange};
+use syncplay_sync::{ClientNode, HostServer};
+use syncplay_ui::{PlayerCommand, PlayerUiSnapshot, RoomMember, TripleBufferSnapshotExchange, UiEvent};
 
 use crate::audio_sink::{AudioSink, AutoAudioSink};
 
 /// Commands delivered to the asynchronous audio streaming thread.
-enum AudioWorkerCommand {
+pub enum AudioWorkerCommand {
     /// Normalized interleaved f32 PCM samples ready for soundcard delivery.
     Samples(Vec<f32>),
     /// Pauses audio playback output.
@@ -151,10 +155,33 @@ impl PlaybackSession {
     }
 }
 
+/// Active watch-party role and networking engine.
+enum WatchPartyRole {
+    None,
+    Host {
+        server: HostServer,
+        _room: String,
+        local_username: String,
+        client_names: HashMap<SocketAddr, String>,
+        last_state_broadcast: Instant,
+        last_member_update: Instant,
+        last_probe_sent: Instant,
+    },
+    Client {
+        client: ClientNode,
+        _room: String,
+        local_username: String,
+        host_username: String,
+        last_probe_sent: Instant,
+        last_member_update: Instant,
+    },
+}
+
 /// Runs the background playback worker loop in a dedicated OS thread.
-fn run_playback_worker(
+pub fn run_playback_worker(
     command_rx: Receiver<PlayerCommand>,
     audio_tx: Sender<AudioWorkerCommand>,
+    event_tx: Sender<UiEvent>,
     exchange: Arc<TripleBufferSnapshotExchange>,
     video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
     clock: Arc<MasterClock>,
@@ -166,6 +193,7 @@ fn run_playback_worker(
     let mut speed: f64 = 1.0;
     let mut overflow_frame: Option<VideoFrameRGBA> = None;
     let mut last_snapshot_instant = Instant::now();
+    let mut party_role = WatchPartyRole::None;
 
     while running.load(Ordering::Relaxed) {
         // 1. Drain all pending UI commands
@@ -183,6 +211,11 @@ fn run_playback_worker(
                             let now = Instant::now();
                             clock.seek_to(0.0, now);
                             clock.set_state(now, PlaybackState::Playing);
+
+                            if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                                server.set_media_state(0, speed, false);
+                                let _ = server.broadcast_room_state();
+                            }
 
                             // Initial snapshot publication
                             let snap = PlayerUiSnapshot {
@@ -205,12 +238,18 @@ fn run_playback_worker(
                 }
                 PlayerCommand::TogglePause => {
                     let now = Instant::now();
-                    if clock.is_playing() {
-                        clock.set_state(now, PlaybackState::Paused);
-                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                    } else {
+                    let will_play = !clock.is_playing();
+                    if will_play {
                         clock.set_state(now, PlaybackState::Playing);
                         let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    } else {
+                        clock.set_state(now, PlaybackState::Paused);
+                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                    }
+                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                        let current_pts = clock.current_pts(now).max(0.0) as u64;
+                        server.set_media_state(current_pts, speed, !will_play);
+                        let _ = server.broadcast_room_state();
                     }
                 }
                 PlayerCommand::Stop => {
@@ -223,6 +262,10 @@ fn run_playback_worker(
                     if let Some(ref mut sess) = session {
                         sess.seek(0, &video_ring);
                     }
+                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                        server.set_media_state(0, speed, true);
+                        let _ = server.broadcast_room_state();
+                    }
                 }
                 PlayerCommand::Seek(target_ms) => {
                     overflow_frame = None;
@@ -232,10 +275,26 @@ fn run_playback_worker(
                         let now = Instant::now();
                         clock.seek_to(target_ms as f64, now);
                     }
+                    match &mut party_role {
+                        WatchPartyRole::Host { server, .. } => {
+                            server.set_media_state(target_ms, speed, !clock.is_playing());
+                            let _ = server.broadcast_room_state();
+                        }
+                        WatchPartyRole::Client { client, .. } => {
+                            let _ = client.send_seek(target_ms);
+                        }
+                        WatchPartyRole::None => {}
+                    }
                 }
                 PlayerCommand::SetSpeed(spd) => {
                     speed = spd.clamp(0.2, 4.0);
-                    clock.reanchor(Instant::now(), speed);
+                    let now = Instant::now();
+                    clock.reanchor(now, speed);
+                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                        let current_pts = clock.current_pts(now).max(0.0) as u64;
+                        server.set_media_state(current_pts, speed, !clock.is_playing());
+                        let _ = server.broadcast_room_state();
+                    }
                 }
                 PlayerCommand::SetVolume(vol) => {
                     volume = vol.clamp(0.0, 1.0);
@@ -243,13 +302,202 @@ fn run_playback_worker(
                 PlayerCommand::ToggleMute => {
                     is_muted = !is_muted;
                 }
-                PlayerCommand::SendChatMessage(_) | PlayerCommand::ExecuteSlashCommand(_) => {
-                    // Watch-party chat commands routed through syncplay-chat
+                PlayerCommand::SendChatMessage(text) | PlayerCommand::ExecuteSlashCommand(text) => {
+                    let now = Instant::now();
+                    let wall_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let media_ms = clock.current_pts(now).max(0.0) as u64;
+
+                    let sender_name = match &party_role {
+                        WatchPartyRole::Host { local_username, .. } => local_username.clone(),
+                        WatchPartyRole::Client { local_username, .. } => local_username.clone(),
+                        WatchPartyRole::None => std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+                    };
+
+                    let rec = ChatRecord::new_text(wall_ms, media_ms, [0u8; 16], sender_name, &text);
+                    let wire_bytes = rec.to_network_bytes();
+
+                    match &mut party_role {
+                        WatchPartyRole::Host { server, .. } => {
+                            let _ = server.broadcast_chat_message(&wire_bytes);
+                        }
+                        WatchPartyRole::Client { client, .. } => {
+                            let _ = client.send_chat_message_with_pts(&wire_bytes, media_ms);
+                        }
+                        WatchPartyRole::None => {}
+                    }
+
+                    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
-                PlayerCommand::HostParty { .. }
-                | PlayerCommand::ConnectParty { .. }
-                | PlayerCommand::DisconnectParty => {
-                    // Handled in watch-party networking integration
+                PlayerCommand::HostParty { port, room, username } => {
+                    let bind_addr = format!("0.0.0.0:{}", port);
+                    match HostServer::bind(&bind_addr) {
+                        Ok(mut server) => {
+                            let now = Instant::now();
+                            let current_pts = clock.current_pts(now).max(0.0) as u64;
+                            let is_paused = !clock.is_playing();
+                            server.set_media_state(current_pts, speed, is_paused);
+
+                            let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
+                                username: username.clone(),
+                                is_local: true,
+                                is_host: true,
+                                rtt_ms: 0.0,
+                            }]));
+
+                            let wall_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let rec = ChatRecord::new_text(
+                                wall_ms,
+                                current_pts,
+                                [0u8; 16],
+                                "System".to_string(),
+                                &format!("★ Hosting watch party in room '{}' on port {}", room, port),
+                            );
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+
+                            party_role = WatchPartyRole::Host {
+                                server,
+                                _room: room,
+                                local_username: username,
+                                client_names: HashMap::new(),
+                                last_state_broadcast: now,
+                                last_member_update: now,
+                                last_probe_sent: now,
+                            };
+                        }
+                        Err(e) => {
+                            eprintln!("[ERROR] Failed to bind HostServer on {}: {}", bind_addr, e);
+                            let wall_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let rec = ChatRecord::new_text(
+                                wall_ms,
+                                0,
+                                [0u8; 16],
+                                "System".to_string(),
+                                &format!("❌ Failed to host room on port {}: {}", port, e),
+                            );
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                    }
+                }
+                PlayerCommand::ConnectParty { addr, room, username } => {
+                    let target_addr: Option<SocketAddr> = addr
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut iter| iter.next());
+
+                    if let Some(target) = target_addr {
+                        let client_id = (SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u32)
+                            .unwrap_or(1))
+                            & 0x7FFFFFFF;
+
+                        match ClientNode::bind("0.0.0.0:0", target, client_id) {
+                            Ok(mut client) => {
+                                let _ = client.send_ntp_probe();
+
+                                let now = Instant::now();
+                                let wall_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let current_pts = clock.current_pts(now).max(0.0) as u64;
+
+                                let join_rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    current_pts,
+                                    [0u8; 16],
+                                    username.clone(),
+                                    &format!("👋 Joined room '{}'", room),
+                                );
+                                let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
+
+                                let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
+                                    username: username.clone(),
+                                    is_local: true,
+                                    is_host: false,
+                                    rtt_ms: 0.0,
+                                }]));
+
+                                let rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    current_pts,
+                                    [0u8; 16],
+                                    "System".to_string(),
+                                    &format!("🔗 Connected to {} (Room '{}')", addr, room),
+                                );
+                                let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+
+                                party_role = WatchPartyRole::Client {
+                                    client,
+                                    _room: room,
+                                    local_username: username,
+                                    host_username: "Host".to_string(),
+                                    last_probe_sent: now,
+                                    last_member_update: now,
+                                };
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR] Failed to bind ClientNode to {}: {}", addr, e);
+                                let wall_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    0,
+                                    [0u8; 16],
+                                    "System".to_string(),
+                                    &format!("❌ Failed to connect to {}: {}", addr, e),
+                                );
+                                let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                            }
+                        }
+                    } else {
+                        eprintln!("[ERROR] Invalid address format: {}", addr);
+                        let wall_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let rec = ChatRecord::new_text(
+                            wall_ms,
+                            0,
+                            [0u8; 16],
+                            "System".to_string(),
+                            &format!("❌ Could not resolve address: {}", addr),
+                        );
+                        let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                    }
+                }
+                PlayerCommand::DisconnectParty => {
+                    party_role = WatchPartyRole::None;
+                    let local_name = std::env::var("USER").unwrap_or_else(|_| "You".to_string());
+                    let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
+                        username: local_name,
+                        is_local: true,
+                        is_host: true,
+                        rtt_ms: 0.0,
+                    }]));
+                    let wall_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let rec = ChatRecord::new_text(
+                        wall_ms,
+                        clock.current_pts(Instant::now()).max(0.0) as u64,
+                        [0u8; 16],
+                        "System".to_string(),
+                        "Disconnected from watch party.",
+                    );
+                    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
             }
         }
@@ -352,7 +600,179 @@ fn run_playback_worker(
             }
         }
 
-        // 3. Publish atomic telemetry snapshot to UI (~40 Hz)
+        // 3. Process watch-party networking and synchronize clocks
+        match &mut party_role {
+            WatchPartyRole::Host {
+                server,
+                _room: _,
+                local_username,
+                client_names,
+                last_state_broadcast,
+                last_member_update,
+                last_probe_sent,
+            } => {
+                // Poll incoming UDP datagrams
+                while let Ok(Some((_, sender_addr))) = server.poll_and_process() {
+                    did_work = true;
+                    client_names
+                        .entry(sender_addr)
+                        .or_insert_with(|| format!("Peer-{}", sender_addr.port()));
+                }
+
+                // Process pending chat messages
+                let chat_msgs = server.poll_chat_messages();
+                for msg in chat_msgs {
+                    let rec = ChatRecord::from_chat_message(&msg);
+                    for addr in server.clients().keys() {
+                        if !client_names.contains_key(addr)
+                            || client_names.get(addr).map(|s| s.starts_with("Peer-")).unwrap_or(false)
+                        {
+                            client_names.insert(*addr, rec.sender_name.clone());
+                        }
+                    }
+                    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                }
+
+                let now = Instant::now();
+                // Send NTP probes to clients (~1 Hz) to measure RTT
+                if now.duration_since(*last_probe_sent) >= Duration::from_millis(1000) {
+                    *last_probe_sent = now;
+                    let targets: Vec<SocketAddr> = server.clients().keys().copied().collect();
+                    for target in targets {
+                        let _ = server.send_ntp_probe_to(target);
+                    }
+                }
+
+                // Periodic room state broadcast (~4 Hz)
+                if now.duration_since(*last_state_broadcast) >= Duration::from_millis(250) {
+                    *last_state_broadcast = now;
+                    let current_pts = clock.current_pts(now).max(0.0) as u64;
+                    let is_paused = !clock.is_playing();
+                    server.set_media_state(current_pts, speed, is_paused);
+                    let _ = server.broadcast_room_state();
+                }
+
+                // Periodic member list update (~2 Hz)
+                if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
+                    *last_member_update = now;
+                    let mut members = vec![RoomMember {
+                        username: local_username.clone(),
+                        is_local: true,
+                        is_host: true,
+                        rtt_ms: 0.0,
+                    }];
+
+                    for (addr, session) in server.clients() {
+                        if session.last_seen.elapsed() < Duration::from_secs(15) {
+                            let name = client_names
+                                .get(addr)
+                                .cloned()
+                                .unwrap_or_else(|| format!("Peer-{}", session.client_id));
+                            members.push(RoomMember {
+                                username: name,
+                                is_local: false,
+                                is_host: false,
+                                rtt_ms: session.rtt_ms as f64,
+                            });
+                        }
+                    }
+                    let _ = event_tx.send(UiEvent::RoomMembersUpdated(members));
+                }
+            }
+            WatchPartyRole::Client {
+                client,
+                _room: _,
+                local_username,
+                host_username,
+                last_probe_sent,
+                last_member_update,
+            } => {
+                // Poll incoming UDP datagrams
+                while let Ok(Some(_)) = client.poll_and_process() {
+                    did_work = true;
+                }
+
+                // Process pending chat messages
+                let chat_msgs = client.poll_chat_messages();
+                for msg in chat_msgs {
+                    let rec = ChatRecord::from_chat_message(&msg);
+                    if *host_username == "Host" && rec.sender_name != *local_username {
+                        *host_username = rec.sender_name.clone();
+                    }
+                    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                }
+
+                let now = Instant::now();
+                // Send NTP probes to host (~1 Hz)
+                if now.duration_since(*last_probe_sent) >= Duration::from_millis(1000) {
+                    *last_probe_sent = now;
+                    let _ = client.send_ntp_probe();
+                }
+
+                // Synchronize playback timeline from host's RoomState
+                if let Some(room_state) = client.latest_room_state().cloned() {
+                    let theta_hat = client.filtered_offset_nanos().unwrap_or(0.0);
+                    let now_nanos = client.current_local_nanos();
+                    let target_pts_ms = room_state.compute_target_media_pts(now_nanos, theta_hat);
+                    let local_pts_ms = clock.current_pts(now).max(0.0) as u64;
+
+                    // Sync pause/play state
+                    if room_state.is_paused && clock.is_playing() {
+                        clock.set_state(now, PlaybackState::Paused);
+                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                    } else if !room_state.is_paused && !clock.is_playing() {
+                        clock.set_state(now, PlaybackState::Playing);
+                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    }
+
+                    // Tri-zone drift sync:
+                    let drift_ms = (target_pts_ms as i64 - local_pts_ms as i64).abs();
+                    if drift_ms > 1500 {
+                        // Zone 3: Hard seek
+                        if let Some(ref mut sess) = session {
+                            sess.seek(target_pts_ms, &video_ring);
+                            clock.seek_to(target_pts_ms as f64, now);
+                        }
+                    } else if drift_ms > 15 && clock.is_playing() {
+                        // Zone 2: Micro-speed steering
+                        if let Some(corr) = client.update_pll(0.025) {
+                            let steered_speed = corr.speed_multiplier.clamp(0.96, 1.04);
+                            clock.reanchor(now, steered_speed);
+                        }
+                    } else if drift_ms <= 15 && clock.is_playing() {
+                        // Zone 1: Deadband - normal speed
+                        if (speed - 1.0).abs() > 1e-4 {
+                            speed = 1.0;
+                            clock.reanchor(now, 1.0);
+                        }
+                    }
+                }
+
+                // Periodic member list update (~2 Hz)
+                if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
+                    *last_member_update = now;
+                    let rtt = client.median_rtt_ms() as f64;
+                    let members = vec![
+                        RoomMember {
+                            username: local_username.clone(),
+                            is_local: true,
+                            is_host: false,
+                            rtt_ms: 0.0,
+                        },
+                        RoomMember {
+                            username: host_username.clone(),
+                            is_local: false,
+                            is_host: true,
+                            rtt_ms: rtt,
+                        },
+                    ];
+                    let _ = event_tx.send(UiEvent::RoomMembersUpdated(members));
+                }
+            }
+            WatchPartyRole::None => {}
+        }
+
+        // 4. Publish atomic telemetry snapshot to UI (~40 Hz)
         let now = Instant::now();
         if now.duration_since(last_snapshot_instant) >= Duration::from_millis(25) {
             last_snapshot_instant = now;
@@ -360,23 +780,52 @@ fn run_playback_worker(
             let dur_ms = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
             let is_playing = clock.is_playing();
 
+            let (peer_count, rtt_nanos, offset_nanos, phase_err_nanos, pll_ratio) = match &party_role {
+                WatchPartyRole::Host { server, .. } => {
+                    let peers = (server.clients().len() + 1).min(u16::MAX as usize) as u16;
+                    let rtt_ns = server.max_rtt_ms() * 1_000_000;
+                    (peers, rtt_ns, 0i64, 0i64, (speed * 65536.0) as u32)
+                }
+                WatchPartyRole::Client { client, .. } => {
+                    let rtt_ns = client.median_rtt_nanos() as u64;
+                    let offset_ns = client.filtered_offset_nanos().unwrap_or(0.0) as i64;
+                    let phase_err_ms = if let Some(room) = client.latest_room_state() {
+                        let target = room.compute_target_media_pts(
+                            client.current_local_nanos(),
+                            offset_ns as f64,
+                        );
+                        (target as i64) - (current_pts_ms.max(0.0) as i64)
+                    } else {
+                        0
+                    };
+                    (
+                        2u16,
+                        rtt_ns,
+                        offset_ns,
+                        phase_err_ms * 1_000_000,
+                        (clock.speed() * 65536.0) as u32,
+                    )
+                }
+                WatchPartyRole::None => (1u16, 0, 0, 0, (speed * 65536.0) as u32),
+            };
+
             let snap = PlayerUiSnapshot {
                 monotonic_timestamp: now.elapsed().as_nanos() as u64,
                 media_position_pts: (current_pts_ms.max(0.0) * 1_000_000.0) as u64,
                 media_duration_pts: dur_ms * 1_000_000,
                 playback_state: if is_playing { 1 } else { 0 },
-                network_rtt_nanos: 0,
-                clock_offset_nanos: 0,
-                phase_error_nanos: 0,
-                pll_speed_ratio_q16: (speed * 65536.0) as u32,
-                peer_count: 1,
-                peers_ready: 1,
+                network_rtt_nanos: rtt_nanos,
+                clock_offset_nanos: offset_nanos,
+                phase_error_nanos: phase_err_nanos,
+                pll_speed_ratio_q16: pll_ratio,
+                peer_count,
+                peers_ready: peer_count,
                 room_sequence: 1,
             };
             exchange.publish(snap);
         }
 
-        // 4. Rate-limit thread execution
+        // 5. Rate-limit thread execution
         if !did_work {
             thread::sleep(Duration::from_millis(10));
         } else {
@@ -394,6 +843,7 @@ pub fn launch_desktop_player_app(
     let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
     let (command_tx, command_rx) = channel::<PlayerCommand>();
     let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
     let running = Arc::new(AtomicBool::new(true));
 
     // Spawn dedicated audio sink worker thread
@@ -417,6 +867,7 @@ pub fn launch_desktop_player_app(
             run_playback_worker(
                 command_rx,
                 audio_tx,
+                event_tx,
                 thread_exchange,
                 thread_video_ring,
                 thread_clock,
@@ -432,6 +883,7 @@ pub fn launch_desktop_player_app(
         video_ring,
         clock,
         command_tx,
+        event_rx,
     );
 
     // Stop background workers on exit

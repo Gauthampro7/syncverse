@@ -163,3 +163,154 @@ fn test_cli_party_subcommand_flag_parsing() {
     assert!(stdout_demo.contains("demo"));
     assert!(stdout_demo.contains("UDP loopback verified: 8 NTP probes"));
 }
+
+#[test]
+fn test_playback_workers_watch_party_network_and_chat_e2e() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use syncplay_clock::{MasterClock, PlaybackState, SpscRingBuffer};
+    use syncplay_codecs::VideoFrameRGBA;
+    use syncplay_core::{run_playback_worker, AudioWorkerCommand};
+    use syncplay_ui::{PlayerCommand, TripleBufferSnapshotExchange, UiEvent};
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    // 1. Setup Host Worker
+    let (host_cmd_tx, host_cmd_rx) = channel::<PlayerCommand>();
+    let (host_audio_tx, _host_audio_rx) = channel::<AudioWorkerCommand>();
+    let (host_event_tx, host_event_rx) = channel::<UiEvent>();
+    let host_exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let host_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let host_clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let host_running = Arc::clone(&running);
+
+    let host_thread = thread::spawn(move || {
+        run_playback_worker(
+            host_cmd_rx,
+            host_audio_tx,
+            host_event_tx,
+            host_exchange,
+            host_ring,
+            host_clock,
+            host_running,
+        );
+    });
+
+    // 2. Setup Client Worker
+    let (client_cmd_tx, client_cmd_rx) = channel::<PlayerCommand>();
+    let (client_audio_tx, _client_audio_rx) = channel::<AudioWorkerCommand>();
+    let (client_event_tx, client_event_rx) = channel::<UiEvent>();
+    let client_exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let client_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let client_clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let client_running = Arc::clone(&running);
+
+    let client_thread = thread::spawn(move || {
+        run_playback_worker(
+            client_cmd_rx,
+            client_audio_tx,
+            client_event_tx,
+            client_exchange,
+            client_ring,
+            client_clock,
+            client_running,
+        );
+    });
+
+    // Pick an available high port for testing
+    let test_port = 19888;
+    host_cmd_tx
+        .send(PlayerCommand::HostParty {
+            port: test_port,
+            room: "glupa".to_string(),
+            username: "GauthamHost".to_string(),
+        })
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+
+    // Client connects to 127.0.0.1:19888
+    client_cmd_tx
+        .send(PlayerCommand::ConnectParty {
+            addr: format!("127.0.0.1:{}", test_port),
+            room: "glupa".to_string(),
+            username: "AliceClient".to_string(),
+        })
+        .unwrap();
+
+    // Allow workers to exchange UDP packets
+    let mut host_saw_client = false;
+    let mut client_saw_host = false;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(3) {
+        while let Ok(evt) = host_event_rx.try_recv() {
+            if let UiEvent::RoomMembersUpdated(members) = evt {
+                if members.iter().any(|m| m.username.contains("AliceClient")) {
+                    host_saw_client = true;
+                }
+            }
+        }
+        while let Ok(evt) = client_event_rx.try_recv() {
+            if let UiEvent::RoomMembersUpdated(members) = evt {
+                if members.iter().any(|m| m.username.contains("GauthamHost") || m.is_host) {
+                    client_saw_host = true;
+                }
+            }
+        }
+        if host_saw_client && client_saw_host {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(host_saw_client, "Host must observe connecting client in RoomMembersUpdated");
+    assert!(client_saw_host, "Client must observe host in RoomMembersUpdated");
+
+    // 3. Test two-way chat messaging
+    // Client sends message
+    client_cmd_tx
+        .send(PlayerCommand::SendChatMessage("Hey host, testing watch party!".to_string()))
+        .unwrap();
+
+    // Host sends message
+    host_cmd_tx
+        .send(PlayerCommand::SendChatMessage("Welcome to the party, Alice!".to_string()))
+        .unwrap();
+
+    let mut host_received_client_msg = false;
+    let mut client_received_host_msg = false;
+    let start_chat = std::time::Instant::now();
+
+    while start_chat.elapsed() < Duration::from_secs(3) {
+        while let Ok(evt) = host_event_rx.try_recv() {
+            if let UiEvent::NewChatRecord(rec) = evt {
+                let text = String::from_utf8_lossy(&rec.payload);
+                if text.contains("Hey host, testing watch party!") {
+                    host_received_client_msg = true;
+                }
+            }
+        }
+        while let Ok(evt) = client_event_rx.try_recv() {
+            if let UiEvent::NewChatRecord(rec) = evt {
+                let text = String::from_utf8_lossy(&rec.payload);
+                if text.contains("Welcome to the party, Alice!") {
+                    client_received_host_msg = true;
+                }
+            }
+        }
+        if host_received_client_msg && client_received_host_msg {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(host_received_client_msg, "Host must receive client's chat message over UDP");
+    assert!(client_received_host_msg, "Client must receive host's chat message over UDP");
+
+    // Clean shutdown
+    running.store(false, Ordering::Relaxed);
+    let _ = host_thread.join();
+    let _ = client_thread.join();
+}

@@ -265,12 +265,6 @@ impl ConnectPartyDialog {
 
                             sidebar.members = vec![
                                 RoomMember {
-                                    username: "Host".to_string(),
-                                    is_local: false,
-                                    is_host: true,
-                                    rtt_ms: 12.0,
-                                },
-                                RoomMember {
                                     username: self.username.clone(),
                                     is_local: true,
                                     is_host: false,

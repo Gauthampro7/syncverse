@@ -1,7 +1,7 @@
 //! Main desktop graphical player application and eframe lifecycle coordinator.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use syncplay_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncplay_codecs::VideoFrameRGBA;
 
 use crate::command::PlayerCommand;
+use crate::event::UiEvent;
 use crate::gui::controls::{ControlsBarAction, ControlsBarState, PlaybackControlsBar};
 use crate::gui::dialogs::{AboutDialog, ConnectPartyDialog, HostPartyDialog, ShortcutsDialog};
 use crate::gui::drag_drop::DragDropHandler;
@@ -35,6 +36,7 @@ pub struct SyncplayApp {
     video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
     clock: Arc<MasterClock>,
     command_tx: Sender<PlayerCommand>,
+    event_rx: Receiver<UiEvent>,
     chat_records: Vec<ChatRecord>,
     current_file: Option<PathBuf>,
 }
@@ -47,6 +49,7 @@ impl SyncplayApp {
         video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
         clock: Arc<MasterClock>,
         command_tx: Sender<PlayerCommand>,
+        event_rx: Receiver<UiEvent>,
         initial_file: Option<PathBuf>,
     ) -> Self {
         let mut app = Self {
@@ -63,6 +66,7 @@ impl SyncplayApp {
             video_ring,
             clock,
             command_tx,
+            event_rx,
             chat_records: Vec::new(),
             current_file: None,
         };
@@ -92,6 +96,19 @@ impl eframe::App for SyncplayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx: Context = ui.ctx().clone();
         let now = Instant::now();
+
+        // 0. Drain events from playback and watch-party networking runtime
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                UiEvent::NewChatRecord(record) => {
+                    self.chat_records.push(record);
+                    self.sidebar_state.autoscroll = true;
+                }
+                UiEvent::RoomMembersUpdated(members) => {
+                    self.sidebar_state.members = members;
+                }
+            }
+        }
 
         // 1. Check window close request
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -491,6 +508,7 @@ pub fn run_desktop_player(
     video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
     clock: Arc<MasterClock>,
     command_tx: Sender<PlayerCommand>,
+    event_rx: Receiver<UiEvent>,
 ) -> Result<(), eframe::Error> {
     let native_options = create_native_options();
 
@@ -504,6 +522,7 @@ pub fn run_desktop_player(
                 video_ring,
                 clock,
                 command_tx,
+                event_rx,
                 initial_file,
             )))
         }),
@@ -516,6 +535,7 @@ pub fn run_desktop_gui(initial_file: Option<PathBuf>) -> Result<(), eframe::Erro
     let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
     let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
     let (command_tx, _command_rx) = channel();
+    let (_event_tx, event_rx) = channel();
 
     run_desktop_player(
         initial_file,
@@ -523,5 +543,6 @@ pub fn run_desktop_gui(initial_file: Option<PathBuf>) -> Result<(), eframe::Erro
         video_ring,
         clock,
         command_tx,
+        event_rx,
     )
 }

@@ -96,6 +96,8 @@ pub struct HostServer {
     scheduled_unpause_server_ms: Option<u64>,
     chat_messages: Vec<ChatMessagePayload>,
     next_chat_seq: u32,
+    pending_probes: HashMap<u32, (SocketAddr, u64)>,
+    next_probe_id: u32,
 }
 
 impl HostServer {
@@ -115,6 +117,8 @@ impl HostServer {
             scheduled_unpause_server_ms: None,
             chat_messages: Vec::new(),
             next_chat_seq: 1,
+            pending_probes: HashMap::new(),
+            next_probe_id: 1,
         })
     }
 
@@ -155,6 +159,17 @@ impl HostServer {
             client.rtt_ms = rtt_ms;
             client.last_seen = Instant::now();
         }
+    }
+
+    /// Sends an NTP probe request to a specific client address to measure round-trip time.
+    pub fn send_ntp_probe_to(&mut self, target: SocketAddr) -> Result<u32, SyncError> {
+        let probe_id = self.next_probe_id;
+        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+        let t1 = self.current_server_nanos();
+        self.pending_probes.insert(probe_id, (target, t1));
+        let packet = WirePacket::ntp_request(probe_id, t1);
+        self.transport.send_packet(&packet, target)?;
+        Ok(probe_id)
     }
 
     /// Returns the maximum RTT across all connected clients: $\max_i(\text{RTT}_i)$.
@@ -207,6 +222,18 @@ impl HostServer {
                     let t3 = self.current_server_nanos();
                     let resp = WirePacket::ntp_response(req.probe_id, req.t1_client_send_ns, t2, t3);
                     self.transport.send_packet(&resp, addr)?;
+                }
+                PacketPayload::NtpProbeResponse(resp) => {
+                    if let Some((target, t1)) = self.pending_probes.remove(&resp.probe_id) {
+                        if target == addr {
+                            let t4 = self.current_server_nanos();
+                            let server_delay = t4.saturating_sub(t1);
+                            let client_proc = resp.t3_server_send_ns.saturating_sub(resp.t2_server_recv_ns);
+                            let rtt_ns = server_delay.saturating_sub(client_proc);
+                            let rtt_ms = rtt_ns / 1_000_000;
+                            self.update_client_rtt(addr, rtt_ms);
+                        }
+                    }
                 }
                 PacketPayload::BarrierReady(ready) => {
                     if ready.session_id == self.barrier_session_id {
@@ -586,6 +613,12 @@ impl ClientNode {
                     PacketPayload::ChatMessage(chat) => {
                         self.chat_messages.push(chat.clone());
                     }
+                    PacketPayload::NtpProbeRequest(req) => {
+                        let t2 = self.current_local_nanos();
+                        let t3 = self.current_local_nanos();
+                        let resp = WirePacket::ntp_response(req.probe_id, req.t1_client_send_ns, t2, t3);
+                        let _ = self.transport.send_packet(&resp, self.host_addr);
+                    }
                     _ => {}
                 }
             }
@@ -625,6 +658,15 @@ impl ClientNode {
         let packet = WirePacket::chat_message(seq, wall_ms, media_pts_ms, payload.to_vec());
         self.transport.send_packet(&packet, self.host_addr)?;
         Ok(seq)
+    }
+
+    /// Sends an in-band seek command event to the host server.
+    pub fn send_seek(&mut self, target_pts_ms: u64) -> Result<(), SyncError> {
+        let event_id = self.next_probe_id;
+        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+        let packet = WirePacket::seek_command(event_id, target_pts_ms);
+        self.transport.send_packet(&packet, self.host_addr)?;
+        Ok(())
     }
 
     /// Evaluates the discrete PI PLL speed controller against the reference timeline.

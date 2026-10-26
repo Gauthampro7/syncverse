@@ -6,6 +6,7 @@
 pub mod command;
 pub mod debouncer;
 pub mod error;
+pub mod event;
 pub mod gui;
 pub mod osd;
 pub mod overlay;
@@ -17,6 +18,7 @@ pub mod terminal;
 pub use command::PlayerCommand;
 pub use debouncer::SeekDebouncer;
 pub use error::UiError;
+pub use event::UiEvent;
 pub use gui::{
     controls_style, create_native_options, is_supported_media, run_desktop_gui, run_desktop_player,
     ControlsBarAction, ControlsBarState, DragDropHandler, FileDialogManager, PlaybackControlsBar,
