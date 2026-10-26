@@ -1,0 +1,88 @@
+name: Windows Release & Installer
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Release & Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Install FFmpeg Development Libraries
+        run: |
+          # Download prebuilt Windows FFmpeg shared dev libraries
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dist
+          $ffmpegPath = Resolve-Path ffmpeg-dist\ffmpeg-master-*-win64-gpl-shared
+          echo "FFMPEG_DIR=$ffmpegPath" >> $env:GITHUB_ENV
+          echo "$ffmpegPath\bin" >> $env:GITHUB_PATH
+
+      - name: Compile Release Binary
+        run: |
+          cargo build --release --bin syncplay-alt
+
+      - name: Stage Runtime DLLs
+        run: |
+          # Copy FFmpeg shared DLLs next to syncplay-alt.exe so the installer bundles them
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" -Destination "target\release\" -Force
+
+      - name: Build Inno Setup Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
+
+      - name: Compute SHA-256 Checksums
+        run: |
+          Get-FileHash -Path target\windows-dist\*.exe -Algorithm SHA256 | Out-File -FilePath target\windows-dist\SHA256SUMS.txt
+          Get-Content target\windows-dist\SHA256SUMS.txt
+
+      - name: Upload Windows Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            target/windows-dist/*.exe
+            target/windows-dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/windows-dist/*.exe
+            target/windows-dist/SHA256SUMS.txt
+          generate_release_notes: true
