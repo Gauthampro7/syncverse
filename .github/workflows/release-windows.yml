@@ -72,6 +72,8 @@ jobs:
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dist
           $ffmpegDir = (Get-Item "ffmpeg-dist\ffmpeg-master-*-win64-gpl-shared").FullName
           Write-Host "Resolved FFMPEG_DIR: $ffmpegDir"
+          # Remove hwcontext_cuda.h to prevent bindgen from parsing unreleased CUDA structs in FFmpeg master
+          Remove-Item "$ffmpegDir\include\libavutil\hwcontext_cuda.h" -Force -ErrorAction SilentlyContinue
           "FFMPEG_DIR=$ffmpegDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "$ffmpegDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 

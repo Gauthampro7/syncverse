@@ -94,7 +94,7 @@ impl MasterClock {
                         let elapsed_secs = if now >= anchor_wall {
                             now.duration_since(anchor_wall).as_secs_f64()
                         } else {
-                            -anchor_wall.duration_since(now).as_secs_f64()
+                            0.0
                         };
                         anchor_pts + elapsed_secs * speed * 1000.0
                     }
