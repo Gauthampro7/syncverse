@@ -1,15 +1,15 @@
 # Progress — explorer_survey_1
 
 ## Liveness
-Last visited: 2026-10-24T23:08:00Z
+Last visited: 2026-10-26T11:23:30Z
 
 ## Status
-- [x] Initialized DISPATCH.md and BRIEFING.md
-- [x] Inspected system environment: Fedora Linux 44, Intel Core Ultra 9 185H (AVX2/FMA/BMI2), user-level rustup capability
-- [x] Section 1: EBML / Matroska standard analysis, VINT bitmasking, element taxonomy & synthetic test vector design
-- [x] Section 2: ISOBMFF / MP4 standard analysis, box hierarchy, table parsing (stts, stsc, stsz, stco/co64) & synthetic test vector design
-- [x] Section 3: Baseline video/audio codec primitives, planar YUV420p layout, fixed-point RGB conversion formula & SIMD acceleration
-- [x] Section 4: Master Monotonic Clock design, audio/video/network drift mathematics & lock-free SPSC ring-buffer architecture
-- [x] Section 5: Synthesize and write `analysis.md`
-- [x] Section 6: Produce structured 5-component `handoff.md`
-- [x] Section 7: Update `BRIEFING.md` & send completion message to orchestrator
+- [x] Initialized DISPATCH.md and BRIEFING.md for Phase 5 Survey
+- [x] Investigated `crates/syncplay-sync` wire packets, serialization, transport, and peer state
+- [x] Investigated `crates/syncplay-common`, `crates/syncplay-core`, and `crates/syncplay-ui` touchpoints
+- [x] Analyzed wire packet extensions for media metadata and readiness (Opcode 0x09 / 0x0A)
+- [x] Analyzed barrier unpause gate integration and force-play override
+- [x] Discovered opcode negative test collision fixtures in `chat_transport_adversarial.rs` and `watch_party_transport.rs`
+- [x] Wrote comprehensive technical survey in `analysis.md`
+- [x] Wrote structured 5-component handoff report in `handoff.md`
+- [x] Updated BRIEFING.md & sending completion message to parent coordinator

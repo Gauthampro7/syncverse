@@ -1,22 +1,26 @@
 # Progress Log — worker_m3
 
-Last visited: 2026-10-25T01:05:00Z
+Last visited: 2026-10-26T11:49:00Z
 
-## Status
-- [x] Initialized workspace and working directories.
-- [x] Installed stable Rust toolchain (rustc 1.99.1, cargo 1.99.1).
-- [x] Created root `Cargo.toml` and 8 crate scaffolds under `crates/`.
-- [x] Implemented `syncplay-common` (MediaTime, WallTime, ByteReader, BitReader, Crc32) + unit tests passing.
-- [x] Implemented `syncplay-demux` (EBML VINT, Matroska SimpleBlock 24h math, ISOBMFF 32/64-bit box parser, sample table resolver, 48B EBML & 132B MP4 synthetic vectors) + unit tests passing.
-- [x] Implemented `syncplay-codecs` (64B aligned YUV420p frames with SIMD tail padding, packed RGBA, pure-Rust Q8 BT.601/BT.709 color space converter) + unit tests passing.
-- [x] Implemented `syncplay-clock` (Monotonic clock, SeqLock C0 continuity, 128B cache-line aligned SPSC ring buffer, reorder buffer) + unit tests passing.
-- [x] Implemented `syncplay-sync` (NTP 4-timestamp exchange, RFC 5905 filter with effective dispersion and watchdog, critically damped discrete PI PLL controller, barrier unpause) + unit tests passing.
-- [x] Implemented `syncplay-chat` (Append-only binary log `syncplay_chat.bin`, crash recovery scanner with false-sync resilience, inverted index FTS with CJK unigrams/bigrams, slash commands, export) + unit tests passing.
-- [x] Implemented `syncplay-ui` (72B `PlayerUiSnapshot`, lock-free triple buffer exchange, 10Hz scrubber debouncer, Alpha8 font atlas) + unit tests passing.
-- [x] Implemented `syncplay-core` (Runtime coordinator binding all subsystems and Telemetry Aggregator).
-- [x] Verified `cargo check --workspace --all-targets` (0 warnings).
-- [x] Verified `cargo test --workspace -- --nocapture` (42/42 tests pass).
-- [x] Verified `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings).
-- [x] Verified `./scripts/audit_dependencies.sh` (0 forbidden dependencies).
-- [x] Verified empirical challenge test suite (0 errors, 0 failures).
-- [x] Completed `handoff.md` and notified orchestrator.
+## Phase 5 Milestone 3 Status
+- [x] Received dispatch assignment and verified requirements in `ORIGINAL_REQUEST.md` (R4, R3) and `explorer_survey_3/handoff.md`.
+- [x] Confirmed zero banned dependencies and existing baseline test suite passing.
+- [x] Updated BRIEFING.md with situational awareness, key constraints, and architecture decisions.
+- [x] Implemented `crates/syncplay-chat/src/announcements.rs`:
+  - [x] Standardized formatting for 5 room events (media loaded, ready/unready, paused, resumed, seeked) + unpause gate waiting.
+  - [x] Timecode formatting helpers (`format_timecode` producing `HH:MM:SS` or `MM:SS`, `format_timecode_hms`).
+  - [x] Typed event enum (`RoomAnnouncementEvent`) with Display and format support.
+  - [x] Dual-temporal chat record creation helpers (`create_record`, `create_record_from_event`).
+- [x] Exposed `pub mod announcements;` and re-exported `RoomAnnouncement` and helpers in `crates/syncplay-chat/src/lib.rs`.
+- [x] Unit & integration tests in `crates/syncplay-chat/src/announcements.rs`:
+  - [x] Timecode formatting tests (sub-hour, multi-hour, hms).
+  - [x] Formatting exactness across all announcement types.
+  - [x] Typed event enum Display tests.
+  - [x] Binary log persistence with `0xAA55` framing and CRC32 verification.
+  - [x] Log file storage write and `ChatRecoveryScanner` crash recovery roundtrip.
+  - [x] Inverted index full-text search indexing and query retrieval (`"loaded"`, `"ready"`, `"paused"`, `"resumed"`, `"seeked"`, `"waiting"`, multi-term Boolean AND).
+- [x] Verified `cargo check -p syncplay-chat --all-targets` (0 warnings).
+- [x] Verified `cargo test -p syncplay-chat` (22/22 unit tests, 17/17 integration tests pass).
+- [x] Verified `cargo clippy -p syncplay-chat --all-targets -- -D warnings` (0 warnings).
+- [x] Verified `./scripts/audit_dependencies.sh` (0 banned dependencies).
+- [ ] Complete `handoff.md` and message orchestrator.

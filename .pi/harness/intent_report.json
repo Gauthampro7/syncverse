@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-26T08:02:06Z",
+  "timestamp": "2026-10-26T12:53:03Z",
   "total_intents": 8,
   "passed_intents": 8,
   "compliance_score_percent": 100.0,
@@ -10,7 +10,7 @@
       "name": "Universal Media Compatibility & Zero Monolithic Player / Database Wrappers",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.386,
+      "duration_s": 0.212,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -19,7 +19,7 @@
       "name": "Deterministic High-RTT Network Clock Synchronization",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.034,
+      "duration_s": 0.017,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -28,7 +28,7 @@
       "name": "Barrier-Synchronized Two-Phase Commit Unpause",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.036,
+      "duration_s": 0.018,
       "invariants_count": 3,
       "error_snippet": null
     },
@@ -37,7 +37,7 @@
       "name": "Crash-Resilient Dual-Temporal Local Smart Chat",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.039,
+      "duration_s": 0.019,
       "invariants_count": 6,
       "error_snippet": null
     },
@@ -46,7 +46,7 @@
       "name": "Desktop Graphical UI Architecture & Decoupled Lock-Free Responsiveness",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.749,
+      "duration_s": 0.724,
       "invariants_count": 7,
       "error_snippet": null
     },
@@ -55,7 +55,7 @@
       "name": "Zero-Allocation Fixed-Point Color Transformation",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.376,
+      "duration_s": 0.218,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -64,7 +64,7 @@
       "name": "Robust Container Demuxing & Timescale Integer Arithmetic",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.372,
+      "duration_s": 0.215,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -73,7 +73,7 @@
       "name": "OpenSpec Traceability & Anti-Drift Guarantee",
       "success": true,
       "exit_code": 0,
-      "duration_s": 14.333,
+      "duration_s": 11.264,
       "invariants_count": 4,
       "error_snippet": null
     }

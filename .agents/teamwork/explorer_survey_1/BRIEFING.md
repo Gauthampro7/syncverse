@@ -1,7 +1,7 @@
-# BRIEFING — 2026-10-24T23:03:00Z
+# BRIEFING — 2026-10-26T11:23:00Z
 
 ## Mission
-Conduct an exhaustive technical survey and specification for zero-dependency container demuxing (EBML/MKV, MP4/ISOBMFF), baseline codec primitives & YUV420p-RGB conversion, and master monotonic A/V clock & lock-free ring buffer pipeline.
+Investigate network wire protocol and peer state in crates/syncplay-sync, crates/syncplay-common, and crates/syncplay-core. Analyze extending wire packet protocol for peer media metadata, peer readiness state, and barrier unpause gate integration.
 
 ## 🔒 My Identity
 - Archetype: explorer
@@ -9,6 +9,8 @@ Conduct an exhaustive technical survey and specification for zero-dependency con
 - Working directory: /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1
 - Original parent: 1a21f3c9-f57a-4ad4-b306-97b4ba0e698e
 - Milestone: Phase 0 Survey (Subsystems 1, 2, 3)
+- Phase 5 Parent: ad8bd8cc-722a-48fc-97f9-4ff7f3c97d5d
+- Phase 5 Milestone: Phase 5 Survey (Network Wire Protocol & Peer State)
 
 ## 🔒 Key Constraints
 - Read-only investigation — do NOT implement application source code.
@@ -16,31 +18,31 @@ Conduct an exhaustive technical survey and specification for zero-dependency con
 - ZERO external media/codec libraries allowed (`ffmpeg`, `libav*`, `gstreamer`, `mpv`, `vlc`, `symphonia`, `dav1d`).
 - Prioritize authoritative standards: EBML RFC 8794, Matroska specs, ISO/IEC 14496-12 ISOBMFF.
 - Deliver analysis.md and handoff.md; notify parent via send_message.
+- Phase 5 Constraints: Read-only investigation on network wire protocol & peer state, media metadata, readiness state, unpause gate. Do NOT implement application code.
 
 ## Current Parent
-- Conversation ID: 1a21f3c9-f57a-4ad4-b306-97b4ba0e698e
-- Updated: 2026-10-24T23:03:00Z
+- Conversation ID: ad8bd8cc-722a-48fc-97f9-4ff7f3c97d5d
+- Updated: 2026-10-26T11:23:00Z
 
 ## Investigation State
-- **Explored paths**: `ORIGINAL_REQUEST.md`, `orchestrator_1/progress.md`, CPU SIMD topology (`/proc/cpuinfo`, `lscpu`), RFC 8794 EBML spec, Matroska format spec, ISO/IEC 14496-12 ISOBMFF spec, BT.601 / BT.709 colorimetry.
+- **Explored paths**: `ORIGINAL_REQUEST.md`, `crates/syncplay-sync/src/wire.rs`, `crates/syncplay-sync/src/transport.rs`, `crates/syncplay-sync/src/barrier.rs`, `crates/syncplay-core/src/playback_runtime.rs`, `crates/syncplay-core/src/coordinator.rs`, `crates/syncplay-ui/src/gui/sidebar.rs`, `crates/syncplay-ui/src/snapshot.rs`, `crates/syncplay-ui/src/event.rs`, `crates/syncplay-sync/tests/chat_transport_adversarial.rs`, `crates/syncplay-sync/tests/watch_party_transport.rs`.
 - **Key findings**:
-  - EBML VINT has distinct handling for Element ID (marker bit preserved) vs Element Size (marker bit cleared; all 1s indicates unknown size).
-  - ISOBMFF box hierarchy requires traversing `moov/trak/mdia/minf/stbl` table structures (`stts`, `stsc`, `stsz`, `stco`/`co64`) to calculate exact file byte offsets and PTS timestamps.
-  - Pure-Rust integer fixed-point $Q8$ conversion matches BT.601/BT.709 standard colorimetry within $<0.1\%$ error and avoids floating-point overhead.
-  - Intel Core Ultra 9 185H host has AVX2/FMA/BMI2 with 22 execution threads, enabling single-core SIMD color conversion of 1080p in $< 1.1\,\text{ms}$.
-  - Master Monotonic Clock requires seamless re-anchoring on PLL speed changes to avoid PTS discontinuities.
-  - SPSC lock-free ring buffer requires 128-byte alignment between head and tail to eliminate false sharing.
-- **Unexplored areas**: Subsystems 4, 5, 6 (covered by parallel peers `explorer_survey_2` and `explorer_survey_3`).
+  - SPNT wire format uses 12-byte header with table-driven CRC32. Existing opcodes 0x01..0x06 and 0x08.
+  - Opcodes 0x07, 0x09, 0x0A are tested as unknown in `chat_transport_adversarial.rs:303` and `watch_party_transport.rs:483`. Test fixtures must be updated when allocating opcodes.
+  - Recommended opcode: `0x09` for unified `PeerStatus` (or 0x09 `PeerMedia` + 0x0A `PeerReadiness`).
+  - `ClientSession.is_ready` is currently overloaded for transient barrier pre-roll decode. Must separate `is_user_ready: bool` (persistent watch readiness) from `barrier_preroll_ready: bool`.
+  - Unpause gate must hook into `playback_runtime.rs` on `PlayerCommand::TogglePause`, halting playback and alerting room if unready peers exist unless Host `ForcePlay` override is active.
+- **Unexplored areas**: None within the Phase 5 survey scope for wire protocol, peer state, and unpause gate.
 
 ## Key Decisions Made
-- Specified exact byte arrays for synthetic EBML header (47 bytes) and synthetic MP4 header (132 bytes) for in-tree unit tests without external assets.
-- Specified $Q8$ fixed-point integer color space formulas for BT.601 and BT.709 with branchless clamping.
-- Specified acquire-release memory ordering and 128-byte cache line alignment for SPSC ring buffers.
-- Structured crate boundaries into `syncplay-demux`, `syncplay-codecs`, `syncplay-clock`, and `syncplay-common`.
+- Recommended unified `PeerStatus` (0x09) as primary wire packet for robust, idempotent UDP state replication over WAN links.
+- Specified strict separation of user social readiness from barrier decode pre-roll readiness.
+- Specified file matching algorithm (duration $\pm 2$s and/or case-insensitive basename match).
+- Outlined complete unpause gate logic and barrier unpause execution.
 
 ## Artifact Index
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/DISPATCH.md` — Initial dispatch message
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/BRIEFING.md` — Agent persistent state and memory
+- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/DISPATCH.md` — Dispatch message
+- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/BRIEFING.md` — Persistent state and memory
 - `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/progress.md` — Liveness heartbeat and milestone tracking
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/analysis.md` — Exhaustive survey report (EBML, ISOBMFF, Codec/Color, Clock/SPSC)
+- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/analysis.md` — Exhaustive Phase 5 technical survey analysis report
 - `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/handoff.md` — Structured 5-component handoff report

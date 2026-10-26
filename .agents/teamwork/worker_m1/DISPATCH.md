@@ -1,41 +1,69 @@
-## 2026-10-24T23:10:33Z
-You are worker_m1 (teamwork_preview_worker).
-Your Working Directory: /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/
-Project Root: /home/gautham/syncplay-alt
-Authoritative User Request: /home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md
-Project Scope Document: /home/gautham/syncplay-alt/.agents/teamwork/orchestrator_1/PROJECT.md
+# Dispatch: Worker M1 (Auto-Update Detection & Notification)
 
-### Reference Technical Analyses
-Read the following authoritative survey reports before authoring the specifications:
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_1/analysis.md` (Demuxers, Codecs, Clock)
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_2/analysis.md` (Network Sync Protocol, UI/OSD Architecture)
-- `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/analysis.md` (Smart Chat, Binary Log, Inverted Index, Multi-Crate Workspace)
+## Objective
+Implement Milestone 1 of Syncplay-Alt Phase 5:
+1. Add `ureq` (with `tls`, `json`) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`.
+2. Implement `crates/syncplay-ui/src/gui/updater.rs`:
+   - Query GitHub Releases API asynchronously in background thread: `https://api.github.com/repos/Gauthampro7/syncplay-desktop-preview/releases/latest`.
+   - Set 5.0 second timeout and User-Agent: `syncplay-alt/<version>`.
+   - Semver parsing and normalization (`v0.1.2` -> `0.1.2`), compare against `CARGO_PKG_VERSION` (`0.1.1`).
+   - Rate limit (HTTP 403/429 with reset time), timeout, offline error handling without panicking.
+   - Action handler to open browser to download URL or release page (`open_browser_url` / `ctx.open_url`).
+3. In `crates/syncplay-ui/src/event.rs`:
+   - Add `UpdateAvailable { latest_version: String, release_url: String, download_url: Option<String> }`.
+   - Add `UpdateChecked { is_latest: bool, current_version: String }`.
+4. In `crates/syncplay-ui/src/gui/app.rs`:
+   - Top notification banner: render when `update_info` is Some and not dismissed:
+     - Title `"🚀 Update Available: v{latest}"`
+     - Action buttons: `"📥 Download"` (opens direct installer or release page), `"Release Page"`
+     - `"✖ Dismiss"` button to hide banner
+   - Help menu: add `"🔄 Check for Updates..."` item triggering manual check.
+5. Unit tests:
+   - Semver tag normalization & comparison (`v0.1.2` > `0.1.1`, `0.2.0` > `0.1.9`, invalid tags).
+   - Rate limiting and offline error handling.
 
-### Write Ownership
-You exclusively own and must create the following specification files under `/home/gautham/syncplay-alt/openspec/`:
-- `openspec/project.md`: Master project specification, architecture philosophy, zero-external-codec invariants, subsystem contracts, and data-flow diagrams.
-- `openspec/specs/demuxer/spec.md`: Container demuxing (EBML/MKV VINT, Element IDs, Clusters, SimpleBlocks, and ISOBMFF/MP4 32/64-bit box hierarchy `moov/trak/mdia/minf/stbl/stsd/stts/stsc/stsz/stco/co64`).
-- `openspec/specs/codecs/spec.md`: Baseline frame representations (YUV420p planar, RGB24/RGBA32 packed), pure-Rust Q8 fixed-point integer color space converter ($Y'CbCr \to R'G'B'$ limited range) with SIMD-friendly layout.
-- `openspec/specs/av-pipeline/spec.md`: Master monotonic clock, continuous PTS re-anchoring across rate shifts, and 128-byte cache-aligned lock-free SPSC ring-buffer pipeline.
-- `openspec/specs/sync-engine/spec.md`: NTP 4-timestamp exchange with RFC 5905 sliding-window minimum RTT filtering, deterministic reference timeline equation, tri-zone PLL micro-speed drift controller ($r \in [0.96, 1.04]$ via discrete PI controller with $K_p=0.05, K_i=0.000625$), and two-phase barrier-synchronized unpause ($<10\text{ ms}$ alignment).
-- `openspec/specs/smart-chat/spec.md`: In-player smart chat, dual-temporal coordinates ($t_{wall}, t_{media}$), custom crash-resilient append-only binary log (`syncplay_chat.bin`) with `0xAA55` framing and CRC32, in-memory inverted index FTS, timeline overlay window query, and slash-command grammar (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
-- `openspec/specs/ui-renderer/spec.md`: Native player UI & OSD overlay architecture, lock-free triple-buffered atomic snapshot state model (`PlayerUiSnapshot`), floating chat bubbles, sync badges, and VLC-grade responsiveness (< 16ms input latency).
-- `openspec/changes/`: Ordered, dependency-graphed multi-phase implementation roadmap:
-  * `openspec/changes/001-demuxer-bitstream.md`
-  * `openspec/changes/002-codecs-presentation.md`
-  * `openspec/changes/003-clock-pipeline.md`
-  * `openspec/changes/004-network-sync-protocol.md`
-  * `openspec/changes/005-smart-chat-storage.md`
-  * `openspec/changes/006-ui-osd-renderer.md`
+## Files Owned Exclusively
+- `crates/syncplay-ui/Cargo.toml`
+- `crates/syncplay-ui/src/gui/updater.rs`
+- `crates/syncplay-ui/src/gui/app.rs`
+- `crates/syncplay-ui/src/gui/mod.rs`
+- `crates/syncplay-ui/src/event.rs`
 
-### Strict Quality & Formatting Rules
-1. Every capability spec under `openspec/specs/<subsystem>/spec.md` MUST contain formal `### Requirement: <Name>` blocks using RFC-2119 keywords (`MUST`, `SHALL`, `MUST NOT`, `SHOULD`).
-2. Every requirement MUST be paired with testable `#### Scenario: <Name>` blocks with concrete `Given`, `When`, `Then` acceptance criteria.
-3. Every change proposal under `openspec/changes/` MUST contain an ordered dependency graph, deliverables, affected crates, and concrete verification commands.
+## References
+- User request: `/home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md` (read section `## 2026-10-26T11:12:06Z`)
+- Project spec: `/home/gautham/syncplay-alt/PROJECT.md`
+- Survey report: `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md`
+- Survey report: `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_2/handoff.md`
 
-### Mandatory Integrity Warning
+## Invariants & Warnings
+- Zero compiler warnings (`#![deny(warnings)]`).
+- Clippy clean: `cargo clippy -p syncplay-ui -- -D warnings`.
+- Zero banned dependencies (no `mpv`, `vlc`, `sqlite`, `rocksdb`).
+- Non-blocking: NEVER execute blocking network I/O on UI rendering thread.
+
+MANDATORY INTEGRITY WARNING:
 DO NOT CHEAT. All implementations must be genuine. DO NOT hardcode test results, create dummy/facade implementations, or circumvent the intended task. A teamwork_preview_auditor will independently verify your work. Integrity violations WILL be detected and your work WILL be rejected.
 
-### Deliverables & Reporting
-Write your progress in `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/progress.md` and complete a full handoff report in `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md`.
-Notify the orchestrator via `send_message` when all specification files have been created and verified.
+## Completion Criteria
+Run `cargo check -p syncplay-ui`, `cargo test -p syncplay-ui`, and `cargo clippy -p syncplay-ui -- -D warnings`. All must pass with 0 warnings.
+Write your completion report in `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md` and message back.
+
+
+## 2026-10-26T11:27:33Z
+You are Worker M1 for Phase 5 Milestone 1 (Auto-Update Detection & Notification).
+Your identity: worker_m1
+Your working directory: /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/
+Read your dispatch assignment in /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/DISPATCH.md and the authoritative user request in /home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md (under section `## 2026-10-26T11:12:06Z`). Also read the survey report in /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md.
+
+Implement Milestone 1:
+- Add `ureq` (with `tls`, `json`) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`.
+- Implement `crates/syncplay-ui/src/gui/updater.rs`: async background querying of GitHub Releases API, semver normalization & comparison, rate-limit/offline/timeout error handling, URL launcher.
+- Implement top notification banner in `crates/syncplay-ui/src/gui/app.rs` with 1-click download/release page button and Dismiss button.
+- Add "Check for Updates..." to Help menu.
+- Unit tests for semver comparison, update checking, error handling.
+
+MANDATORY INTEGRITY WARNING:
+DO NOT CHEAT. All implementations must be genuine. DO NOT hardcode test results, create dummy/facade implementations, or circumvent the intended task. A teamwork_preview_auditor will independently verify your work. Integrity violations WILL be detected and your work WILL be rejected.
+
+Run builds and tests: `cargo check -p syncplay-ui`, `cargo test -p syncplay-ui`, and `cargo clippy -p syncplay-ui -- -D warnings`.
+Produce your handoff report at /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md and message back when complete.

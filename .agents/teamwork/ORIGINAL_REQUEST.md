@@ -228,3 +228,89 @@ Revise and update all repository documentation and verification specifications t
 - [ ] Workspace compiles with zero compiler warnings (cargo check --workspace --all-targets).
 - [ ] All tests pass under cargo test --workspace.
 - [ ] Updated dependency audit and intent verification scripts succeed without errors.
+
+
+## 2026-10-26T11:12:06Z
+
+# Teamwork Project Prompt
+
+Syncplay-Alt Watch-Party Social & Auto-Update Polish: Implement auto-update detection from GitHub releases, peer media status display with file matching diagnostics, peer readiness state with a strict auto-pause playback gate, and synchronized room activity announcements.
+
+Working directory: `/home/gautham/syncplay-alt`
+Integrity mode: development
+
+## Requirements
+
+### R1. Auto-Update Detection & Notification
+- Implement an asynchronous, non-blocking background update checker querying GitHub Releases API (`https://api.github.com/repos/Gauthampro7/syncplay-desktop-preview/releases/latest`).
+- Run the check on application startup and provide a manual "Check for Updates..." entry under the Help menu.
+- When a newer version tag (e.g., `v0.1.2` > `v0.1.1`) is detected:
+  - Display a persistent notification banner at the top of the UI announcing the new version.
+  - Provide a 1-click action button that opens the GitHub Release download page or directly downloads the OS installer (`.exe` on Windows, binary on Linux).
+  - Provide a "Dismiss" button to hide the banner.
+- Gracefully handle network timeouts, rate-limiting, and offline states without blocking UI rendering or playback.
+
+### R2. Peer Media Status & File Match Diagnostics
+- Transmit loaded media metadata across connected peers via UDP wire packets:
+  - File name (base name without full path).
+  - Duration in milliseconds.
+  - File size in bytes.
+- Render loaded media information for each peer in the watch-party sidebar:
+  - Display peer's loaded file name and formatted duration (`HH:MM:SS`).
+  - If peer has no media loaded, display `[⏳ No file loaded]`.
+  - Compare local media against each peer's media and display a diagnostic badge:
+    - `[Match ✔]` in green if duration matches within ±2s and/or filename matches.
+    - `[⚠️ Mismatch]` in amber/red if duration or filename differs significantly.
+- When opening or changing a media file, immediately update local state and broadcast the new media status to all room peers.
+
+### R3. Peer Readiness & Strict Playback Unpause Gate
+- Provide an interactive "Ready to Watch" toggle checkbox in the watch-party sidebar for the local user, defaulting to ready once media is loaded.
+- Synchronize readiness state (`Ready` vs `Not Ready`) across all room peers via UDP wire packets.
+- In the sidebar members list, display a badge for each peer: `[✓ Ready]` (green) or `[⏳ Not Ready]` (amber).
+- Implement a strict playback unpause gate:
+  - When Play / Unpause is triggered (via spacebar, play button, or room command), check if any connected peer has no media loaded or is `Not Ready`.
+  - If unready peers exist:
+    - Keep playback paused (or pause immediately).
+    - Display an on-screen alert / notification: e.g. `"⏸ Paused: Waiting for [Username(s)] to load media and get ready..."`.
+    - Broadcast a system announcement to the room chat.
+  - Provide a "Force Play" bypass button/toggle for the host to allow playback anyway if a peer is idle or AFK.
+
+### R4. Automated Room Activity Announcements
+- Automatically format and broadcast synchronized chat system announcements for key room events:
+  - Media loaded: `"🎬 {user} loaded '{filename}' ({duration})"`
+  - Readiness changed: `"✓ {user} is ready to watch"` or `"⏳ {user} is not ready"`
+  - Playback paused: `"⏸ {user} paused playback"`
+  - Playback resumed: `"▶ {user} resumed playback"`
+  - Seeking: `"⏩ {user} seeked to {timecode}"`
+
+### R5. Verification, Zero Warnings & Push
+- Maintain strict zero compiler warnings (`#![deny(warnings)]`) and zero clippy warnings (`cargo clippy --workspace --all-targets -- -D warnings`).
+- Enforce invariant prohibitions: zero external monolithic player wrappers (`mpv`, `vlc`) and zero external database engines (`sqlite`, `rocksdb`).
+- All existing tests and new unit/integration tests covering the updater, media status wire exchange, and readiness unpause gating must pass.
+- Commit all code cleanly with descriptive git commit messages and push to `origin/main`.
+
+## Acceptance Criteria
+
+### Auto-Update
+- [ ] Version comparison correctly identifies when a remote release tag is newer than `CARGO_PKG_VERSION`.
+- [ ] UI shows notification banner when update is available, with clickable action to download/view release.
+- [ ] Failure to reach GitHub API does not hang or crash the player.
+
+### Peer Media & Readiness
+- [ ] Sidebar lists loaded file name and duration for all connected peers.
+- [ ] Visual badge clearly distinguishes matching files (`[Match ✔]`), mismatched files (`[⚠️ Mismatch]`), and unloaded files (`[⏳ No file loaded]`).
+- [ ] Readiness toggle updates local state and synchronizes immediately to remote peers.
+
+### Playback Unpause Gate
+- [ ] Attempting to unpause while a peer has no media or is unready halts playback and alerts the room.
+- [ ] Host can force playback if desired via a "Force Play" override.
+- [ ] Once all peers have loaded media and toggled ready, unpausing proceeds smoothly.
+
+### Room Announcements
+- [ ] File loading, ready toggling, play/pause, and seeking produce clear system messages in the chat log.
+
+### Codebase Cleanliness & Git Push
+- [ ] `./scripts/audit_dependencies.sh` passes with 0 violations.
+- [ ] `cargo check --workspace --all-targets` and `cargo test --workspace` pass with 0 errors.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes with 0 warnings.
+- [ ] Git commit and push succeeds.

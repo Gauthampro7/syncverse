@@ -1,21 +1,14 @@
 # Progress — explorer_survey_2
 
 ## Current Status
-Last visited: 2026-10-24T23:07:30Z
-Current state: Completed Technical Survey & Handoff
+Last visited: 2026-10-26T11:24:00Z
+Current state: Completed Phase 5 Survey & Generated Handoff Report
 
 ## Task Breakdown
-- [x] Initial dispatch processing, BRIEFING.md initialization
-- [x] Section 1: Long-Distance High-RTT Synchronization Protocol Specification
-  - [x] 1.1 NTP 4-timestamp exchange, RTT, and clock offset equations
-  - [x] 1.2 Outlier filtering: sliding-window minimum filter & Marzullo dispersion
-  - [x] 1.3 Deterministic reference timeline equation ($t_{master}(t)$ to $t_{local}(t)$)
-  - [x] 1.4 Phase-Locked Loop (PLL) micro-speed drift correction & discrete PI controller math
-  - [x] 1.5 Barrier-synchronized Ready/Commit Unpause protocol state machine
-- [x] Section 2: Native Player UI & OSD Overlay Architecture Specification
-  - [x] 2.1 Thread decoupling & lock-free atomic snapshot ring/triple buffer
-  - [x] 2.2 OSD overlay compositing pipeline (glyphs, timecode, sync health badge, floating chat, progress bar)
-  - [x] 2.3 Low-latency input handling (< 16ms event-loop response) & memory footprint analysis
-- [x] Section 3: Wire Format, Data Structures & Interface Boundaries
-- [x] Section 4: Handoff and Synthesis Generation (`analysis.md` and `handoff.md`)
-- [x] Message Orchestrator
+- [x] Initial dispatch processing & BRIEFING.md update
+- [x] Subtask 1: Investigate current `PlayerUiSnapshot`, `syncplay-ui`, and `syncplay-core` telemetry aggregation
+- [x] Subtask 2: Investigate sidebar rendering in `syncplay-ui/src/gui/sidebar.rs` (peer media, duration, diagnostic badges, readiness badges)
+- [x] Subtask 3: Investigate playback controls, unpause gate enforcement, waiting notification, and Host "Force Play" bypass
+- [x] Subtask 4: Investigate Auto-update notification banner and Help menu integration
+- [x] Subtask 5: Synthesize analysis and produce comprehensive handoff report at `handoff.md`
+- [x] Subtask 6: Send completion message to parent agent

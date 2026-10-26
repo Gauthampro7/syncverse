@@ -1,51 +1,45 @@
-## 2026-10-24T23:03:24Z
+# Dispatch: Explorer Survey 3 (Auto-Updater & Room Activity Announcements)
 
-You are explorer_survey_3 (teamwork_preview_explorer).
-Your Working Directory: /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/
-Project Root: /home/gautham/syncplay-alt
-Authoritative User Request: /home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md
+## Objective
+Investigate:
+1. Auto-update requirements:
+   - Querying GitHub Releases API (`https://api.github.com/repos/Gauthampro7/syncplay-desktop-preview/releases/latest`) asynchronously in background without blocking UI or playback.
+   - Checking existing workspace dependencies (e.g. `ureq`, `reqwest`, `minreq`, or raw HTTP via `std::net`, or if a lightweight HTTP client is needed - check banned crate list in AGENTS.md!).
+   - Semver parsing / comparison logic between `CARGO_PKG_VERSION` and release tag (e.g. `v0.1.2` > `v0.1.1`).
+   - Action handler to open release page or download asset (e.g., using `open` crate or system launcher).
+   - Error handling: timeouts, rate limits, offline gracefully handled.
+2. Room activity announcements:
+   - How `syncplay-chat` works (`syncplay_chat.bin`, chat messages, system announcements).
+   - How chat messages are broadcast and displayed in UI.
+   - How room events (media loaded, readiness changed, paused, resumed, seeked) can format and inject system announcement chat messages.
 
-### Objective
-Conduct an exhaustive technical exploration and survey for the smart chat system, multi-crate Rust workspace architecture, Pi agent framework, and verification harness of Syncplay-Alt:
-1. Locally persisted smart in-player chat system (timestamp-anchored messages, custom binary log + indexed storage engine with full-text search, slash-commands `/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
-2. Pure-Rust multi-crate workspace scaffold with strict zero-dependency compliance on external media/codec/database engines (`ffmpeg`, `libav*`, `gstreamer`, `mpv`, `vlc`, `symphonia`, `dav1d`, `sqlite`, `rusqlite`, `sqlx`).
-3. Pi framework setup (`AGENTS.md` and `.pi/`) and automated verification harness (`scripts/verify_phase1.sh`).
+## Input Information
+- `/home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md` (read section `## 2026-10-26T11:12:06Z`)
+- `/home/gautham/syncplay-alt/AGENTS.md` (check dependency whitelist & prohibitions!)
+- `/home/gautham/syncplay-alt/Cargo.toml`
+- `/home/gautham/syncplay-alt/crates/syncplay-chat`
+- `/home/gautham/syncplay-alt/crates/syncplay-core`
 
-### Scope & Constraints
-- Read-only technical investigation. Do NOT write or modify application source code.
-- Write your working files exclusively in your working directory `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/`.
-- Prioritize custom zero-dependency implementations (no SQLite/RocksDB/Tantivy; use custom append-only binary log + in-memory inverted index).
+## Output Requirements
+Produce a comprehensive report in `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md`.
+Include:
+- Recommended HTTP strategy compliant with whitelist and zero-warning rules
+- Semver comparison details and tag normalization
+- Update check lifecycle (startup background thread + manual menu trigger)
+- Chat announcement format and event trigger integration points
+- Security, offline, rate-limiting considerations
 
-### Detailed Requirements to Survey & Specify
-1. **Smart In-Player Chat & Custom Storage Engine**:
-   - Custom Binary Log Format (`syncplay_chat.bin`):
-     * Header: Magic bytes `b"SPCH"`, version (u16), flags (u16), reserved (u32).
-     * Record layout: length (u32), record type (u8: message, reaction, marker, poll), wall_timestamp_utc_ms (u64), media_timestamp_ms (u64), sender_id (16-byte UUID / 32-byte string), payload_len (u32), payload bytes, crc32 checksum (u32).
-     * Recovery & corrupt record handling: forward scan with CRC validation, seeking to next valid magic/boundary on corruption.
-   - Inverted Index & Full-Text Search (FTS):
-     * Tokenization (Unicode lowercase, punctuation stripping, stop-word handling).
-     * Posting list: `Term -> Vec<(RecordOffset, MediaTimestampMs)>`.
-     * Query parser: prefix matching, multi-term intersection (AND), phrase search.
-     * Timeline range queries: querying chat messages within `[T_media - window, T_media + window]` for on-screen overlay display.
-     * Room history export: formatted JSON and markdown/text export formats.
-   - Smart Slash-Commands & Media Triggers:
-     * Parser grammar for `/seek <timestamp_or_hms>`, `/bookmark [optional_label]`, `/clip <start_time> <end_time>`, `/poll <"Question"> <"Opt1"> <"Opt2">...`, `/sync-status`.
-     * Media command dispatching & sync message event mapping.
-2. **Multi-Crate Workspace Architecture & Dependency Rules**:
-   - Clean workspace structure:
-     * `crates/syncplay-common`: Core types, timestamps, error handling, CRC32, serialization primitives.
-     * `crates/syncplay-demux`: EBML/MKV and MP4/ISOBMFF container demuxing traits & parsers.
-     * `crates/syncplay-codecs`: Codec interfaces, YUV420p/RGB frame definitions, pixel converters.
-     * `crates/syncplay-clock`: Monotonic clock, PTS tracking, audio/video synchronization ring buffer.
-     * `crates/syncplay-sync`: NTP clock filter, PLL speed controller, timeline equation, barrier unpause state machine.
-     * `crates/syncplay-chat`: Custom binary log engine, inverted index, slash command parser, history exporter.
-     * `crates/syncplay-ui`: UI state model, OSD overlay layout primitives.
-     * `crates/syncplay-core`: Top-level coordinator engine binding the crates together.
-   - Zero-dependency audit script: grep/cargo metadata inspection to ensure zero prohibited crates.
-3. **Pi Framework (`.pi/` & `AGENTS.md`) & `scripts/verify_phase1.sh` Architecture**:
-   - Required skills, prompts, and workflows in `.pi/`.
-   - Structure of `scripts/verify_phase1.sh`: OpenSpec validation, Pi framework verification, dependency check, `cargo test --workspace`, test vector execution, and deterministic network sync simulation (250-400ms RTT, ±30ms jitter, PLL error < 15ms, barrier unpause < 10ms).
 
-### Deliverables
-Write a comprehensive report to `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/analysis.md` and complete a structured handoff report in `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md`.
-Notify the orchestrator via `send_message` when complete.
+## 2026-10-26T11:15:20Z
+You are Explorer 3 for Phase 5 Survey.
+Your identity: explorer_survey_3
+Your working directory: /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/
+Read your dispatch assignment in /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/DISPATCH.md and the authoritative user request in /home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md (under section `## 2026-10-26T11:12:06Z`).
+
+Investigate auto-update architecture and room activity announcements.
+Analyze:
+1. Querying GitHub Releases API asynchronously in background, parsing semver, handling rate limits/offline.
+2. Compliance with AGENTS.md dependency whitelist and zero-warning rules.
+3. syncplay-chat room activity announcements (media loaded, readiness changed, paused, resumed, seeked) and how system messages are formatted and broadcast.
+
+Produce your comprehensive handoff report at /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md and message back when complete.
