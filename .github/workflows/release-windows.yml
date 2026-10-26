@@ -20,6 +20,27 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Clean Local Cargo Config for Cross-Platform Build
+        shell: powershell
+        run: |
+          # Remove local Linux-specific .cargo/config.toml if present
+          if (Test-Path ".cargo\config.toml") {
+            Remove-Item -Force ".cargo\config.toml"
+            Write-Host "Removed Linux-specific .cargo/config.toml for Windows build"
+          }
+
+      - name: Setup LLVM / libclang
+        shell: powershell
+        run: |
+          if (Test-Path "C:\Program Files\LLVM\bin\libclang.dll") {
+            Write-Host "Found pre-installed LLVM at C:\Program Files\LLVM\bin"
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "Installing LLVM via chocolatey..."
+            choco install llvm -y --no-progress
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
       - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
