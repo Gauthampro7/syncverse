@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
 use syncplay_demux::{
     build_synthetic_full_mkv, build_synthetic_full_mp4, Demuxer, EbmlDemuxer, IsoBmffDemuxer,
     ReadSeek, TrackType, UniversalDemuxer,
@@ -26,6 +27,8 @@ struct FixtureSpec {
     filename: &'static str,
     args: Vec<&'static str>,
 }
+
+static FIXTURES_INIT: Once = Once::new();
 
 fn ensure_adversarial_fixtures() -> Vec<(&'static str, PathBuf)> {
     let dir = PathBuf::from("/tmp/media_fixtures_adv");
@@ -83,7 +86,7 @@ fn ensure_adversarial_fixtures() -> Vec<(&'static str, PathBuf)> {
                 "-f", "lavfi", "-i", "testsrc=duration=3:size=320x240:rate=25",
                 "-f", "lavfi", "-i", "sine=frequency=1000:duration=3",
                 "-c:v", "libvpx-vp9", "-g", "25",
-                "-c:a", "libopus",
+                "-c:a", "libopus", "-strict", "-2",
             ],
         },
         FixtureSpec {
@@ -118,22 +121,25 @@ fn ensure_adversarial_fixtures() -> Vec<(&'static str, PathBuf)> {
         },
     ];
 
-    let mut fixtures = Vec::new();
-    for spec in specs {
-        let path = dir.join(spec.filename);
-        if !path.exists() {
-            let mut cmd = Command::new("ffmpeg");
-            cmd.arg("-y");
-            for arg in spec.args {
-                cmd.arg(arg);
+    FIXTURES_INIT.call_once(|| {
+        for spec in &specs {
+            let path = dir.join(spec.filename);
+            let tmp_path = dir.join(format!("tmp_{}", spec.filename));
+            if !path.exists() {
+                let mut cmd = Command::new("ffmpeg");
+                cmd.arg("-y");
+                for arg in &spec.args {
+                    cmd.arg(arg);
+                }
+                cmd.arg(&tmp_path);
+                let status = cmd.status().expect("ffmpeg execution failed");
+                assert!(status.success(), "Failed to generate fixture {}", spec.name);
+                std::fs::rename(&tmp_path, &path).expect("atomic rename fixture");
             }
-            cmd.arg(&path);
-            let status = cmd.status().expect("ffmpeg execution failed");
-            assert!(status.success(), "Failed to generate fixture {}", spec.name);
         }
-        fixtures.push((spec.name, path));
-    }
-    fixtures
+    });
+
+    specs.iter().map(|s| (s.name, dir.join(s.filename))).collect()
 }
 
 #[test]
