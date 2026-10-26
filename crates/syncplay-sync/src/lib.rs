@@ -19,4 +19,4 @@ pub use ntp::{ProbeSample, Rfc5905Filter};
 pub use pll::{PllCorrection, PllSpeedController, PllZone};
 pub use timeline::RoomState;
 pub use transport::{ClientNode, ClientSession, HostServer, UdpSyncTransport};
-pub use wire::{ChatMessagePayload, PacketPayload, PacketType, WirePacket};
+pub use wire::{ChatMessagePayload, PacketPayload, PacketType, PeerStatusPayload, WirePacket};

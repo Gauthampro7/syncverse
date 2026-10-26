@@ -7,6 +7,7 @@ pub mod drag_drop;
 pub mod file_dialog;
 pub mod recent_files;
 pub mod sidebar;
+pub mod updater;
 pub mod viewport;
 
 pub use app::{create_native_options, run_desktop_gui, run_desktop_player, SyncplayApp};
@@ -18,7 +19,12 @@ pub use dialogs::{AboutDialog, ConnectPartyDialog, HostPartyDialog, ShortcutsDia
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
 pub use file_dialog::FileDialogManager;
 pub use recent_files::RecentFilesManager;
-pub use sidebar::{RoomMember, SidebarState};
+pub use sidebar::{
+    evaluate_file_match, format_duration_hms, FileMatchStatus, RoomMember, SidebarState,
+};
+pub use updater::{
+    check_for_updates, open_browser_url, spawn_update_check, UpdateError, UpdateInfo,
+};
 pub use viewport::{
     VideoTextureBuffer, VideoViewport, ViewportAction, ViewportDisplayMode, ViewportGeometry,
 };

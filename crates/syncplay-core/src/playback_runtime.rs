@@ -14,12 +14,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use syncplay_chat::ChatRecord;
+use syncplay_chat::{ChatRecord, RoomAnnouncement};
 use syncplay_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncplay_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
 use syncplay_demux::{Demuxer, TrackType, UniversalDemuxer};
-use syncplay_sync::{ClientNode, HostServer};
-use syncplay_ui::{PlayerCommand, PlayerUiSnapshot, RoomMember, TripleBufferSnapshotExchange, UiEvent};
+use syncplay_sync::{ClientNode, HostServer, PeerStatusPayload};
+use syncplay_ui::{
+    evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
+    TripleBufferSnapshotExchange, UiEvent, SNAPSHOT_FLAG_FORCE_PLAY, SNAPSHOT_FLAG_GATE_BLOCKED,
+    SNAPSHOT_FLAG_HAS_MISMATCH, SNAPSHOT_FLAG_LOCAL_READY,
+};
 
 use crate::audio_sink::{AudioSink, AutoAudioSink};
 
@@ -177,6 +181,88 @@ enum WatchPartyRole {
     },
 }
 
+/// Helper extracting local sender name for announcements and chat records.
+fn get_sender_name(party_role: &WatchPartyRole) -> String {
+    match party_role {
+        WatchPartyRole::Host { local_username, .. } => local_username.clone(),
+        WatchPartyRole::Client { local_username, .. } => local_username.clone(),
+        WatchPartyRole::None => std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+    }
+}
+
+/// Helper broadcasting a standardized chat announcement locally and across connected room peers.
+fn broadcast_chat_announcement(
+    text: &str,
+    now: Instant,
+    clock: &MasterClock,
+    party_role: &mut WatchPartyRole,
+    event_tx: &Sender<UiEvent>,
+) {
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let media_ms = clock.current_pts(now).max(0.0) as u64;
+    let rec = RoomAnnouncement::create_record(wall_ms, media_ms, text);
+    let wire_bytes = rec.to_network_bytes();
+
+    match party_role {
+        WatchPartyRole::Host { server, .. } => {
+            let _ = server.broadcast_chat_message(&wire_bytes);
+        }
+        WatchPartyRole::Client { client, .. } => {
+            let _ = client.send_chat_message_with_pts(&wire_bytes, media_ms);
+        }
+        WatchPartyRole::None => {}
+    }
+
+    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+}
+
+/// Helper broadcasting local peer media status to room peers.
+fn broadcast_local_peer_status(
+    has_media: bool,
+    is_ready: bool,
+    duration_ms: u64,
+    file_size_bytes: u64,
+    filename: &str,
+    party_role: &mut WatchPartyRole,
+) {
+    match party_role {
+        WatchPartyRole::Host {
+            server,
+            local_username,
+            ..
+        } => {
+            let status = PeerStatusPayload {
+                client_id: 0,
+                has_media,
+                is_ready,
+                duration_ms,
+                file_size_bytes,
+                username: local_username.clone(),
+                filename: filename.to_string(),
+            };
+            let _ = server.broadcast_peer_status(&status);
+        }
+        WatchPartyRole::Client {
+            client,
+            local_username,
+            ..
+        } => {
+            let _ = client.send_peer_status(
+                has_media,
+                is_ready,
+                duration_ms,
+                file_size_bytes,
+                local_username,
+                filename,
+            );
+        }
+        WatchPartyRole::None => {}
+    }
+}
+
 /// Runs the background playback worker loop in a dedicated OS thread.
 pub fn run_playback_worker(
     command_rx: Receiver<PlayerCommand>,
@@ -188,6 +274,11 @@ pub fn run_playback_worker(
     running: Arc<AtomicBool>,
 ) {
     let mut session: Option<PlaybackSession> = None;
+    let mut current_file_name: Option<String> = None;
+    let mut current_file_size: u64 = 0;
+    let mut local_ready: bool = false;
+    let mut force_play: bool = false;
+    let mut gate_blocked: bool = false;
     let mut volume: f32 = 1.0;
     let mut is_muted: bool = false;
     let mut speed: f64 = 1.0;
@@ -204,6 +295,17 @@ pub fn run_playback_worker(
                     match PlaybackSession::open(&path) {
                         Ok(new_session) => {
                             let dur_ms = new_session.duration_ms;
+                            let filename = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("media")
+                                .to_string();
+                            let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            current_file_name = Some(filename.clone());
+                            current_file_size = file_size;
+                            local_ready = true;
+                            gate_blocked = false;
+
                             session = Some(new_session);
                             overflow_frame = None;
                             while video_ring.try_pop().is_some() {}
@@ -217,12 +319,34 @@ pub fn run_playback_worker(
                                 let _ = server.broadcast_room_state();
                             }
 
+                            // Broadcast peer status with loaded media and readiness
+                            broadcast_local_peer_status(
+                                true,
+                                local_ready,
+                                dur_ms,
+                                file_size,
+                                &filename,
+                                &mut party_role,
+                            );
+
+                            // Broadcast room activity chat announcement: RoomAnnouncement::media_loaded
+                            let sender = get_sender_name(&party_role);
+                            let announcement =
+                                RoomAnnouncement::media_loaded_ms(&sender, &filename, dur_ms);
+                            broadcast_chat_announcement(
+                                &announcement,
+                                now,
+                                &clock,
+                                &mut party_role,
+                                &event_tx,
+                            );
+
                             // Initial snapshot publication
                             let snap = PlayerUiSnapshot {
                                 monotonic_timestamp: 0,
                                 media_position_pts: 0,
                                 media_duration_pts: dur_ms * 1_000_000,
-                                playback_state: 1,
+                                playback_state: 1 | SNAPSHOT_FLAG_LOCAL_READY,
                                 pll_speed_ratio_q16: (speed * 65536.0) as u32,
                                 peer_count: 1,
                                 peers_ready: 1,
@@ -236,26 +360,172 @@ pub fn run_playback_worker(
                         }
                     }
                 }
+                PlayerCommand::SetReady(ready) => {
+                    local_ready = ready;
+                    let now = Instant::now();
+                    let dur_ms = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
+                    broadcast_local_peer_status(
+                        session.is_some(),
+                        local_ready,
+                        dur_ms,
+                        current_file_size,
+                        current_file_name.as_deref().unwrap_or(""),
+                        &mut party_role,
+                    );
+
+                    let sender = get_sender_name(&party_role);
+                    let msg = RoomAnnouncement::readiness(&sender, ready);
+                    broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
+                }
+                PlayerCommand::SetForcePlay(val) => {
+                    force_play = val;
+                    if force_play {
+                        gate_blocked = false;
+                    }
+                }
+                PlayerCommand::ForcePlay => {
+                    force_play = true;
+                    gate_blocked = false;
+                    let now = Instant::now();
+                    clock.set_state(now, PlaybackState::Playing);
+                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+
+                    let sender = get_sender_name(&party_role);
+                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                        let current_pts = clock.current_pts(now).max(0.0) as u64;
+                        server.set_media_state(current_pts, speed, false);
+                        let _ = server.prepare_barrier_unpause(50);
+                        let _ = server.broadcast_room_state();
+                    }
+
+                    let msg = RoomAnnouncement::resumed(&sender);
+                    broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
+                }
                 PlayerCommand::TogglePause => {
                     let now = Instant::now();
                     let will_play = !clock.is_playing();
+                    let sender = get_sender_name(&party_role);
+
                     if will_play {
-                        clock.set_state(now, PlaybackState::Playing);
-                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                        // Unpause trigger: evaluate unpause gate across room peers
+                        let mut unready_peers = Vec::new();
+                        let in_watch_party = match &party_role {
+                            WatchPartyRole::Host { .. } | WatchPartyRole::Client { .. } => true,
+                            WatchPartyRole::None => false,
+                        };
+
+                        if in_watch_party {
+                            // Check local readiness
+                            if session.is_none() || !local_ready {
+                                unready_peers.push(sender.clone());
+                            }
+
+                            // Check remote peers
+                            match &party_role {
+                                WatchPartyRole::Host {
+                                    server,
+                                    client_names,
+                                    ..
+                                } => {
+                                    for (addr, client) in server.clients() {
+                                        if client.last_seen.elapsed() < Duration::from_secs(15)
+                                            && (!client.has_media || !client.is_user_ready)
+                                        {
+                                            let name = if !client.username.is_empty() {
+                                                client.username.clone()
+                                            } else {
+                                                client_names
+                                                    .get(addr)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| {
+                                                        format!("Peer-{}", client.client_id)
+                                                    })
+                                            };
+                                            unready_peers.push(name);
+                                        }
+                                    }
+                                }
+                                WatchPartyRole::Client {
+                                    client,
+                                    host_username,
+                                    ..
+                                } => {
+                                    if client.peer_statuses().is_empty() {
+                                        unready_peers.push(host_username.clone());
+                                    } else {
+                                        for status in client.peer_statuses().values() {
+                                            if !status.has_media || !status.is_ready {
+                                                unready_peers.push(status.username.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                WatchPartyRole::None => {}
+                            }
+                        }
+
+                        if !unready_peers.is_empty() && !force_play {
+                            // Unpause blocked: hold playback paused and alert room
+                            clock.set_state(now, PlaybackState::Paused);
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            gate_blocked = true;
+
+                            let msg = RoomAnnouncement::gate_waiting(&unready_peers);
+                            let _ = event_tx.send(UiEvent::UnpauseBlocked {
+                                unready_peers: unready_peers.clone(),
+                                message: msg.clone(),
+                            });
+
+                            broadcast_chat_announcement(
+                                &msg,
+                                now,
+                                &clock,
+                                &mut party_role,
+                                &event_tx,
+                            );
+                        } else {
+                            // Unpause allowed or force_play override active
+                            gate_blocked = false;
+                            clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
+
+                            if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                                let current_pts = clock.current_pts(now).max(0.0) as u64;
+                                server.set_media_state(current_pts, speed, false);
+                                let _ = server.prepare_barrier_unpause(50);
+                                let _ = server.broadcast_room_state();
+                            }
+
+                            let msg = RoomAnnouncement::resumed(&sender);
+                            broadcast_chat_announcement(
+                                &msg,
+                                now,
+                                &clock,
+                                &mut party_role,
+                                &event_tx,
+                            );
+                        }
                     } else {
+                        // Pause trigger
+                        gate_blocked = false;
                         clock.set_state(now, PlaybackState::Paused);
                         let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                    }
-                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                        let current_pts = clock.current_pts(now).max(0.0) as u64;
-                        server.set_media_state(current_pts, speed, !will_play);
-                        let _ = server.broadcast_room_state();
+
+                        if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                            let current_pts = clock.current_pts(now).max(0.0) as u64;
+                            server.set_media_state(current_pts, speed, true);
+                            let _ = server.broadcast_room_state();
+                        }
+
+                        let msg = RoomAnnouncement::paused(&sender);
+                        broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
                     }
                 }
                 PlayerCommand::Stop => {
                     let now = Instant::now();
                     clock.seek_to(0.0, now);
                     clock.set_state(now, PlaybackState::Paused);
+                    gate_blocked = false;
                     overflow_frame = None;
                     while video_ring.try_pop().is_some() {}
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
@@ -285,6 +555,10 @@ pub fn run_playback_worker(
                         }
                         WatchPartyRole::None => {}
                     }
+                    let now = Instant::now();
+                    let sender = get_sender_name(&party_role);
+                    let msg = RoomAnnouncement::seeked_ms(&sender, target_ms);
+                    broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
                 }
                 PlayerCommand::SetSpeed(spd) => {
                     speed = spd.clamp(0.2, 4.0);
@@ -340,12 +614,17 @@ pub fn run_playback_worker(
                             let is_paused = !clock.is_playing();
                             server.set_media_state(current_pts, speed, is_paused);
 
-                            let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
-                                username: username.clone(),
-                                is_local: true,
-                                is_host: true,
-                                rtt_ms: 0.0,
-                            }]));
+                            let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                            let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
+                                username.clone(),
+                                true,
+                                true,
+                                0.0,
+                                current_file_name.clone(),
+                                dur_ms,
+                                if session.is_some() { Some(current_file_size) } else { None },
+                                local_ready,
+                            )]));
 
                             let wall_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -369,6 +648,15 @@ pub fn run_playback_worker(
                                 last_member_update: now,
                                 last_probe_sent: now,
                             };
+
+                            broadcast_local_peer_status(
+                                session.is_some(),
+                                local_ready,
+                                dur_ms.unwrap_or(0),
+                                current_file_size,
+                                current_file_name.as_deref().unwrap_or(""),
+                                &mut party_role,
+                            );
                         }
                         Err(e) => {
                             eprintln!("[ERROR] Failed to bind HostServer on {}: {}", bind_addr, e);
@@ -420,12 +708,26 @@ pub fn run_playback_worker(
                                 );
                                 let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
 
-                                let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
-                                    username: username.clone(),
-                                    is_local: true,
-                                    is_host: false,
-                                    rtt_ms: 0.0,
-                                }]));
+                                let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                                let _ = client.send_peer_status(
+                                    session.is_some(),
+                                    local_ready,
+                                    dur_ms.unwrap_or(0),
+                                    current_file_size,
+                                    &username,
+                                    current_file_name.as_deref().unwrap_or(""),
+                                );
+
+                                let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
+                                    username.clone(),
+                                    true,
+                                    false,
+                                    0.0,
+                                    current_file_name.clone(),
+                                    dur_ms,
+                                    if session.is_some() { Some(current_file_size) } else { None },
+                                    local_ready,
+                                )]));
 
                                 let rec = ChatRecord::new_text(
                                     wall_ms,
@@ -479,13 +781,19 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::DisconnectParty => {
                     party_role = WatchPartyRole::None;
+                    gate_blocked = false;
                     let local_name = std::env::var("USER").unwrap_or_else(|_| "You".to_string());
-                    let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember {
-                        username: local_name,
-                        is_local: true,
-                        is_host: true,
-                        rtt_ms: 0.0,
-                    }]));
+                    let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                    let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
+                        local_name,
+                        true,
+                        true,
+                        0.0,
+                        current_file_name.clone(),
+                        dur_ms,
+                        if session.is_some() { Some(current_file_size) } else { None },
+                        local_ready,
+                    )]));
                     let wall_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -655,25 +963,54 @@ pub fn run_playback_worker(
                 // Periodic member list update (~2 Hz)
                 if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
                     *last_member_update = now;
-                    let mut members = vec![RoomMember {
-                        username: local_username.clone(),
-                        is_local: true,
-                        is_host: true,
-                        rtt_ms: 0.0,
-                    }];
+                    let local_dur = session.as_ref().map(|s| s.duration_ms);
+                    let mut members = vec![RoomMember::with_media(
+                        local_username.clone(),
+                        true,
+                        true,
+                        0.0,
+                        current_file_name.clone(),
+                        local_dur,
+                        if session.is_some() {
+                            Some(current_file_size)
+                        } else {
+                            None
+                        },
+                        local_ready,
+                    )];
 
-                    for (addr, session) in server.clients() {
-                        if session.last_seen.elapsed() < Duration::from_secs(15) {
-                            let name = client_names
-                                .get(addr)
-                                .cloned()
-                                .unwrap_or_else(|| format!("Peer-{}", session.client_id));
-                            members.push(RoomMember {
-                                username: name,
-                                is_local: false,
-                                is_host: false,
-                                rtt_ms: session.rtt_ms as f64,
-                            });
+                    for (addr, client_session) in server.clients() {
+                        if client_session.last_seen.elapsed() < Duration::from_secs(15) {
+                            let name = if !client_session.username.is_empty() {
+                                client_session.username.clone()
+                            } else {
+                                client_names
+                                    .get(addr)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("Peer-{}", client_session.client_id))
+                            };
+                            members.push(RoomMember::with_media(
+                                name,
+                                false,
+                                false,
+                                client_session.rtt_ms as f64,
+                                if client_session.has_media && !client_session.filename.is_empty() {
+                                    Some(client_session.filename.clone())
+                                } else {
+                                    None
+                                },
+                                if client_session.has_media {
+                                    Some(client_session.duration_ms)
+                                } else {
+                                    None
+                                },
+                                if client_session.has_media {
+                                    Some(client_session.file_size_bytes)
+                                } else {
+                                    None
+                                },
+                                client_session.is_user_ready,
+                            ));
                         }
                     }
                     let _ = event_tx.send(UiEvent::RoomMembersUpdated(members));
@@ -751,21 +1088,63 @@ pub fn run_playback_worker(
                 // Periodic member list update (~2 Hz)
                 if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
                     *last_member_update = now;
-                    let rtt = client.median_rtt_ms() as f64;
-                    let members = vec![
-                        RoomMember {
-                            username: local_username.clone(),
-                            is_local: true,
-                            is_host: false,
-                            rtt_ms: 0.0,
+                    let local_dur = session.as_ref().map(|s| s.duration_ms);
+                    let mut members = vec![RoomMember::with_media(
+                        local_username.clone(),
+                        true,
+                        false,
+                        0.0,
+                        current_file_name.clone(),
+                        local_dur,
+                        if session.is_some() {
+                            Some(current_file_size)
+                        } else {
+                            None
                         },
-                        RoomMember {
-                            username: host_username.clone(),
-                            is_local: false,
-                            is_host: true,
-                            rtt_ms: rtt,
-                        },
-                    ];
+                        local_ready,
+                    )];
+
+                    let peer_stats = client.peer_statuses().clone();
+                    if peer_stats.is_empty() {
+                        // Host status not yet received; add placeholder
+                        members.push(RoomMember::new(
+                            host_username.clone(),
+                            false,
+                            true,
+                            client.median_rtt_ms() as f64,
+                        ));
+                    } else {
+                        for status in peer_stats.values() {
+                            let is_host_peer = status.client_id == 0;
+                            let rtt = if is_host_peer {
+                                client.median_rtt_ms() as f64
+                            } else {
+                                0.0
+                            };
+                            members.push(RoomMember::with_media(
+                                status.username.clone(),
+                                false,
+                                is_host_peer,
+                                rtt,
+                                if status.has_media && !status.filename.is_empty() {
+                                    Some(status.filename.clone())
+                                } else {
+                                    None
+                                },
+                                if status.has_media {
+                                    Some(status.duration_ms)
+                                } else {
+                                    None
+                                },
+                                if status.has_media {
+                                    Some(status.file_size_bytes)
+                                } else {
+                                    None
+                                },
+                                status.is_ready,
+                            ));
+                        }
+                    }
                     let _ = event_tx.send(UiEvent::RoomMembersUpdated(members));
                 }
             }
@@ -780,13 +1159,81 @@ pub fn run_playback_worker(
             let dur_ms = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
             let is_playing = clock.is_playing();
 
-            let (peer_count, rtt_nanos, offset_nanos, phase_err_nanos, pll_ratio) = match &party_role {
+            let (
+                peer_count,
+                peers_ready,
+                rtt_nanos,
+                offset_nanos,
+                phase_err_nanos,
+                pll_ratio,
+                has_mismatch,
+            ) = match &party_role {
                 WatchPartyRole::Host { server, .. } => {
-                    let peers = (server.clients().len() + 1).min(u16::MAX as usize) as u16;
+                    let total = (server.clients().len() + 1).min(u16::MAX as usize) as u16;
+                    let mut ready_count = if local_ready && session.is_some() {
+                        1u16
+                    } else {
+                        0u16
+                    };
+                    let mut mismatch = false;
+                    let local_dur = session.as_ref().map(|s| s.duration_ms);
+                    let local_file = current_file_name.as_deref();
+
+                    for client_sess in server.clients().values() {
+                        if client_sess.is_user_ready && client_sess.has_media {
+                            ready_count = ready_count.saturating_add(1);
+                        }
+                        if client_sess.has_media {
+                            let st = evaluate_file_match(
+                                local_file,
+                                local_dur,
+                                Some(&client_sess.filename),
+                                Some(client_sess.duration_ms),
+                            );
+                            if st == FileMatchStatus::Mismatch {
+                                mismatch = true;
+                            }
+                        }
+                    }
                     let rtt_ns = server.max_rtt_ms() * 1_000_000;
-                    (peers, rtt_ns, 0i64, 0i64, (speed * 65536.0) as u32)
+                    (
+                        total,
+                        ready_count,
+                        rtt_ns,
+                        0i64,
+                        0i64,
+                        (speed * 65536.0) as u32,
+                        mismatch,
+                    )
                 }
                 WatchPartyRole::Client { client, .. } => {
+                    let total = (client.peer_statuses().len() + 1).min(u16::MAX as usize) as u16;
+                    let mut ready_count = if local_ready && session.is_some() {
+                        1u16
+                    } else {
+                        0u16
+                    };
+                    let mut mismatch = false;
+                    let local_dur = session.as_ref().map(|s| s.duration_ms);
+                    let local_file = current_file_name.as_deref();
+
+                    for status in client.peer_statuses().values() {
+                        if status.is_ready && status.has_media {
+                            ready_count = ready_count.saturating_add(1);
+                        }
+                        if status.has_media {
+                            let st = evaluate_file_match(
+                                local_file,
+                                local_dur,
+                                Some(&status.filename),
+                                Some(status.duration_ms),
+                            );
+                            if st == FileMatchStatus::Mismatch {
+                                mismatch = true;
+                            }
+                        }
+                    }
+
                     let rtt_ns = client.median_rtt_nanos() as u64;
                     let offset_ns = client.filtered_offset_nanos().unwrap_or(0.0) as i64;
                     let phase_err_ms = if let Some(room) = client.latest_room_state() {
@@ -799,27 +1246,55 @@ pub fn run_playback_worker(
                         0
                     };
                     (
-                        2u16,
+                        total,
+                        ready_count,
                         rtt_ns,
                         offset_ns,
                         phase_err_ms * 1_000_000,
                         (clock.speed() * 65536.0) as u32,
+                        mismatch,
                     )
                 }
-                WatchPartyRole::None => (1u16, 0, 0, 0, (speed * 65536.0) as u32),
+                WatchPartyRole::None => (
+                    1u16,
+                    if local_ready && session.is_some() {
+                        1u16
+                    } else {
+                        0u16
+                    },
+                    0,
+                    0,
+                    0,
+                    (speed * 65536.0) as u32,
+                    false,
+                ),
             };
+
+            let mut playback_state_flags = if is_playing { 1 } else { 0 };
+            if gate_blocked {
+                playback_state_flags |= SNAPSHOT_FLAG_GATE_BLOCKED;
+            }
+            if force_play {
+                playback_state_flags |= SNAPSHOT_FLAG_FORCE_PLAY;
+            }
+            if local_ready {
+                playback_state_flags |= SNAPSHOT_FLAG_LOCAL_READY;
+            }
+            if has_mismatch {
+                playback_state_flags |= SNAPSHOT_FLAG_HAS_MISMATCH;
+            }
 
             let snap = PlayerUiSnapshot {
                 monotonic_timestamp: now.elapsed().as_nanos() as u64,
                 media_position_pts: (current_pts_ms.max(0.0) * 1_000_000.0) as u64,
                 media_duration_pts: dur_ms * 1_000_000,
-                playback_state: if is_playing { 1 } else { 0 },
+                playback_state: playback_state_flags,
                 network_rtt_nanos: rtt_nanos,
                 clock_offset_nanos: offset_nanos,
                 phase_error_nanos: phase_err_nanos,
                 pll_speed_ratio_q16: pll_ratio,
                 peer_count,
-                peers_ready: peer_count,
+                peers_ready,
                 room_sequence: 1,
             };
             exchange.publish(snap);

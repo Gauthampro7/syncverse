@@ -36,11 +36,59 @@ pub struct PlayerUiSnapshot {
     pub room_sequence: u64,
 }
 
+/// Playback state enum values.
+pub const PLAYBACK_STATE_PAUSED: u64 = 0;
+/// Playback state is actively presenting media frames.
+pub const PLAYBACK_STATE_PLAYING: u64 = 1;
+/// Playback state is currently seeking.
+pub const PLAYBACK_STATE_SEEKING: u64 = 2;
+/// Playback state is buffering data.
+pub const PLAYBACK_STATE_BUFFERING: u64 = 3;
+
+/// Status bitflag indicating playback unpause is blocked by unready or unloaded peers.
+pub const SNAPSHOT_FLAG_GATE_BLOCKED: u64 = 0x0100;
+/// Status bitflag indicating host force play bypass is active.
+pub const SNAPSHOT_FLAG_FORCE_PLAY: u64 = 0x0200;
+/// Status bitflag indicating local user is marked ready to watch.
+pub const SNAPSHOT_FLAG_LOCAL_READY: u64 = 0x0400;
+/// Status bitflag indicating a peer's loaded media mismatches local media.
+pub const SNAPSHOT_FLAG_HAS_MISMATCH: u64 = 0x0800;
+
 impl PlayerUiSnapshot {
     /// Returns true if the snapshot is internally consistent (used in concurrency audit).
     #[inline]
     pub fn is_internally_consistent(&self) -> bool {
         self.monotonic_timestamp == self.room_sequence
+    }
+
+    /// Returns true if the snapshot playback state is Playing.
+    #[inline]
+    pub fn is_playing(&self) -> bool {
+        (self.playback_state & 0xFF) == PLAYBACK_STATE_PLAYING
+    }
+
+    /// Returns true if the unpause gate is currently blocking playback resumption.
+    #[inline]
+    pub fn is_gate_blocked(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_GATE_BLOCKED) != 0
+    }
+
+    /// Returns true if host force play override is active.
+    #[inline]
+    pub fn is_force_play(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_FORCE_PLAY) != 0
+    }
+
+    /// Returns true if the local user is marked ready to watch.
+    #[inline]
+    pub fn is_local_ready(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_LOCAL_READY) != 0
+    }
+
+    /// Returns true if any connected peer's media mismatches the local media.
+    #[inline]
+    pub fn has_media_mismatch(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_HAS_MISMATCH) != 0
     }
 }
 

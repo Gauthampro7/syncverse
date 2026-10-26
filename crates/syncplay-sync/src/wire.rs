@@ -37,6 +37,8 @@ pub enum PacketType {
     SeekCommand = 0x06,
     /// 0x08: In-band Chat Message (`sequence: u32`, `wall_timestamp_ms: u64`, `media_timestamp_ms: u64`, `payload: Vec<u8>`)
     ChatMessage = 0x08,
+    /// 0x09: Peer Status Broadcast (`client_id: u32`, `has_media: bool`, `is_ready: bool`, `duration_ms: u64`, `file_size_bytes: u64`, `username: String`, `filename: String`)
+    PeerStatus = 0x09,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -51,6 +53,7 @@ impl TryFrom<u8> for PacketType {
             0x05 => Ok(Self::BarrierReady),
             0x06 => Ok(Self::SeekCommand),
             0x08 => Ok(Self::ChatMessage),
+            0x09 => Ok(Self::PeerStatus),
             other => Err(SyncError::UnknownPacketType(other)),
         }
     }
@@ -154,6 +157,51 @@ impl ChatMessagePayload {
     }
 }
 
+/// Payload for `0x09` Peer Status (media metadata and user readiness state).
+///
+/// Encapsulates loaded media diagnostics (filename, duration, size) and
+/// persistent user watch readiness ("Ready to Watch" state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerStatusPayload {
+    /// Identifier of the reporting client (0 for host).
+    pub client_id: u32,
+    /// Whether the peer currently has media loaded.
+    pub has_media: bool,
+    /// Persistent readiness state of the peer ("Ready to Watch" checkbox).
+    pub is_ready: bool,
+    /// Media container duration in milliseconds.
+    pub duration_ms: u64,
+    /// Media file size on disk in bytes.
+    pub file_size_bytes: u64,
+    /// Peer username.
+    pub username: String,
+    /// Loaded media file basename.
+    pub filename: String,
+}
+
+impl PeerStatusPayload {
+    /// Constructs a new `PeerStatusPayload`.
+    pub fn new(
+        client_id: u32,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_id,
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username: username.into(),
+            filename: filename.into(),
+        }
+    }
+}
+
 /// Typed representation of wire packet payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketPayload {
@@ -171,6 +219,8 @@ pub enum PacketPayload {
     SeekCommand(SeekCommandPayload),
     /// In-band Chat Message
     ChatMessage(ChatMessagePayload),
+    /// Peer Status Broadcast
+    PeerStatus(PeerStatusPayload),
 }
 
 impl PacketPayload {
@@ -228,6 +278,24 @@ impl PacketPayload {
                 buf.extend_from_slice(&p.payload);
                 buf
             }
+            Self::PeerStatus(p) => {
+                let username_bytes = p.username.as_bytes();
+                let filename_bytes = p.filename.as_bytes();
+                let username_len = username_bytes.len().min(u16::MAX as usize) as u16;
+                let filename_len = filename_bytes.len().min(u16::MAX as usize) as u16;
+
+                let mut buf = Vec::with_capacity(26 + username_bytes.len() + filename_bytes.len());
+                buf.extend_from_slice(&p.client_id.to_le_bytes());
+                buf.extend_from_slice(&p.duration_ms.to_le_bytes());
+                buf.extend_from_slice(&p.file_size_bytes.to_le_bytes());
+                buf.push(if p.is_ready { 1 } else { 0 });
+                buf.push(if p.has_media { 1 } else { 0 });
+                buf.extend_from_slice(&username_len.to_le_bytes());
+                buf.extend_from_slice(&username_bytes[..username_len as usize]);
+                buf.extend_from_slice(&filename_len.to_le_bytes());
+                buf.extend_from_slice(&filename_bytes[..filename_len as usize]);
+                buf
+            }
         }
     }
 
@@ -241,6 +309,7 @@ impl PacketPayload {
             Self::BarrierReady(_) => PacketType::BarrierReady,
             Self::SeekCommand(_) => PacketType::SeekCommand,
             Self::ChatMessage(_) => PacketType::ChatMessage,
+            Self::PeerStatus(_) => PacketType::PeerStatus,
         }
     }
 }
@@ -384,6 +453,31 @@ impl WirePacket {
         }
     }
 
+    /// Constructs a Peer Status packet (`0x09`).
+    pub fn peer_status(
+        client_id: u32,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self {
+            packet_type: PacketType::PeerStatus,
+            flags: FLAG_NONE,
+            payload: PacketPayload::PeerStatus(PeerStatusPayload::new(
+                client_id,
+                has_media,
+                is_ready,
+                duration_ms,
+                file_size_bytes,
+                username,
+                filename,
+            )),
+        }
+    }
+
     /// Serializes this packet into a binary byte vector with header framing and CRC32.
     pub fn to_bytes(&self) -> Vec<u8> {
         let payload_bytes = self.payload.serialize();
@@ -397,7 +491,6 @@ impl WirePacket {
         buf.extend_from_slice(&payload_len.to_le_bytes());
         buf.extend_from_slice(&crc.to_le_bytes());
         buf.extend_from_slice(&payload_bytes);
-
         buf
     }
 
@@ -565,6 +658,72 @@ impl WirePacket {
                     payload,
                 })
             }
+            PacketType::PeerStatus => {
+                if payload_slice.len() < 26 {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "PeerStatus expected at least 26 bytes, got {}",
+                        payload_slice.len()
+                    )));
+                }
+                let client_id = u32::from_le_bytes(payload_slice[0..4].try_into().unwrap());
+                let duration_ms = u64::from_le_bytes(payload_slice[4..12].try_into().unwrap());
+                let file_size_bytes =
+                    u64::from_le_bytes(payload_slice[12..20].try_into().unwrap());
+                let is_ready = payload_slice[20] != 0;
+                let has_media = payload_slice[21] != 0;
+                let username_len =
+                    u16::from_le_bytes(payload_slice[22..24].try_into().unwrap()) as usize;
+                if 24 + username_len + 2 > payload_slice.len() {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "PeerStatus username length {} exceeds buffer boundary",
+                        username_len
+                    )));
+                }
+                let username_bytes = &payload_slice[24..24 + username_len];
+                let username = std::str::from_utf8(username_bytes)
+                    .map_err(|e| {
+                        SyncError::MalformedPayload(format!(
+                            "PeerStatus invalid UTF-8 username: {}",
+                            e
+                        ))
+                    })?
+                    .to_string();
+
+                let fn_len_offset = 24 + username_len;
+                let filename_len = u16::from_le_bytes(
+                    payload_slice[fn_len_offset..fn_len_offset + 2]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let fn_bytes_offset = fn_len_offset + 2;
+                if fn_bytes_offset + filename_len != payload_slice.len() {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "PeerStatus declared payload length mismatch: expected total {} bytes, got {}",
+                        fn_bytes_offset + filename_len,
+                        payload_slice.len()
+                    )));
+                }
+                let filename_bytes =
+                    &payload_slice[fn_bytes_offset..fn_bytes_offset + filename_len];
+                let filename = std::str::from_utf8(filename_bytes)
+                    .map_err(|e| {
+                        SyncError::MalformedPayload(format!(
+                            "PeerStatus invalid UTF-8 filename: {}",
+                            e
+                        ))
+                    })?
+                    .to_string();
+
+                PacketPayload::PeerStatus(PeerStatusPayload {
+                    client_id,
+                    has_media,
+                    is_ready,
+                    duration_ms,
+                    file_size_bytes,
+                    username,
+                    filename,
+                })
+            }
         };
 
         Ok(Self {
@@ -695,5 +854,79 @@ mod tests {
         } else {
             panic!("expected ChatMessage payload");
         }
+    }
+
+    #[test]
+    fn test_peer_status_roundtrip() {
+        let pkt = WirePacket::peer_status(
+            3,
+            true,
+            true,
+            7_200_000,
+            1_500_000_000,
+            "Gautham",
+            "sintel_trailer.mp4",
+        );
+        let bytes = pkt.to_bytes();
+
+        assert_eq!(&bytes[0..4], b"SPNT");
+        assert_eq!(bytes[4], 0x09); // type = PeerStatus
+
+        let parsed = WirePacket::from_bytes(&bytes).expect("parse peer status");
+        assert_eq!(pkt, parsed);
+
+        if let PacketPayload::PeerStatus(status) = parsed.payload {
+            assert_eq!(status.client_id, 3);
+            assert!(status.has_media);
+            assert!(status.is_ready);
+            assert_eq!(status.duration_ms, 7_200_000);
+            assert_eq!(status.file_size_bytes, 1_500_000_000);
+            assert_eq!(status.username, "Gautham");
+            assert_eq!(status.filename, "sintel_trailer.mp4");
+        } else {
+            panic!("expected PeerStatus payload");
+        }
+    }
+
+    #[test]
+    fn test_peer_status_empty_strings() {
+        let pkt = WirePacket::peer_status(0, false, false, 0, 0, "", "");
+        let bytes = pkt.to_bytes();
+        assert_eq!(bytes.len(), HEADER_LEN + 26);
+
+        let parsed = WirePacket::from_bytes(&bytes).expect("parse empty strings peer status");
+        assert_eq!(pkt, parsed);
+    }
+
+    #[test]
+    fn test_peer_status_unicode_and_large_values() {
+        let pkt = WirePacket::peer_status(
+            u32::MAX,
+            true,
+            false,
+            u64::MAX,
+            u64::MAX,
+            "ユーザーA 🎬",
+            "言の葉の庭_1080p.mkv",
+        );
+        let bytes = pkt.to_bytes();
+        let parsed = WirePacket::from_bytes(&bytes).expect("parse unicode peer status");
+        assert_eq!(pkt, parsed);
+    }
+
+    #[test]
+    fn test_peer_status_malformed_payload() {
+        // Create packet with truncated payload (< 26 bytes)
+        let mut bytes = WirePacket::peer_status(1, true, true, 100, 200, "user", "file").to_bytes();
+        // Set payload length to 10
+        bytes[6] = 10;
+        bytes[7] = 0;
+        // Recompute CRC for truncated 10 bytes
+        let truncated_crc = Crc32::digest(&bytes[HEADER_LEN..HEADER_LEN + 10]);
+        bytes[8..12].copy_from_slice(&truncated_crc.to_le_bytes());
+        bytes.truncate(HEADER_LEN + 10);
+
+        let res = WirePacket::from_bytes(&bytes);
+        assert!(matches!(res, Err(SyncError::MalformedPayload(_))));
     }
 }

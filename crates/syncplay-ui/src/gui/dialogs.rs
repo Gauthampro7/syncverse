@@ -144,12 +144,12 @@ impl HostPartyDialog {
                                 username: self.username.clone(),
                             });
 
-                            sidebar.members = vec![RoomMember {
-                                username: self.username.clone(),
-                                is_local: true,
-                                is_host: true,
-                                rtt_ms: 0.0,
-                            }];
+                            sidebar.members = vec![RoomMember::new(
+                                self.username.clone(),
+                                true,
+                                true,
+                                0.0,
+                            )];
                             sidebar.local_username = self.username.clone();
 
                             self.is_open = false;
@@ -263,14 +263,12 @@ impl ConnectPartyDialog {
                                 username: self.username.clone(),
                             });
 
-                            sidebar.members = vec![
-                                RoomMember {
-                                    username: self.username.clone(),
-                                    is_local: true,
-                                    is_host: false,
-                                    rtt_ms: 0.0,
-                                },
-                            ];
+                            sidebar.members = vec![RoomMember::new(
+                                self.username.clone(),
+                                true,
+                                false,
+                                0.0,
+                            )];
                             sidebar.local_username = self.username.clone();
 
                             self.is_open = false;

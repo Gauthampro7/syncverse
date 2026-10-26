@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui::{Context, ViewportBuilder, ViewportCommand};
+use egui::{Align2, Color32, Context, CornerRadius, Stroke, ViewportBuilder, ViewportCommand};
 use syncplay_chat::ChatRecord;
 use syncplay_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncplay_codecs::VideoFrameRGBA;
@@ -20,6 +20,28 @@ use crate::gui::recent_files::RecentFilesManager;
 use crate::gui::sidebar::SidebarState;
 use crate::gui::viewport::VideoViewport;
 use crate::snapshot::TripleBufferSnapshotExchange;
+
+/// Information for rendering the update notification banner.
+#[derive(Debug, Clone)]
+pub struct UpdateBannerInfo {
+    /// Latest remote version string.
+    pub latest_version: String,
+    /// Web URL to the GitHub release page.
+    pub release_url: String,
+    /// Direct download URL for the target installer or binary.
+    pub download_url: Option<String>,
+}
+
+/// Information for rendering the unpause gate blocked on-screen alert banner.
+#[derive(Debug, Clone)]
+pub struct UnpauseBlockedBanner {
+    /// List of unready usernames.
+    pub unready_peers: Vec<String>,
+    /// Alert announcement message.
+    pub message: String,
+    /// Alert emission instant.
+    pub timestamp: Instant,
+}
 
 /// Desktop application state implementing `eframe::App`.
 pub struct SyncplayApp {
@@ -37,8 +59,14 @@ pub struct SyncplayApp {
     clock: Arc<MasterClock>,
     command_tx: Sender<PlayerCommand>,
     event_rx: Receiver<UiEvent>,
+    local_event_tx: Sender<UiEvent>,
+    local_event_rx: Receiver<UiEvent>,
     chat_records: Vec<ChatRecord>,
     current_file: Option<PathBuf>,
+    update_info: Option<UpdateBannerInfo>,
+    is_update_banner_dismissed: bool,
+    update_status_toast: Option<(String, Instant)>,
+    unpause_blocked_banner: Option<UnpauseBlockedBanner>,
 }
 
 impl SyncplayApp {
@@ -52,6 +80,15 @@ impl SyncplayApp {
         event_rx: Receiver<UiEvent>,
         initial_file: Option<PathBuf>,
     ) -> Self {
+        let (local_event_tx, local_event_rx) = channel::<UiEvent>();
+
+        // Trigger asynchronous background update check on startup
+        crate::gui::updater::spawn_update_check(
+            env!("CARGO_PKG_VERSION"),
+            local_event_tx.clone(),
+            _cc.egui_ctx.clone(),
+        );
+
         let mut app = Self {
             viewport: VideoViewport::new(),
             controls_state: ControlsBarState::default(),
@@ -67,8 +104,14 @@ impl SyncplayApp {
             clock,
             command_tx,
             event_rx,
+            local_event_tx,
+            local_event_rx,
             chat_records: Vec::new(),
             current_file: None,
+            update_info: None,
+            is_update_banner_dismissed: false,
+            update_status_toast: None,
+            unpause_blocked_banner: None,
         };
 
         if let Some(path) = initial_file {
@@ -84,6 +127,7 @@ impl SyncplayApp {
         self.recent_files.add_file(&path);
         let _ = self.command_tx.send(PlayerCommand::OpenFile(path.clone()));
         self.current_file = Some(path);
+        self.sidebar_state.local_ready = true;
     }
 
     /// Appends a new chat record to the local in-memory view.
@@ -97,15 +141,66 @@ impl eframe::App for SyncplayApp {
         let ctx: Context = ui.ctx().clone();
         let now = Instant::now();
 
-        // 0. Drain events from playback and watch-party networking runtime
+        // 0. Drain events from playback runtime and local UI workers
+        let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+        while let Ok(event) = self.local_event_rx.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
             match event {
                 UiEvent::NewChatRecord(record) => {
                     self.chat_records.push(record);
                     self.sidebar_state.autoscroll = true;
                 }
                 UiEvent::RoomMembersUpdated(members) => {
+                    if let Some(local) = members.iter().find(|m| m.is_local) {
+                        self.sidebar_state.local_ready = local.is_ready;
+                    }
                     self.sidebar_state.members = members;
+                }
+                UiEvent::UnpauseBlocked {
+                    unready_peers,
+                    message,
+                } => {
+                    self.unpause_blocked_banner = Some(UnpauseBlockedBanner {
+                        unready_peers,
+                        message,
+                        timestamp: now,
+                    });
+                }
+                UiEvent::UpdateAvailable {
+                    latest_version,
+                    release_url,
+                    download_url,
+                } => {
+                    self.update_info = Some(UpdateBannerInfo {
+                        latest_version,
+                        release_url,
+                        download_url,
+                    });
+                    self.is_update_banner_dismissed = false;
+                    self.update_status_toast = None;
+                }
+                UiEvent::UpdateChecked {
+                    is_latest,
+                    current_version,
+                } => {
+                    if is_latest {
+                        self.update_status_toast = Some((
+                            format!("Syncplay-Alt v{} is up to date!", current_version),
+                            now,
+                        ));
+                    }
+                }
+                UiEvent::UpdateFailed { error } => {
+                    self.update_status_toast = Some((
+                        format!("Update check failed: {}", error),
+                        now,
+                    ));
                 }
             }
         }
@@ -212,6 +307,80 @@ impl eframe::App for SyncplayApp {
 
         // 7. Update video frames from SPSC ring against presentation clock
         self.viewport.update_playback(&ctx, &self.video_ring, &self.clock, now);
+
+        // 8a. Top Update Notification Banner (rendered when an update is available and not dismissed)
+        if self.controls_state.is_visible(now) {
+            if let Some(ref update) = self.update_info {
+                if !self.is_update_banner_dismissed {
+                    egui::Panel::top("update_notification_banner")
+                        .frame(
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(15, 23, 42))
+                                .inner_margin(egui::Margin::symmetric(14, 8))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 41, 59))),
+                        )
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("🚀 Update Available: v{}", update.latest_version))
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(56, 189, 248)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("(current: v{})", env!("CARGO_PKG_VERSION")))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(148, 163, 184)),
+                                );
+
+                                ui.add_space(8.0);
+
+                                if ui.button(egui::RichText::new("📥 Download").strong().color(egui::Color32::WHITE)).clicked() {
+                                    let target = update.download_url.as_deref().unwrap_or(&update.release_url);
+                                    let _ = crate::gui::updater::open_browser_url(target);
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+                                }
+
+                                if ui.button("Release Page").clicked() {
+                                    let _ = crate::gui::updater::open_browser_url(&update.release_url);
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(&update.release_url));
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("✖ Dismiss").clicked() {
+                                        self.is_update_banner_dismissed = true;
+                                    }
+                                });
+                            });
+                        });
+                }
+            } else if let Some((ref msg, timestamp)) = self.update_status_toast {
+                if now.duration_since(timestamp).as_secs() < 6 {
+                    let mut dismiss_toast = false;
+                    let toast_msg = msg.clone();
+                    egui::Panel::top("update_status_toast")
+                        .frame(
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(30, 41, 59))
+                                .inner_margin(egui::Margin::symmetric(14, 6)),
+                        )
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&toast_msg).color(egui::Color32::from_rgb(226, 232, 240)),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("✖").clicked() {
+                                        dismiss_toast = true;
+                                    }
+                                });
+                            });
+                        });
+                    if dismiss_toast {
+                        self.update_status_toast = None;
+                    }
+                }
+            }
+        }
 
         // 8. Top Menu Bar (hidden in fullscreen if controls auto-hidden)
         if self.controls_state.is_visible(now) {
@@ -358,12 +527,12 @@ impl eframe::App for SyncplayApp {
                             if ui.button("Disconnect / Leave Room").clicked() {
                                 ui.close();
                                 let _ = self.command_tx.send(PlayerCommand::DisconnectParty);
-                                self.sidebar_state.members = vec![crate::gui::sidebar::RoomMember {
-                                    username: self.sidebar_state.local_username.clone(),
-                                    is_local: true,
-                                    is_host: false,
-                                    rtt_ms: 0.0,
-                                }];
+                                self.sidebar_state.members = vec![crate::gui::sidebar::RoomMember::new(
+                                    self.sidebar_state.local_username.clone(),
+                                    true,
+                                    false,
+                                    0.0,
+                                )];
                             }
                             ui.separator();
                         }
@@ -393,6 +562,19 @@ impl eframe::App for SyncplayApp {
 
                     // --- HELP MENU ---
                     ui.menu_button("Help", |ui| {
+                        if ui.button("🔄 Check for Updates...").clicked() {
+                            ui.close();
+                            self.update_status_toast = Some((
+                                "Checking for updates...".to_string(),
+                                Instant::now(),
+                            ));
+                            crate::gui::updater::spawn_update_check(
+                                env!("CARGO_PKG_VERSION"),
+                                self.local_event_tx.clone(),
+                                ctx.clone(),
+                            );
+                        }
+                        ui.separator();
                         if ui.button("⌨ Keyboard Shortcuts & Controls (F1)").clicked() {
                             ui.close();
                             self.shortcuts_dialog.open();
@@ -469,6 +651,61 @@ impl eframe::App for SyncplayApp {
                     let _ = self.command_tx.send(PlayerCommand::TogglePause);
                 }
             });
+
+        // 11b. On-screen Unpause Blocked Alert Banner over Viewport
+        if let Some(ref banner) = self.unpause_blocked_banner.clone() {
+            if snapshot.is_playing() {
+                self.unpause_blocked_banner = None;
+            } else {
+                let mut dismiss = false;
+                let is_host = self.sidebar_state.members.iter().any(|m| m.is_local && m.is_host);
+
+                egui::Area::new(egui::Id::unique("unpause_blocked_alert_area"))
+                    .anchor(Align2::CENTER_TOP, [0.0, 48.0])
+                    .order(egui::Order::Foreground)
+                    .show(&ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(Color32::from_rgba_premultiplied(30, 20, 10, 240))
+                            .stroke(Stroke::new(1.5, Color32::from_rgb(245, 158, 11)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(16, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&banner.message)
+                                            .strong()
+                                            .color(Color32::from_rgb(254, 240, 138)),
+                                    );
+
+                                    if is_host {
+                                        ui.add_space(8.0);
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("⚡ Force Play")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(250, 204, 21)),
+                                            )
+                                            .on_hover_text("Bypass unpause gate and force start playback for all peers")
+                                            .clicked()
+                                        {
+                                            let _ = self.command_tx.send(PlayerCommand::ForcePlay);
+                                            dismiss = true;
+                                        }
+                                    }
+
+                                    ui.add_space(4.0);
+                                    if ui.button("✖").on_hover_text("Dismiss alert").clicked() {
+                                        dismiss = true;
+                                    }
+                                });
+                            });
+                    });
+
+                if dismiss {
+                    self.unpause_blocked_banner = None;
+                }
+            }
+        }
 
         // 12. Modal Dialogs
         self.host_dialog.show(&ctx, &mut self.sidebar_state, &self.command_tx);

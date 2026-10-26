@@ -3,6 +3,7 @@
 #![deny(warnings)]
 #![deny(missing_docs)]
 
+pub mod announcements;
 pub mod commands;
 pub mod error;
 pub mod export;
@@ -10,6 +11,11 @@ pub mod index;
 pub mod record;
 pub mod storage;
 pub mod store;
+
+pub use announcements::{
+    format_timecode, format_timecode_hms, RoomAnnouncement, RoomAnnouncementEvent,
+    SYSTEM_SENDER_ID, SYSTEM_SENDER_NAME,
+};
 
 pub use commands::{
     format_sync_status_report, parse_time_to_ms, ActivePoll, Bookmark, ClipDefinition,

@@ -8,7 +8,7 @@
 //!    - Accurate preservation of dual timestamps ($t_{wall}, t_{media}$)
 //! 2. Corrupted datagram fuzzing and crash resilience:
 //!    - Truncated headers (0..11 bytes)
-//!    - Unknown opcodes (0x00, 0x07, 0x09, 0x0A, 0x7F, 0xFF)
+//!    - Unknown opcodes (0x00, 0x07, 0x0A, 0x7F, 0xFF)
 //!    - Truncated payloads and sub-20-byte ChatMessage payloads
 //!    - Bit-flipped CRC32 headers and payload bodies
 //!    - Oversized payloads and raw MTU-exceeding datagrams
@@ -299,8 +299,8 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
         );
     }
 
-    // --- Sub-test 2.2: Unknown opcodes (0x00, 0x07, 0x09, 0x0A, 0x7F, 0xFF) ---
-    for &bad_op in &[0x00u8, 0x07, 0x09, 0x0A, 0x33, 0x7F, 0xFE, 0xFF] {
+    // --- Sub-test 2.2: Unknown opcodes (0x00, 0x07, 0x0A, 0x7F, 0xFF) ---
+    for &bad_op in &[0x00u8, 0x07, 0x0A, 0x33, 0x7F, 0xFE, 0xFF] {
         let mut pkt = valid_bytes.clone();
         pkt[4] = bad_op;
         raw_sock.send_to(&pkt, host_addr).unwrap();

@@ -20,10 +20,11 @@ pub use debouncer::SeekDebouncer;
 pub use error::UiError;
 pub use event::UiEvent;
 pub use gui::{
-    controls_style, create_native_options, is_supported_media, run_desktop_gui, run_desktop_player,
-    ControlsBarAction, ControlsBarState, DragDropHandler, FileDialogManager, PlaybackControlsBar,
-    RecentFilesManager, RoomMember, SidebarState, SyncplayApp, VideoTextureBuffer, VideoViewport,
-    ViewportAction, ViewportDisplayMode, ViewportGeometry, VolumeControlState, SUPPORTED_EXTENSIONS,
+    controls_style, create_native_options, evaluate_file_match, format_duration_hms,
+    is_supported_media, run_desktop_gui, run_desktop_player, ControlsBarAction, ControlsBarState,
+    DragDropHandler, FileDialogManager, FileMatchStatus, PlaybackControlsBar, RecentFilesManager,
+    RoomMember, SidebarState, SyncplayApp, VideoTextureBuffer, VideoViewport, ViewportAction,
+    ViewportDisplayMode, ViewportGeometry, VolumeControlState, SUPPORTED_EXTENSIONS,
     SUPPORTED_SPEEDS,
 };
 pub use osd::{
@@ -39,7 +40,11 @@ pub use render::{
     render_sync_diagnostics_panel, ScrubberStyle,
 };
 pub use scrubber::ScrubberDebouncer;
-pub use snapshot::{PlayerUiSnapshot, TripleBufferSnapshotExchange};
+pub use snapshot::{
+    PlayerUiSnapshot, TripleBufferSnapshotExchange, PLAYBACK_STATE_BUFFERING, PLAYBACK_STATE_PAUSED,
+    PLAYBACK_STATE_PLAYING, PLAYBACK_STATE_SEEKING, SNAPSHOT_FLAG_FORCE_PLAY,
+    SNAPSHOT_FLAG_GATE_BLOCKED, SNAPSHOT_FLAG_HAS_MISMATCH, SNAPSHOT_FLAG_LOCAL_READY,
+};
 pub use terminal::{
     get_terminal_size, parse_key_sequence, render_hotkeys_footer, render_osd_hud,
     render_scrubber_bar, KeyCommand, OsdHudState, TerminalGuard,

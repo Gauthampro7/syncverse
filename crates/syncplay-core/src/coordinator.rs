@@ -192,8 +192,11 @@ impl PlayerCoordinator {
             }
             PlayerCommand::HostParty { .. }
             | PlayerCommand::ConnectParty { .. }
-            | PlayerCommand::DisconnectParty => {
-                // Handled in watch-party networking integration
+            | PlayerCommand::DisconnectParty
+            | PlayerCommand::SetReady(_)
+            | PlayerCommand::SetForcePlay(_)
+            | PlayerCommand::ForcePlay => {
+                // Handled in watch-party networking integration / playback runtime
             }
         }
         Ok(())

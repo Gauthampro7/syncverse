@@ -12,7 +12,9 @@ use crate::error::SyncError;
 use crate::ntp::{ProbeSample, Rfc5905Filter};
 use crate::pll::{PllCorrection, PllSpeedController, PllZone};
 use crate::timeline::RoomState;
-use crate::wire::{ChatMessagePayload, PacketPayload, WirePacket, FLAG_BARRIER_COMMIT};
+use crate::wire::{
+    ChatMessagePayload, PacketPayload, PeerStatusPayload, WirePacket, FLAG_BARRIER_COMMIT,
+};
 
 /// Non-blocking UDP transport wrapper for watch-party synchronization.
 pub struct UdpSyncTransport {
@@ -78,8 +80,20 @@ pub struct ClientSession {
     pub rtt_ms: u64,
     /// Last received instant.
     pub last_seen: Instant,
-    /// Whether client completed pre-roll decode and reported ready.
-    pub is_ready: bool,
+    /// Whether client completed pre-roll decode and reported ready for current barrier session.
+    pub barrier_preroll_ready: bool,
+    /// Persistent readiness state of the peer ("Ready to Watch" checkbox).
+    pub is_user_ready: bool,
+    /// Whether peer currently has media loaded.
+    pub has_media: bool,
+    /// Loaded media file basename.
+    pub filename: String,
+    /// Media container duration in milliseconds.
+    pub duration_ms: u64,
+    /// Media file size on disk in bytes.
+    pub file_size_bytes: u64,
+    /// Peer username.
+    pub username: String,
 }
 
 /// Host watch-party server managing UDP transport, NTP timekeeping, and barrier synchronization.
@@ -148,7 +162,13 @@ impl HostServer {
                 addr,
                 rtt_ms,
                 last_seen: Instant::now(),
-                is_ready: false,
+                barrier_preroll_ready: false,
+                is_user_ready: false,
+                has_media: false,
+                filename: String::new(),
+                duration_ms: 0,
+                file_size_bytes: 0,
+                username: String::new(),
             },
         );
     }
@@ -213,7 +233,13 @@ impl HostServer {
                     addr,
                     rtt_ms: 0,
                     last_seen: now,
-                    is_ready: false,
+                    barrier_preroll_ready: false,
+                    is_user_ready: false,
+                    has_media: false,
+                    filename: String::new(),
+                    duration_ms: 0,
+                    file_size_bytes: 0,
+                    username: String::new(),
                 });
 
             match &packet.payload {
@@ -238,7 +264,7 @@ impl HostServer {
                 PacketPayload::BarrierReady(ready) => {
                     if ready.session_id == self.barrier_session_id {
                         if let Some(client) = self.clients.get_mut(&addr) {
-                            client.is_ready = true;
+                            client.barrier_preroll_ready = true;
                         }
                     }
                 }
@@ -249,6 +275,27 @@ impl HostServer {
                 PacketPayload::ChatMessage(chat) => {
                     self.chat_messages.push(chat.clone());
                     // Relay chat message to all other connected peers except sender
+                    let targets: Vec<SocketAddr> = self
+                        .clients
+                        .keys()
+                        .filter(|&&c_addr| c_addr != addr)
+                        .copied()
+                        .collect();
+                    for target in targets {
+                        let _ = self.transport.send_packet(packet, target);
+                    }
+                }
+                PacketPayload::PeerStatus(status) => {
+                    if let Some(client) = self.clients.get_mut(&addr) {
+                        client.client_id = status.client_id;
+                        client.has_media = status.has_media;
+                        client.is_user_ready = status.is_ready;
+                        client.duration_ms = status.duration_ms;
+                        client.file_size_bytes = status.file_size_bytes;
+                        client.username = status.username.clone();
+                        client.filename = status.filename.clone();
+                    }
+                    // Relay PeerStatus packet to all other connected peers except sender
                     let targets: Vec<SocketAddr> = self
                         .clients
                         .keys()
@@ -327,9 +374,9 @@ impl HostServer {
         self.barrier_session_id = self.barrier_session_id.wrapping_add(1);
         self.scheduled_unpause_server_ms = Some(target_unpause_server_ms);
 
-        // Reset readiness on all clients
+        // Reset barrier preroll readiness on all clients
         for client in self.clients.values_mut() {
-            client.is_ready = false;
+            client.barrier_preroll_ready = false;
         }
 
         self.barrier.prepare_unpause(now_ms, max_rtt, self.ref_media_pts_ms);
@@ -355,7 +402,64 @@ impl HostServer {
         if self.clients.is_empty() {
             return true;
         }
-        self.clients.values().all(|c| c.is_ready)
+        self.clients.values().all(|c| c.barrier_preroll_ready)
+    }
+
+    /// Returns true if all registered clients have media loaded and have marked themselves ready.
+    pub fn are_all_users_ready(&self) -> bool {
+        if self.clients.is_empty() {
+            return true;
+        }
+        self.clients.values().all(|c| c.is_user_ready && c.has_media)
+    }
+
+    /// Returns a list of unready client IDs and usernames (clients without media or marked not ready).
+    pub fn get_unready_clients(&self) -> Vec<(u32, String)> {
+        self.clients
+            .values()
+            .filter(|c| !c.is_user_ready || !c.has_media)
+            .map(|c| (c.client_id, c.username.clone()))
+            .collect()
+    }
+
+    /// Returns a snapshot of all connected clients' peer statuses.
+    pub fn peer_statuses(&self) -> Vec<PeerStatusPayload> {
+        self.clients
+            .values()
+            .map(|c| PeerStatusPayload {
+                client_id: c.client_id,
+                has_media: c.has_media,
+                is_ready: c.is_user_ready,
+                duration_ms: c.duration_ms,
+                file_size_bytes: c.file_size_bytes,
+                username: c.username.clone(),
+                filename: c.filename.clone(),
+            })
+            .collect()
+    }
+
+    /// Broadcasts a `PeerStatus` packet to all registered clients.
+    pub fn broadcast_peer_status(
+        &mut self,
+        status: &PeerStatusPayload,
+    ) -> Result<usize, SyncError> {
+        let packet = WirePacket::peer_status(
+            status.client_id,
+            status.has_media,
+            status.is_ready,
+            status.duration_ms,
+            status.file_size_bytes,
+            &status.username,
+            &status.filename,
+        );
+        let mut sent_count = 0;
+        let targets: Vec<SocketAddr> = self.clients.keys().copied().collect();
+        for addr in targets {
+            if self.transport.send_packet(&packet, addr).is_ok() {
+                sent_count += 1;
+            }
+        }
+        Ok(sent_count)
     }
 
     /// Commits the unpause barrier sequence, broadcasting commit confirmation to all peers.
@@ -420,6 +524,8 @@ pub struct ClientNode {
     is_playing: bool,
     chat_messages: Vec<ChatMessagePayload>,
     next_chat_seq: u32,
+    peer_statuses: HashMap<u32, PeerStatusPayload>,
+    pending_peer_statuses: Vec<PeerStatusPayload>,
 }
 
 impl ClientNode {
@@ -447,6 +553,8 @@ impl ClientNode {
             is_playing: false,
             chat_messages: Vec::new(),
             next_chat_seq: 1,
+            peer_statuses: HashMap::new(),
+            pending_peer_statuses: Vec::new(),
         })
     }
 
@@ -613,6 +721,10 @@ impl ClientNode {
                     PacketPayload::ChatMessage(chat) => {
                         self.chat_messages.push(chat.clone());
                     }
+                    PacketPayload::PeerStatus(status) => {
+                        self.peer_statuses.insert(status.client_id, status.clone());
+                        self.pending_peer_statuses.push(status.clone());
+                    }
                     PacketPayload::NtpProbeRequest(req) => {
                         let t2 = self.current_local_nanos();
                         let t3 = self.current_local_nanos();
@@ -629,6 +741,51 @@ impl ClientNode {
     /// Drains and returns all pending received chat messages from the host server.
     pub fn poll_chat_messages(&mut self) -> Vec<ChatMessagePayload> {
         std::mem::take(&mut self.chat_messages)
+    }
+
+    /// Drains and returns all pending received peer status updates.
+    pub fn poll_peer_statuses(&mut self) -> Vec<PeerStatusPayload> {
+        std::mem::take(&mut self.pending_peer_statuses)
+    }
+
+    /// Returns a reference to all received peer status records indexed by client ID.
+    pub fn peer_statuses(&self) -> &HashMap<u32, PeerStatusPayload> {
+        &self.peer_statuses
+    }
+
+    /// Returns the cached status for a specific client ID, if known.
+    pub fn get_peer_status(&self, client_id: u32) -> Option<&PeerStatusPayload> {
+        self.peer_statuses.get(&client_id)
+    }
+
+    /// Broadcasts local peer media metadata and user readiness to the host server.
+    ///
+    /// Sanitizes the filename to its basename to avoid leaking local filesystem paths.
+    pub fn send_peer_status(
+        &mut self,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: &str,
+        filename: &str,
+    ) -> Result<(), SyncError> {
+        let clean_filename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(filename);
+
+        let packet = WirePacket::peer_status(
+            self.client_id,
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username,
+            clean_filename,
+        );
+        self.transport.send_packet(&packet, self.host_addr)?;
+        Ok(())
     }
 
     /// Sends an in-band chat message payload to the host server.

@@ -13,7 +13,7 @@ use crate::command::PlayerCommand;
 use crate::overlay::{evaluate_sync_health, SyncBadgeColor};
 use crate::snapshot::PlayerUiSnapshot;
 
-/// Room member in active watch-party session.
+/// Room member in active watch-party session with media & readiness metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomMember {
     /// Member username.
@@ -24,6 +24,133 @@ pub struct RoomMember {
     pub is_host: bool,
     /// Round-trip time in milliseconds.
     pub rtt_ms: f64,
+    /// Loaded media file name (base name without full path). None if no file loaded.
+    pub file_name: Option<String>,
+    /// Media container duration in milliseconds. None if no file loaded.
+    pub duration_ms: Option<u64>,
+    /// Media file size in bytes. None if no file loaded.
+    pub file_size_bytes: Option<u64>,
+    /// Readiness state ("Ready to Watch" vs "Not Ready").
+    pub is_ready: bool,
+}
+
+impl RoomMember {
+    /// Constructs a basic room member without media info.
+    pub fn new(username: String, is_local: bool, is_host: bool, rtt_ms: f64) -> Self {
+        Self {
+            username,
+            is_local,
+            is_host,
+            rtt_ms,
+            file_name: None,
+            duration_ms: None,
+            file_size_bytes: None,
+            is_ready: false,
+        }
+    }
+
+    /// Constructs a room member with full media and readiness metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_media(
+        username: String,
+        is_local: bool,
+        is_host: bool,
+        rtt_ms: f64,
+        file_name: Option<String>,
+        duration_ms: Option<u64>,
+        file_size_bytes: Option<u64>,
+        is_ready: bool,
+    ) -> Self {
+        Self {
+            username,
+            is_local,
+            is_host,
+            rtt_ms,
+            file_name,
+            duration_ms,
+            file_size_bytes,
+            is_ready,
+        }
+    }
+}
+
+/// Formats millisecond duration into standard `HH:MM:SS` timecode.
+#[inline]
+pub fn format_duration_hms(duration_ms: u64) -> String {
+    let total_sec = duration_ms / 1000;
+    let h = total_sec / 3600;
+    let m = (total_sec % 3600) / 60;
+    let s = total_sec % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+/// Evaluation result for comparing peer media against local media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMatchStatus {
+    /// Files match within ±2000ms duration or identical case-insensitive filename.
+    Match,
+    /// Files differ significantly in duration and filename.
+    Mismatch,
+    /// Peer has no media loaded.
+    NoFileLoaded,
+}
+
+impl FileMatchStatus {
+    /// Returns the UI display badge label for this match status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Match => "[Match ✔]",
+            Self::Mismatch => "[⚠️ Mismatch]",
+            Self::NoFileLoaded => "[⏳ No file loaded]",
+        }
+    }
+}
+
+/// Helper extracting filename basename across both Unix and Windows separators.
+#[inline]
+pub fn extract_basename(path_str: &str) -> &str {
+    let s = path_str.rsplit('/').next().unwrap_or(path_str);
+    s.rsplit('\\').next().unwrap_or(s)
+}
+
+/// Evaluates file match diagnostics between local and peer media.
+///
+/// Rules:
+/// - If peer has no file name or empty string: `NoFileLoaded`.
+/// - If local has no file, returns `Mismatch`.
+/// - If duration matches within ±2000ms OR filename matches (case-insensitive basename): `Match`.
+/// - Otherwise: `Mismatch`.
+pub fn evaluate_file_match(
+    local_file: Option<&str>,
+    local_duration_ms: Option<u64>,
+    peer_file: Option<&str>,
+    peer_duration_ms: Option<u64>,
+) -> FileMatchStatus {
+    let peer_file = match peer_file {
+        Some(f) if !f.trim().is_empty() => f.trim(),
+        _ => return FileMatchStatus::NoFileLoaded,
+    };
+
+    let local_file = match local_file {
+        Some(f) if !f.trim().is_empty() => f.trim(),
+        _ => return FileMatchStatus::Mismatch,
+    };
+
+    let local_base = extract_basename(local_file);
+    let peer_base = extract_basename(peer_file);
+
+    let filename_match = local_base.eq_ignore_ascii_case(peer_base);
+
+    let duration_match = match (local_duration_ms, peer_duration_ms) {
+        (Some(loc), Some(peer)) => loc.abs_diff(peer) <= 2000,
+        _ => false,
+    };
+
+    if filename_match || duration_match {
+        FileMatchStatus::Match
+    } else {
+        FileMatchStatus::Mismatch
+    }
 }
 
 /// Persistent state for the watch-party sidebar panel.
@@ -49,6 +176,10 @@ pub struct SidebarState {
     pub request_open_host_dialog: bool,
     /// Request opening Connect Party dialog.
     pub request_open_connect_dialog: bool,
+    /// Local user readiness state ("Ready to Watch" checkbox).
+    pub local_ready: bool,
+    /// Host force play bypass state.
+    pub force_play: bool,
 }
 
 impl Default for SidebarState {
@@ -60,15 +191,17 @@ impl Default for SidebarState {
             autoscroll: true,
             active_poll: None,
             dispatcher: SlashCommandDispatcher::new(),
-            members: vec![RoomMember {
-                username: std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
-                is_local: true,
-                is_host: true,
-                rtt_ms: 0.0,
-            }],
+            members: vec![RoomMember::new(
+                std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+                true,
+                true,
+                0.0,
+            )],
             local_username: std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
             request_open_host_dialog: false,
             request_open_connect_dialog: false,
+            local_ready: false,
+            force_play: false,
         }
     }
 }
@@ -170,12 +303,12 @@ impl SidebarState {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Disconnect").on_hover_text("Leave the watch party room").clicked() {
                         let _ = command_tx.send(PlayerCommand::DisconnectParty);
-                        self.members = vec![RoomMember {
-                            username: self.local_username.clone(),
-                            is_local: true,
-                            is_host: false,
-                            rtt_ms: 0.0,
-                        }];
+                        self.members = vec![RoomMember::new(
+                            self.local_username.clone(),
+                            true,
+                            false,
+                            0.0,
+                        )];
                     }
                 });
             });
@@ -189,7 +322,7 @@ impl SidebarState {
         ui.separator();
 
         // --- 3. ROOM MEMBERS LIST ---
-        self.render_members_list(ui);
+        self.render_members_list(ui, command_tx);
 
         ui.separator();
 
@@ -286,28 +419,139 @@ impl SidebarState {
         }
     }
 
-    /// Renders list of room members with host and local user highlighting.
-    fn render_members_list(&self, ui: &mut Ui) {
+    /// Renders list of room members with host/local user highlighting, readiness badges,
+    /// loaded media metadata, file matching diagnostics, and host force play controls.
+    fn render_members_list(&mut self, ui: &mut Ui, command_tx: &Sender<PlayerCommand>) {
+        let is_host = self.members.iter().any(|m| m.is_local && m.is_host);
+
         ui.collapsing(format!("Members ({})", self.members.len()), |ui| {
+            // 1. Interactive readiness toggle and Host bypass controls
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut self.local_ready, "Ready to Watch")
+                    .on_hover_text("Signal to room peers that you are ready to watch")
+                    .changed()
+                {
+                    let _ = command_tx.send(PlayerCommand::SetReady(self.local_ready));
+                }
+
+                if is_host
+                    && ui
+                        .checkbox(&mut self.force_play, "⚡ Force Play")
+                        .on_hover_text("Bypass unpause gate if peers are idle or unready")
+                        .changed()
+                {
+                    let _ = command_tx.send(PlayerCommand::SetForcePlay(self.force_play));
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Find local member to compare against
+            let local_member = self.members.iter().find(|m| m.is_local).cloned();
+
             for member in &self.members {
-                ui.horizontal(|ui| {
-                    if member.is_host {
-                        ui.label(egui::RichText::new("★").color(Color32::from_rgb(250, 204, 21)));
-                    } else {
-                        ui.label("👤");
-                    }
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        if member.is_host {
+                            ui.label(egui::RichText::new("★").color(Color32::from_rgb(250, 204, 21)));
+                        } else {
+                            ui.label("👤");
+                        }
 
-                    if member.is_local {
-                        ui.label(egui::RichText::new(format!("{} (You)", member.username)).strong().color(Color32::from_rgb(96, 165, 250)));
-                    } else {
-                        ui.label(&member.username);
-                    }
+                        if member.is_local {
+                            ui.label(
+                                egui::RichText::new(format!("{} (You)", member.username))
+                                    .strong()
+                                    .color(Color32::from_rgb(96, 165, 250)),
+                            );
+                        } else {
+                            ui.label(&member.username);
+                        }
 
-                    if member.rtt_ms > 0.0 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(format!("{:.0}ms", member.rtt_ms)).small().color(Color32::GRAY));
-                        });
-                    }
+                        // Readiness badge: [✓ Ready] (green) vs [⏳ Not Ready] (amber)
+                        if member.is_ready {
+                            ui.label(
+                                egui::RichText::new("[✓ Ready]")
+                                    .color(Color32::from_rgb(34, 197, 94))
+                                    .small(),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("[⏳ Not Ready]")
+                                    .color(Color32::from_rgb(245, 158, 11))
+                                    .small(),
+                            );
+                        }
+
+                        if member.rtt_ms > 0.0 {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{:.0}ms", member.rtt_ms))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            });
+                        }
+                    });
+
+                    // Media status & diagnostic badge row
+                    ui.horizontal(|ui| {
+                        if let Some(ref fname) = member.file_name {
+                            let dur_str = member
+                                .duration_ms
+                                .map(format_duration_hms)
+                                .unwrap_or_else(|| "--:--:--".to_string());
+                            ui.label(
+                                egui::RichText::new(format!("📄 {} ({})", fname, dur_str))
+                                    .small()
+                                    .color(Color32::from_rgb(203, 213, 225)),
+                            );
+
+                            // Compare peer media against local media
+                            if !member.is_local {
+                                if let Some(ref local) = local_member {
+                                    let match_st = evaluate_file_match(
+                                        local.file_name.as_deref(),
+                                        local.duration_ms,
+                                        Some(fname.as_str()),
+                                        member.duration_ms,
+                                    );
+                                    match match_st {
+                                        FileMatchStatus::Match => {
+                                            ui.label(
+                                                egui::RichText::new("[Match ✔]")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(34, 197, 94)),
+                                            );
+                                        }
+                                        FileMatchStatus::Mismatch => {
+                                            ui.label(
+                                                egui::RichText::new("[⚠️ Mismatch]")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(245, 158, 11)),
+                                            );
+                                        }
+                                        FileMatchStatus::NoFileLoaded => {
+                                            ui.label(
+                                                egui::RichText::new("[⏳ No file loaded]")
+                                                    .small()
+                                                    .color(Color32::from_rgb(148, 163, 184)),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("[⏳ No file loaded]")
+                                    .small()
+                                    .color(Color32::from_rgb(148, 163, 184)),
+                            );
+                        }
+                    });
                 });
             }
         });
@@ -487,5 +731,166 @@ impl SidebarState {
         } else {
             let _ = command_tx.send(PlayerCommand::SendChatMessage(text));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_duration_hms() {
+        assert_eq!(format_duration_hms(0), "00:00:00");
+        assert_eq!(format_duration_hms(5_000), "00:00:05");
+        assert_eq!(format_duration_hms(65_000), "00:01:05");
+        assert_eq!(format_duration_hms(3_665_000), "01:01:05");
+        assert_eq!(format_duration_hms(36_000_000), "10:00:00");
+    }
+
+    #[test]
+    fn test_evaluate_file_match_no_peer_file() {
+        assert_eq!(
+            evaluate_file_match(Some("movie.mkv"), Some(120_000), None, None),
+            FileMatchStatus::NoFileLoaded
+        );
+        assert_eq!(
+            evaluate_file_match(Some("movie.mkv"), Some(120_000), Some(""), None),
+            FileMatchStatus::NoFileLoaded
+        );
+        assert_eq!(
+            evaluate_file_match(Some("movie.mkv"), Some(120_000), Some("   "), None),
+            FileMatchStatus::NoFileLoaded
+        );
+    }
+
+    #[test]
+    fn test_evaluate_file_match_duration_within_tolerance() {
+        // Exact match
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie.mkv"),
+                Some(120_000),
+                Some("other.mkv"),
+                Some(120_000)
+            ),
+            FileMatchStatus::Match
+        );
+
+        // Within +2000ms
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie.mkv"),
+                Some(120_000),
+                Some("different_name.mp4"),
+                Some(122_000)
+            ),
+            FileMatchStatus::Match
+        );
+
+        // Within -2000ms
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie.mkv"),
+                Some(120_000),
+                Some("different_name.mp4"),
+                Some(118_000)
+            ),
+            FileMatchStatus::Match
+        );
+    }
+
+    #[test]
+    fn test_evaluate_file_match_filename_basename_match() {
+        // Case-insensitive basename match with different paths and different durations
+        assert_eq!(
+            evaluate_file_match(
+                Some("/home/user/Videos/Big_Buck_Bunny.mkv"),
+                Some(600_000),
+                Some("C:\\Users\\Friend\\Downloads\\big_buck_bunny.mkv"),
+                Some(900_000)
+            ),
+            FileMatchStatus::Match
+        );
+
+        assert_eq!(
+            evaluate_file_match(
+                Some("EPISODE_01.MP4"),
+                None,
+                Some("episode_01.mp4"),
+                None
+            ),
+            FileMatchStatus::Match
+        );
+    }
+
+    #[test]
+    fn test_evaluate_file_match_mismatch() {
+        // Different filename AND duration diff > 2000ms
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie_a.mkv"),
+                Some(120_000),
+                Some("movie_b.mkv"),
+                Some(125_000)
+            ),
+            FileMatchStatus::Mismatch
+        );
+
+        // Local has no file loaded
+        assert_eq!(
+            evaluate_file_match(None, None, Some("movie_b.mkv"), Some(125_000)),
+            FileMatchStatus::Mismatch
+        );
+    }
+
+    #[test]
+    fn test_evaluate_file_match_overflow_safety() {
+        // Extreme duration values must not panic on subtraction and must not falsely match
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie_a.mkv"),
+                Some(u64::MAX),
+                Some("movie_b.mkv"),
+                Some(0)
+            ),
+            FileMatchStatus::Mismatch
+        );
+
+        assert_eq!(
+            evaluate_file_match(
+                Some("movie_a.mkv"),
+                Some(0),
+                Some("movie_b.mkv"),
+                Some(1u64 << 63)
+            ),
+            FileMatchStatus::Mismatch
+        );
+    }
+
+    #[test]
+    fn test_room_member_constructors() {
+        let member = RoomMember::new("Alice".to_string(), true, true, 12.5);
+        assert_eq!(member.username, "Alice");
+        assert!(member.is_local);
+        assert!(member.is_host);
+        assert_eq!(member.rtt_ms, 12.5);
+        assert_eq!(member.file_name, None);
+        assert_eq!(member.duration_ms, None);
+        assert_eq!(member.file_size_bytes, None);
+        assert!(!member.is_ready);
+
+        let member_media = RoomMember::with_media(
+            "Bob".to_string(),
+            false,
+            false,
+            35.0,
+            Some("video.mp4".to_string()),
+            Some(600_000),
+            Some(1024 * 1024 * 50),
+            true,
+        );
+        assert_eq!(member_media.file_name.as_deref(), Some("video.mp4"));
+        assert_eq!(member_media.duration_ms, Some(600_000));
+        assert!(member_media.is_ready);
     }
 }

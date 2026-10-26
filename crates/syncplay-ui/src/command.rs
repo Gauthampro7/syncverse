@@ -43,4 +43,10 @@ pub enum PlayerCommand {
     },
     /// Leave or disconnect from the current watch-party room.
     DisconnectParty,
+    /// Set local user readiness state ("Ready to Watch" checkbox).
+    SetReady(bool),
+    /// Set host Force Play bypass state.
+    SetForcePlay(bool),
+    /// Host trigger to bypass unpause gate immediately.
+    ForcePlay,
 }
