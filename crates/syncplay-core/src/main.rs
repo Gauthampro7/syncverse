@@ -36,7 +36,7 @@ fn main() {
             print_usage();
         }
         "version" | "--version" | "-v" => {
-            println!("syncplay-alt v0.1.0 (pure-Rust standalone player, VLC-grade desktop UI)");
+            println!("syncplay-alt v0.1.1 (pure-Rust standalone player, VLC-grade desktop UI)");
         }
         "verify" => {
             run_verify_command();

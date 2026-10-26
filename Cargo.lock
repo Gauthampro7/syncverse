@@ -3202,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-chat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "syncplay-common",
  "syncplay-sync",
@@ -3211,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-clock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "syncplay-codecs",
  "syncplay-common",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-codecs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
  "syncplay-common",
@@ -3229,14 +3229,14 @@ dependencies = [
 
 [[package]]
 name = "syncplay-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "syncplay-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
  "syncplay-chat",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-demux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
  "syncplay-common",
@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-sync"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "syncplay-clock",
  "syncplay-common",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "syncplay-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui",

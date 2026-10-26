@@ -453,7 +453,7 @@ impl AboutDialog {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.heading("Syncplay-Alt");
-                    ui.label(RichText::new("v0.1.0").color(Color32::from_rgb(96, 165, 250)));
+                    ui.label(RichText::new("v0.1.1").color(Color32::from_rgb(96, 165, 250)));
                 });
                 ui.label(RichText::new("Pure-Rust Standalone Media Player & High-Precision Watch Party Engine").italics().color(Color32::from_rgb(156, 163, 175)));
                 ui.separator();

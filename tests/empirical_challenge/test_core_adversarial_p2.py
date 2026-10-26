@@ -76,7 +76,7 @@ def test_1_cli_banner_usage_version():
     # 1C. Version flags
     for flag in ["version", "--version", "-v"]:
         out, _ = run_cmd([flag], expect_exit=0)
-        assert "syncplay-alt v0.1.0" in out
+        assert "syncplay-alt v0.1.1" in out
         assert "pure-Rust" in out
 
     # 1D. Unknown commands

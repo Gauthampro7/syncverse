@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName "Syncplay Alt"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #define MyAppPublisher "Syncplay Alt Project"
 #define MyAppURL "https://github.com/Gauthampro7/syncplay-desktop-preview"
 #define MyAppExeName "syncplay-alt.exe"

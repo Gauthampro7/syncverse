@@ -470,7 +470,7 @@ fn test_cli_version_and_help() {
         .expect("failed to run syncplay-alt version");
     assert!(out_ver.status.success());
     let stdout_ver = strip_ansi(&String::from_utf8_lossy(&out_ver.stdout));
-    assert!(stdout_ver.contains("syncplay-alt v0.1.0"));
+    assert!(stdout_ver.contains("syncplay-alt v0.1.1"));
 
     // 2. --help
     let out_help = Command::new(&bin)
