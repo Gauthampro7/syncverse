@@ -43,29 +43,34 @@ jobs:
           choco install innosetup --no-progress -y
 
       - name: Install FFmpeg Development Libraries
+        shell: powershell
         run: |
-          # Download prebuilt Windows FFmpeg shared dev libraries
           $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Write-Host "Downloading FFmpeg from $ffmpegUrl..."
           Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dist
-          $ffmpegPath = Resolve-Path ffmpeg-dist\ffmpeg-master-*-win64-gpl-shared
-          echo "FFMPEG_DIR=$ffmpegPath" >> $env:GITHUB_ENV
-          echo "$ffmpegPath\bin" >> $env:GITHUB_PATH
+          $ffmpegDir = (Get-Item "ffmpeg-dist\ffmpeg-master-*-win64-gpl-shared").FullName
+          Write-Host "Resolved FFMPEG_DIR: $ffmpegDir"
+          "FFMPEG_DIR=$ffmpegDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$ffmpegDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Compile Release Binary
+        shell: powershell
         run: |
           cargo build --release --bin syncplay-alt
 
       - name: Stage Runtime DLLs
+        shell: powershell
         run: |
-          # Copy FFmpeg shared DLLs next to syncplay-alt.exe so the installer bundles them
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" -Destination "target\release\" -Force
 
       - name: Build Inno Setup Installer
+        shell: powershell
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
 
       - name: Compute SHA-256 Checksums
+        shell: powershell
         run: |
           Get-FileHash -Path target\windows-dist\*.exe -Algorithm SHA256 | Out-File -FilePath target\windows-dist\SHA256SUMS.txt
           Get-Content target\windows-dist\SHA256SUMS.txt
