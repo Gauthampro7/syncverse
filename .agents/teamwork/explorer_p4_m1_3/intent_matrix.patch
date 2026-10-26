@@ -1,0 +1,52 @@
+--- /home/gautham/syncplay-alt/.pi/harness/intent_matrix.json	2026-10-25 14:23:44.993021166 +0530
++++ /home/gautham/syncplay-alt/.agents/teamwork/explorer_p4_m1_3/proposed_intent_matrix.json	2026-10-26 02:01:50.367016394 +0530
+@@ -1,12 +1,12 @@
+ {
+-  "version": "1.0.0",
++  "version": "4.0.0",
+   "framework": "pi-framework",
+   "authority": "AGENTS.md",
+   "intents": [
+     {
+       "id": "INTENT-01",
+-      "name": "Zero-External-Codec Invariant",
+-      "description": "Container demuxing, video/audio bitstream decoding, color space transformation, clock synchronization, and smart chat persistence must be built from first principles in pure Rust with zero external multimedia or database engines.",
++      "name": "Universal Media Compatibility & Zero Monolithic Player / Database Wrappers",
++      "description": "Comprehensive container demuxing (MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1; AAC, MP3, Opus, Vorbis, FLAC, PCM) while strictly prohibiting monolithic player IPC wrappers (mpv, vlc) and external database engines (sqlite, diesel, rocksdb).",
+       "openspec_ref": "openspec/project.md#2-invariant-prohibitions--dependency-whitelist",
+       "capabilities": ["demuxer", "codecs", "av-pipeline", "sync-engine", "smart-chat", "ui-renderer"],
+       "verification": {
+@@ -15,9 +15,10 @@
+         "expected_exit_code": 0
+       },
+       "invariants": [
+-        "Zero banned media crates (ffmpeg, libav*, gstreamer, mpv, vlc, symphonia, dav1d, rav1e, minimp3, etc.)",
+-        "Zero banned database crates (sqlite, rusqlite, sqlx, sled, rocksdb, heed, tantivy)",
+-        "Zero native C/C++ build dependencies in build.rs or Cargo.toml"
++        "Universal media compatibility across standard modern containers (MKV, MP4, WebM, AVI, TS, FLV) and codecs (H.264, H.265, VP8, VP9, AV1, AAC, MP3, Opus, FLAC)",
++        "Zero monolithic player script/IPC wrappers (mpv, mpv-sys, libmpv, vlc, libvlc)",
++        "Zero external database engines (sqlite, rusqlite, sqlx, sled, rocksdb, heed, tantivy, meilisearch, diesel)",
++        "Dual-temporal smart chat persists via custom crash-resilient binary log (syncplay_chat.bin) and in-memory inverted index FTS"
+       ]
+     },
+     {
+@@ -77,8 +78,8 @@
+     },
+     {
+       "id": "INTENT-05",
+-      "name": "Decoupled Lock-Free Threading & VLC-Grade Responsiveness",
+-      "description": "128-byte cache-line aligned SPSC ring buffer eliminating false sharing, triple-buffered atomic UI snapshots (PlayerUiSnapshot, 72 bytes) published via Telemetry Aggregator, 10Hz scrubber debouncer, and <=15MB UI memory footprint.",
++      "name": "Desktop Graphical UI Architecture & Decoupled Lock-Free Responsiveness",
++      "description": "Native cross-platform desktop window (Wayland/X11 and Windows via eframe/egui with GPU texture viewport), aspect ratio preservation (letterbox/pillarbox), 128-byte cache-line aligned SPSC ring buffer eliminating false sharing, triple-buffered atomic UI snapshots (PlayerUiSnapshot, 72 bytes) published via Telemetry Aggregator, 10Hz scrubber debouncer, and <=15MB UI memory footprint.",
+       "openspec_ref": "openspec/specs/av-pipeline/spec.md,openspec/specs/ui-renderer/spec.md",
+       "capabilities": ["av-pipeline", "ui-renderer"],
+       "verification": {
+@@ -87,6 +88,8 @@
+         "expected_exit_code": 0
+       },
+       "invariants": [
++        "Native desktop graphical window with Wayland/X11 and Windows support, GPU video surface, bottom playback controls, and watch-party sidebar",
++        "Video viewport aspect ratio preservation math guaranteeing deterministic letterboxing and pillarboxing without image distortion",
+         "SPSC head and tail pointers aligned to 128 bytes (#[repr(align(128))])",
+         "PlayerUiSnapshot fits in single 128-byte cache line pair (72 bytes <= 128 bytes)",
+         "Centralized Telemetry Aggregator topology guarantees zero torn reads for UI thread",

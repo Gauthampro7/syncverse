@@ -1,0 +1,247 @@
+--- /home/gautham/syncplay-alt/scripts/intent_harness.py	2026-10-25 14:24:27.474334810 +0530
++++ /home/gautham/syncplay-alt/.agents/teamwork/explorer_p4_m1_3/proposed_intent_harness.py	2026-10-26 02:03:18.409793766 +0530
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """
+-Syncplay-Alt Pi Framework Intent Verification Harness
+-======================================================
++Syncplay-Alt Pi Framework Intent Verification Harness (Phase 4 Realigned)
++========================================================================
+ Authority: AGENTS.md & .pi/harness/intent_matrix.json
+ 
+ Purpose:
+@@ -10,6 +10,7 @@
+   quantitative Intent Compliance Score.
+ """
+ 
++import argparse
+ import json
+ import os
+ import subprocess
+@@ -17,7 +18,16 @@
+ import time
+ from pathlib import Path
+ 
+-ROOT_DIR = Path(__file__).resolve().parent.parent
++def find_root_dir() -> Path:
++    # Walk upwards from current script until Cargo.toml is found
++    cur = Path(__file__).resolve().parent
++    for _ in range(5):
++        if (cur / "Cargo.toml").exists():
++            return cur
++        cur = cur.parent
++    return Path(__file__).resolve().parent.parent
++
++ROOT_DIR = find_root_dir()
+ MATRIX_PATH = ROOT_DIR / ".pi" / "harness" / "intent_matrix.json"
+ REPORT_PATH = ROOT_DIR / ".pi" / "harness" / "intent_report.json"
+ 
+@@ -42,7 +52,7 @@
+ def log_warn(msg):
+     print(f"{Colors.YELLOW}[WARN]{Colors.RESET} {msg}")
+ 
+-def run_intent_test(intent):
++def run_intent_test(intent, timeout=120):
+     cmd = intent["verification"]["command"]
+     expected_code = intent["verification"]["expected_exit_code"]
+     
+@@ -61,7 +71,7 @@
+             stderr=subprocess.PIPE,
+             text=True,
+             env=env,
+-            timeout=120
++            timeout=timeout
+         )
+         elapsed = time.perf_counter() - start_time
+         success = (res.returncode == expected_code)
+@@ -69,37 +79,98 @@
+         return success, res.returncode, elapsed, output_snippet
+     except subprocess.TimeoutExpired:
+         elapsed = time.perf_counter() - start_time
+-        return False, -1, elapsed, "Execution timed out after 120s"
++        return False, -1, elapsed, f"Execution timed out after {timeout}s"
+     except Exception as e:
+         elapsed = time.perf_counter() - start_time
+         return False, -2, elapsed, str(e)
+ 
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description="Syncplay-Alt Pi Framework Intent Verification Harness"
++    )
++    parser.add_argument(
++        "--intent", "-i",
++        type=str,
++        default=None,
++        help="Run only the specified intent (e.g. INTENT-01, INTENT-05)"
++    )
++    parser.add_argument(
++        "--list", "-l",
++        action="store_true",
++        help="List all registered intents from matrix and exit"
++    )
++    parser.add_argument(
++        "--matrix",
++        type=str,
++        default=str(MATRIX_PATH),
++        help="Custom path to intent_matrix.json"
++    )
++    parser.add_argument(
++        "--report",
++        type=str,
++        default=str(REPORT_PATH),
++        help="Custom path to output intent_report.json"
++    )
++    parser.add_argument(
++        "--quiet", "-q",
++        action="store_true",
++        help="Quiet mode: suppress per-test output"
++    )
++    return parser.parse_args()
++
+ def main():
+-    print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
+-    print(f"{Colors.BOLD}{Colors.BLUE} SYNCPLAY-ALT: PI FRAMEWORK INTENT VERIFICATION HARNESS {Colors.RESET}")
+-    print(f"{Colors.BOLD}{Colors.BLUE} Authority: AGENTS.md & .pi/harness/intent_matrix.json {Colors.RESET}")
+-    print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}\n")
++    args = parse_args()
++    matrix_file = Path(args.matrix)
++    report_file = Path(args.report)
+ 
+-    if not MATRIX_PATH.exists():
+-        log_fail(f"Intent matrix not found at {MATRIX_PATH}")
++    if not matrix_file.exists():
++        log_fail(f"Intent matrix not found at {matrix_file}")
+         sys.exit(1)
+ 
+-    with open(MATRIX_PATH, "r", encoding="utf-8") as f:
++    with open(matrix_file, "r", encoding="utf-8") as f:
+         matrix = json.load(f)
+ 
+-    intents = matrix.get("intents", [])
++    all_intents = matrix.get("intents", [])
++
++    if args.list:
++        print(f"{Colors.BOLD}Registered Intents ({len(all_intents)} total):{Colors.RESET}")
++        for intent in all_intents:
++            print(f"  {Colors.BOLD}{intent['id']}{Colors.RESET}: {intent['name']}")
++            print(f"    Ref: {intent.get('openspec_ref', 'N/A')}")
++            print(f"    Command: {intent['verification']['command']}")
++            print(f"    Invariants ({len(intent.get('invariants', []))}):")
++            for inv in intent.get("invariants", []):
++                print(f"      - {inv}")
++            print("")
++        sys.exit(0)
++
++    if args.intent:
++        target_id = args.intent.strip().upper()
++        intents = [i for i in all_intents if i["id"].upper() == target_id]
++        if not intents:
++            log_fail(f"Intent '{args.intent}' not found in matrix. Use --list to see available intents.")
++            sys.exit(1)
++    else:
++        intents = all_intents
++
++    if not args.quiet:
++        print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
++        print(f"{Colors.BOLD}{Colors.BLUE} SYNCPLAY-ALT: PI FRAMEWORK INTENT VERIFICATION HARNESS (PHASE 4) {Colors.RESET}")
++        print(f"{Colors.BOLD}{Colors.BLUE} Authority: AGENTS.md & .pi/harness/intent_matrix.json {Colors.RESET}")
++        print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}\n")
++        log_info(f"Loaded {len(intents)} intent(s) to evaluate. Beginning verification...\n")
++
+     total_intents = len(intents)
+     passed_intents = 0
+     results = []
+ 
+-    log_info(f"Loaded {total_intents} core intents from matrix. Beginning verification...\n")
+-
+     for idx, intent in enumerate(intents, 1):
+         intent_id = intent["id"]
+         name = intent["name"]
+-        print(f"--> [{idx}/{total_intents}] Verifying {Colors.BOLD}{intent_id}: {name}{Colors.RESET}")
+-        print(f"    Ref: {intent.get('openspec_ref', 'N/A')}")
+-        print(f"    Command: `{intent['verification']['command']}`")
++        if not args.quiet:
++            print(f"--> [{idx}/{total_intents}] Verifying {Colors.BOLD}{intent_id}: {name}{Colors.RESET}")
++            print(f"    Ref: {intent.get('openspec_ref', 'N/A')}")
++            print(f"    Command: `{intent['verification']['command']}`")
+         
+         success, code, elapsed, err_snip = run_intent_test(intent)
+         
+@@ -116,42 +187,49 @@
+ 
+         if success:
+             passed_intents += 1
+-            log_pass(f"{intent_id} verified in {elapsed:.2f}s ({len(intent.get('invariants', []))} invariants active)")
++            if not args.quiet:
++                log_pass(f"{intent_id} verified in {elapsed:.2f}s ({len(intent.get('invariants', []))} invariants active)")
+         else:
+-            log_fail(f"{intent_id} FAILED with code {code} in {elapsed:.2f}s")
+-            if err_snip:
+-                print(f"    {Colors.RED}Details:{Colors.RESET} {err_snip.strip()}")
+-        print("")
++            if not args.quiet:
++                log_fail(f"{intent_id} FAILED with code {code} in {elapsed:.2f}s")
++                if err_snip:
++                    print(f"    {Colors.RED}Details:{Colors.RESET} {err_snip.strip()}")
++        if not args.quiet:
++            print("")
+ 
+     compliance_score = (passed_intents / total_intents) * 100.0
+ 
+-    # Write report
+-    report = {
+-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+-        "total_intents": total_intents,
+-        "passed_intents": passed_intents,
+-        "compliance_score_percent": round(compliance_score, 2),
+-        "status": "PASS" if passed_intents == total_intents else "FAIL",
+-        "results": results
+-    }
+-
+-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+-        json.dump(report, f, indent=2)
+-
+-    print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
+-    print(f" INTENT HARNESS SUMMARY:")
+-    print(f" Total Intents Evaluated: {total_intents}")
+-    print(f" Passed Intents:          {passed_intents}/{total_intents}")
+-    print(f" Compliance Score:        {Colors.BOLD}{compliance_score:.1f}%{Colors.RESET}")
+-    print(f" Audit Report written to: {REPORT_PATH}")
+-    print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
++    # Write report only if running full suite (not filtered)
++    if not args.intent:
++        report = {
++            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++            "total_intents": total_intents,
++            "passed_intents": passed_intents,
++            "compliance_score_percent": round(compliance_score, 2),
++            "status": "PASS" if passed_intents == total_intents else "FAIL",
++            "results": results
++        }
++        report_file.parent.mkdir(parents=True, exist_ok=True)
++        with open(report_file, "w", encoding="utf-8") as f:
++            json.dump(report, f, indent=2)
++
++    if not args.quiet:
++        print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
++        print(f" INTENT HARNESS SUMMARY:")
++        print(f" Total Intents Evaluated: {total_intents}")
++        print(f" Passed Intents:          {passed_intents}/{total_intents}")
++        print(f" Compliance Score:        {Colors.BOLD}{compliance_score:.1f}%{Colors.RESET}")
++        if not args.intent:
++            print(f" Audit Report written to: {report_file}")
++        print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
+ 
+     if passed_intents == total_intents:
+-        log_pass("All Intent Contracts satisfied with 0 drift. Safe to proceed.")
++        if not args.quiet:
++            log_pass("All Intent Contracts satisfied with 0 drift. Safe to proceed.")
+         sys.exit(0)
+     else:
+-        log_fail(f"Intent Drift detected! {total_intents - passed_intents} intents failed.")
++        if not args.quiet:
++            log_fail(f"Intent Drift detected! {total_intents - passed_intents} intents failed.")
+         sys.exit(1)
+ 
+ if __name__ == "__main__":

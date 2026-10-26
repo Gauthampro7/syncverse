@@ -1,0 +1,702 @@
+--- a/AGENTS.md
++++ a/AGENTS.md.new
+@@ -2,32 +2,32 @@
+ 
+ ## 1. System Vision & Engineering Philosophy
+ 
+-**Syncplay-Alt** is an open-source, ultra-efficient standalone media player and long-distance synchronized watch-party platform written in pure, idiomatic Rust. Traditional synchronized media players function as fragile IPC scripting wrappers around external monolithic players (e.g., `mpv`, `vlc`) or rely on massive C/C++ multimedia libraries (`ffmpeg`, `libav*`, `gstreamer`, `symphonia`).
++**Syncplay-Alt** is an open-source, ultra-efficient standalone desktop media player and long-distance synchronized watch-party platform written in pure, idiomatic Rust. Traditional synchronized media solutions function as fragile IPC scripting wrappers around external monolithic players (e.g., `mpv`, `vlc`) or depend on external database daemons (`sqlite`, `rocksdb`).
+ 
+ Syncplay-Alt fundamentally diverges from these architectures:
+-1. **Zero External Media, Codec, or Database Frameworks**: Container demuxing, video/audio bitstream decoding, color space transformation, clock synchronization, and smart chat persistence are built entirely from first principles in pure Rust.
++1. **Standalone Native Architecture with Universal Media Compatibility**: Syncplay-Alt is a standalone player running its own presentation and decoding pipeline, strictly eliminating external monolithic player scripting/IPC wrappers (`mpv`, `vlc`) and external database engines (`sqlite`, `diesel`, `rocksdb`). Universal container demuxing (MKV, WebM, MP4, MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1, MPEG-2/4, VC-1; AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS, PCM) are handled via direct multimedia library bindings (`ffmpeg-next`, `symphonia`), feeding into in-tree planar YUV420p, packed RGBA, and PCM audio models. Smart chat persistence is built from first principles with an in-tree binary log (`syncplay_chat.bin`) and inverted index.
+ 2. **Deterministic Mathematical Synchronization**: Clock phase alignment over high-RTT (250–400ms RTT, $\pm 30\text{ms}$ jitter) WAN links is achieved using RFC 5905 NTP 4-timestamp exchange, sliding-window minimum RTT filtering with dispersion freezing defense, critically damped discrete Proportional-Integral (PI) Phase-Locked Loop (PLL) micro-speed steering ($r \in [0.96, 1.04]$), and barrier-synchronized two-phase commit unpausing ($< 10\text{ms}$ cross-peer alignment).
+-3. **Decoupled Lock-Free Threading**: Cross-thread communication uses 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) ring buffers and triple-buffered atomic UI snapshots (`PlayerUiSnapshot`, 72 bytes) published via a centralized Telemetry Aggregator, guaranteeing sub-microsecond handoffs, zero mutex contention, zero audio buffer underruns, and desktop-grade UI responsiveness (< 16ms input-to-visual latency).
++3. **Decoupled Lock-Free Threading & Native Desktop Graphical UI**: A modern, hardware-accelerated desktop player window (`eframe`/`egui`/`wgpu`) running natively on Linux (Wayland/X11) and Windows. Cross-thread communication uses 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) ring buffers and triple-buffered atomic UI snapshots (`PlayerUiSnapshot`, 72 bytes) published via a centralized Telemetry Aggregator, guaranteeing sub-microsecond handoffs, zero mutex contention, zero audio buffer underruns, and desktop-grade UI responsiveness (< 16ms input-to-visual latency).
+ 4. **Locally Persisted Dual-Temporal Smart Chat**: Crash-resilient append-only binary log storage (`syncplay_chat.bin`) with `0xAA55` framing, dual timestamps ($t_{wall}, t_{media}$), UUID sender identification, IEEE 802.3 CRC32 checksums, forward-scanning false-sync recovery, an in-memory inverted index supporting Unicode CJK unigram/bigram segmentation with single-ideograph length exemption, and slash-command dispatching (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
+ 
+ ---
+ 
+ ## 2. Invariant Prohibitions & Dependency Whitelist
+ 
+-### 2.1 The Zero-External-Codec Invariant (Strictly Enforced)
+-Under no circumstances may any crate within this workspace depend on, link against, or vendor code from external media, codec, player, or database frameworks.
++### 2.1 Preserved Architectural Invariants & Forbidden Frameworks
++Under no circumstances may any crate within this workspace depend on, link against, or vendor code from external monolithic players or external database engines.
+ 
+ #### Strictly Banned Crate & Library List:
+-- **Media & Codec Engines**: `ffmpeg`, `ffmpeg-sys`, `ffmpeg-next`, `libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libswresample`, `gstreamer`, `gstreamer-sys`, `mpv`, `mpv-sys`, `libmpv`, `vlc`, `libvlc`, `symphonia`, `symphonia-core`, `dav1d`, `dav1d-sys`, `rav1e`, `openh264`, `minimp3`, `nom-ebml`, `hound`, `image`, `imageproc`.
+-- **Database & Search Engines**: `sqlite`, `sqlite3`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `rocksdb-sys`, `heed`, `tantivy`, `meilisearch`, `diesel`.
++- **Monolithic Player Frameworks & IPC Wrappers**: `mpv`, `mpv-sys`, `libmpv`, `vlc`, `libvlc`, and any subprocess/IPC wrapper around external player binaries. Syncplay-Alt MUST execute rendering and playback controls entirely within its own process space.
++- **Database & Search Engines**: `sqlite`, `sqlite3`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `rocksdb-sys`, `heed`, `tantivy`, `meilisearch`, `diesel`. All chat persistence and full-text search MUST use the in-tree `syncplay_chat.bin` binary log and inverted index.
+ 
+-Any presence of these crates or their native C/C++ libraries in `Cargo.toml`, `Cargo.lock`, or build scripts will result in immediate rejection by `scripts/audit_dependencies.sh` and CI verification.
++Any presence of these banned crates or their native libraries in `Cargo.toml`, `Cargo.lock`, or build scripts will result in immediate rejection by `scripts/audit_dependencies.sh` and CI verification.
+ 
+ ### 2.2 Dependency Whitelist
+-Only pure-Rust foundational primitives are allowed:
+-- `thiserror` (strongly typed error enum derivation).
+-- Standard library modules (`std::net`, `std::sync::atomic`, `std::time::Instant`, `std::collections::BTreeMap`).
+-- In-tree mathematical primitives, byte-level readers (`ByteReader`, `BitReader`), and custom checksums.
++The workspace permits foundational pure-Rust crates, direct multimedia bindings, and native graphical windowing libraries:
++- **Core Primitives**: `thiserror` (strongly typed error enum derivation), standard library modules (`std::net`, `std::sync::atomic`, `std::time::Instant`, `std::collections::BTreeMap`), and in-tree mathematical/bitstream readers (`ByteReader`, `BitReader`, `Crc32`).
++- **Universal Multimedia & Audio Backends**: `ffmpeg-next`, `ffmpeg-sys-next` (utilizing system `libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libswresample`), `symphonia`, `symphonia-core`, `cpal`, `rodio`.
++- **Desktop Graphical UI & Windowing**: `eframe`, `egui`, `wgpu`, `winit`, `rfd` (native file dialogs via XDG Desktop Portal / Win32).
+ 
+ ---
+ 
+@@ -38,13 +38,13 @@
+ ```
+ crates/
+ ├── syncplay-common/     # Shared types, timestamps, CRC32, bitstream readers, error abstractions
+-├── syncplay-demux/      # Pure-Rust EBML/MKV & ISOBMFF/MP4 container demuxers + in-tree test vectors
+-├── syncplay-codecs/     # Planar YUV420p / packed RGBA models, Q8 fixed-point integer color converter
+-├── syncplay-clock/      # Master monotonic clock, continuous rate re-anchoring, 128B-aligned SPSC ring buffer
++├── syncplay-demux/      # Universal container demuxer (MKV, MP4, AVI, TS, FLV, OGG) + pure-Rust parsers
++├── syncplay-codecs/     # Universal video/audio decoders, planar YUV420p, RGBA, PCM, Q8 color converter
++├── syncplay-clock/      # Master monotonic clock, rate re-anchoring, audio pacer, 128B SPSC ring buffers
+ ├── syncplay-sync/       # RFC 5905 NTP filter, discrete PI PLL micro-speed controller, barrier unpause
+ ├── syncplay-chat/       # syncplay_chat.bin log, false-sync recovery, inverted index FTS, slash commands
+-├── syncplay-ui/         # Lock-free atomic triple-buffered snapshot state, 10Hz scrubber debouncer, OSD
+-└── syncplay-core/       # Top-level runtime coordinator binding all subsystems & telemetry aggregator
++├── syncplay-ui/         # eframe/egui desktop player window, GPU video viewport, debouncer, sidebar
++└── syncplay-core/       # Coordinator orchestrating demuxing, decoding, audio sink (cpal), sync, and UI
+ ```
+ 
+ ### Detailed Crate Contracts:
+@@ -54,58 +54,37 @@
+    - `ByteReader` / `BitReader`: Zero-copy, bounds-checked binary slice readers.
+    - `Crc32`: Table-driven IEEE 802.3 CRC32 calculation (`0xEDB88320` polynomial, initial `0xFFFFFFFF`, final inversion).
+ 2. **`syncplay-demux`**:
+-   - RFC 8794 EBML VINT decoder: variable-length octet widths 1–8 (`leading_zeros() + 1`), element ID retaining marker bit vs data size with marker bit masked, unknown size sentinels, reserved element ID rejection.
+-   - Matroska Demuxer: Cluster and SimpleBlock traversal. Timescale arithmetic:
+-     $$\text{PTS}_{\text{ms}} = \left\lfloor \frac{(\text{ClusterTimecode} + \text{BlockTimecode}) \times \text{TimestampScale}}{1\,000\,000} \right\rfloor$$
+-     computed via 64-bit integer arithmetic without overflow across 24h playback.
+-   - ISOBMFF/MP4 Box Parser: Standard 32-bit boxes ($size \ge 8$ or $0$), 64-bit `largesize` ($size == 1 \implies 16 \le largesize \le 2^{63}-1$), rejection of $largesize < 16$ or $largesize > \text{i64::MAX}$. Sample table resolver (`stts`, `stsc`, `stsz`, `stco`, `co64`).
+-   - Synthetic Test Vectors: In-tree byte-exact 48-byte EBML vector and 132-byte MP4 vector.
++   - `UniversalDemuxer`: High-efficiency demuxing engine powered by `ffmpeg-next` supporting Matroska (`.mkv`, `.webm`), ISOBMFF/MP4 (`.mp4`, `.m4v`, `.mov`), AVI (`.avi`), MPEG-TS (`.ts`), FLV (`.flv`), and OGG (`.ogg`, `.ogv`).
++   - `EbmlDemuxer` & `IsoBmffDemuxer`: In-tree zero-dependency demuxers preserving byte-exact parsing of synthetic test vectors and timescale arithmetic.
++   - Seek Table Resolver: Maps random-access seek points and computes target presentation timestamps.
+ 3. **`syncplay-codecs`**:
+-   - `VideoFrameYUV420p`: 64-byte cache-aligned plane buffers ($Y, U, V$), 16-byte row stride alignment (`(width + 15) & !15`), and $+16$B SIMD tail padding to prevent out-of-bounds over-reads.
++   - `UniversalDecoder`: Video bitstream decoder (H.264, H.265, VP8, VP9, AV1, MPEG-2, MPEG-4, VC-1) emitting `VideoFrameYUV420p` and `VideoFrameRGBA`; audio bitstream decoder (AAC, MP3, Opus, Vorbis, FLAC, AC3/E-AC3, DTS, PCM) emitting normalized `AudioFramePCM` (48kHz, stereo, f32).
++   - `VideoFrameYUV420p`: 64-byte cache-aligned plane buffers ($Y, U, V$), 16-byte row stride alignment (`(width + 15) & !15`), and $+16$B SIMD tail padding.
+    - `VideoFrameRGBA`: Packed 32-bit RGBA frames with 64-byte row alignment.
+-   - Pure-Rust Q8 Fixed-Point Color Space Converter ($Y'CbCr \to R'G'B'$ limited range ITU-R BT.601 / BT.709):
+-     $$C = Y - 16, \quad D = U - 128, \quad E = V - 128$$
+-     $$R = \text{clamp}((298 \cdot C + 409 \cdot E + 128) \gg 8)$$
+-     $$G = \text{clamp}((298 \cdot C - 100 \cdot D - 208 \cdot E + 128) \gg 8)$$
+-     $$B = \text{clamp}((298 \cdot C + 516 \cdot D + 128) \gg 8)$$
+-     Branchless clamping `clamp(0, 255) as u8` and 4:2:0 spatial chroma expansion ($2\times 2$ luma blocks) with zero heap allocations in the hot loop.
++   - Pure-Rust Q8 Fixed-Point Color Space Converter ($Y'CbCr \to R'G'B'$ limited range ITU-R BT.601 / BT.709) with branchless clamping.
+ 4. **`syncplay-clock`**:
+-   - Master Monotonic Clock: Continuous presentation tracking. Instantaneous rate adjustments re-anchor the timeline atomically via SeqLock or `AtomicU128` publication:
+-     $$\text{anchor\_pts}' \leftarrow \text{CurrentPTS}(t_{\text{now}}), \quad \text{anchor\_wall}' \leftarrow t_{\text{now}}, \quad \text{speed} \leftarrow s_{\text{new}}$$
+-     guaranteeing mathematical continuity: $\lim_{\epsilon \to 0} |\text{CurrentPTS}(t_{\text{now}} + \epsilon) - \text{CurrentPTS}(t_{\text{now}} - \epsilon)| = 0$.
+-   - SPSC Lock-Free Ring Buffer: Power-of-two capacity, unbounded monotonic `AtomicUsize` counters (`head`, `tail`), bitwise masking (`index & (CAPACITY - 1)`). Head and tail isolated on separate 128-byte cache lines (`#[repr(align(128))]`) to eliminate false sharing.
++   - Master Monotonic Clock: Continuous presentation tracking with SeqLock atomic rate re-anchoring guaranteeing $C^0$ mathematical continuity across speed shifts.
++   - `AudioPacer`: Paces audio against `MasterClock`, evaluates audio timing delta, and injects silence frames on underruns to prevent thread starvation and audio crackle.
++   - SPSC Lock-Free Ring Buffer: Power-of-two capacity, unbounded monotonic `AtomicUsize` counters (`head`, `tail`), bitwise masking. Head and tail isolated on separate 128-byte cache lines (`#[repr(align(128))]`) to eliminate false sharing.
+ 5. **`syncplay-sync`**:
+-   - NTP 4-timestamp probe exchange ($T_1, T_2, T_3, T_4$):
+-     $$\theta = \frac{(T_2 - T_1) + (T_3 - T_4)}{2}, \quad \text{RTT} = (T_4 - T_1) - (T_3 - T_2)$$
+-   - RFC 5905 8-sample sliding-window minimum RTT filter:
+-     - Window dispersion $D = \sum_{i=0}^{W-1} \frac{|\theta_i - \theta_0|}{2^{i+1}}$ with floor $D_{\text{effective}} = \max(D, 5.0\text{ ms})$ preventing zero-dispersion freeze.
+-     - Outlier filter: reject samples where $\text{RTT} > 2.0 \times \text{median}(\text{RTT})$ or $|\theta - \hat{\theta}| > 3 D_{\text{effective}}$.
+-     - Watchdog timer: flush filter buffer upon 8 consecutive rejections to recover from network route shifts.
+-   - Reference Timeline Equation:
+-     $$\tau_{\text{target}}(t_{\text{local}}) = \tau_{\text{ref\_media}} + r_{\text{target}} \cdot \left[ (t_{\text{local}} + \hat{\theta}) - t_{\text{ref\_server}} \right]$$
+-   - Discrete PI PLL Speed Controller:
+-     - Sample interval $\Delta t = 0.2\text{ s}$, gains $K_p = 0.17\text{ s}^{-1}$, $K_i = 0.0072\text{ s}^{-2}$, anti-windup clamp $I_{\text{max}} = 32.0\text{ s}$.
+-     - Tri-Zone drift policy:
+-       * **Zone 1** (Deadband, $|e| < 15\text{ ms}$): $r = 1.0\times$, integral accumulator held constant.
+-       * **Zone 2** (Continuous Micro-Speed, $15\text{ ms} \le |e| \le 1500\text{ ms}$): $r = \text{clamp}(1.0 + \Delta r, 0.96, 1.04)$.
+-       * **Zone 3** (Hard Seek, $|e| > 1500\text{ ms}$): hard jump to target PTS, PLL re-initialized.
+-     - Critically damped dynamics: $e(0) = +450\text{ ms}$ enters $< 15\text{ ms}$ deadband within 20s (at $t \approx 12.0\text{ s}$) with zero overshoot past $-15\text{ ms}$.
+-   - Two-Phase Barrier Unpause:
+-     - Target schedule: $T_{\text{target\_server}} = t_{\text{server\_now}} + 1.5 \times \max_i(\text{RTT}_i) + t_{\text{preroll\_budget}} + 100\text{ ms}$ ($t_{\text{preroll\_budget}} = 200\text{ ms}$).
+-     - Guarantees $\ge 100\text{ ms}$ positive commit arrival margin across all pre-roll intervals and cross-peer start alignment $< 10\text{ ms}$.
++   - NTP 4-timestamp probe exchange ($T_1, T_2, T_3, T_4$) and RFC 5905 8-sample sliding-window minimum RTT filter with effective dispersion floor $D_{\text{effective}} = \max(D, 5.0\text{ ms})$.
++   - Reference Timeline Equation: $\tau_{\text{target}}(t_{\text{local}}) = \tau_{\text{ref\_media}} + r_{\text{target}} \cdot \left[ (t_{\text{local}} + \hat{\theta}) - t_{\text{ref\_server}} \right]$.
++   - Discrete PI PLL Speed Controller ($K_p = 0.17\text{ s}^{-1}, K_i = 0.0072\text{ s}^{-2}$) with Tri-Zone drift policy (Zone 1 deadband $<15\text{ms}$, Zone 2 micro-speed $[0.96, 1.04]$, Zone 3 hard seek $>1500\text{ms}$).
++   - Two-Phase Barrier Unpause: Scheduled playback resumption guaranteeing $\ge 100\text{ms}$ positive commit arrival margin across all peers and cross-peer start alignment $< 10\text{ms}$.
+ 6. **`syncplay-chat`**:
+-   - Binary Log (`syncplay_chat.bin`): 16-byte fixed header (magic `b"SPCH"`, version `1`, flags `0`, reserved `0`, header CRC32).
+-   - Record Framing: `[0xAA, 0x55]` sync word (2 bytes), record total length (4 bytes LE, total record size = length of body + 10, $\ge 48$ bytes), body (type, flags, $t_{wall}, t_{media}$, 16-byte UUID sender, sender name length + bytes, payload length + bytes), body CRC32 (4 bytes).
+-   - Crash Recovery Scanner: Forward scan identifying `0xAA55`. Verifies length and body CRC32. If a candidate record specifies length exceeding remaining file bytes or has invalid CRC, it is treated as a false-sync candidate; scanning advances byte-by-byte ($+1$), preserving valid trailing records and truncating only authoritative trailing incomplete writes at EOF.
+-   - Inverted Index FTS: Unicode case folding (Latin, Turkish dotted I), punctuation stripping (preserving `#` and `@`), CJK unigram + overlapping bigram segmentation (`U+4E00`..`U+9FFF`), single ideograph indexing (length 1..48 for CJK, 2..48 for Western), two-pointer linear merge for Boolean AND queries.
+-   - Spatial Timeline Queries: `query_timeline_window(media_ts, window_ms)` over `BTreeMap` in $O(\log N + K)$ time for floating comments.
++   - Binary Log (`syncplay_chat.bin`): 16-byte fixed header, `0xAA55` framing, dual timestamps ($t_{wall}, t_{media}$), UUID sender identification, IEEE 802.3 CRC32 checksums, and forward byte-by-byte false-sync recovery.
++   - Inverted Index FTS: Unicode case folding (Latin, Turkish dotted I), punctuation stripping, CJK unigram + overlapping bigram segmentation, and single-ideograph indexing.
+    - Slash Commands: `/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status` normalized to absolute milliseconds and dispatched to `syncplay-sync`.
+ 7. **`syncplay-ui`**:
+-   - Lock-Free Atomic Triple-Buffer Snapshot: `PlayerUiSnapshot` (72 bytes, fitting in a 128-byte cache line pair). Single-Producer Single-Consumer topology published exclusively by the central Telemetry Aggregator; UI event thread reads via atomic pointer swap with zero torn snapshots.
+-   - Scrubber Debouncer: 10 Hz rate limiter on drag events. For a 500ms drag at 120 Hz, dispatches exactly 5 throttled intermediate seek commands plus 1 final authoritative release seek command at mouse release (total 6 commands).
+-   - Memory Bounding: Floating chat overlay capped at 5 visible bubbles (4.0s dwell, 1.0s fade). Single-channel Alpha8 (`R8_UNORM`) font glyph atlas (4.0 MB at $2048 \times 2048$), ensuring total UI memory consumption $\le 15.0\text{ MB}$.
++   - Native Desktop Window: Cross-platform `eframe`/`egui`/`wgpu` application window supporting Wayland, X11, and Windows, title bar, minimize/maximize, window resizing, clean close, and `F11`/double-click fullscreen toggle.
++   - Video Viewport: GPU-accelerated video rendering surface with aspect-ratio preservation (automatic letterboxing / pillarboxing) and vsync frame pacing.
++   - Playback Controls Bar: Bottom docked controls with Play/Pause, Stop, interactive seekbar with mouse hover timestamp tooltip and 10Hz debounced drag-scrubbing, volume slider with mute toggle, timecode HUD (`HH:MM:SS / HH:MM:SS`), and playback speed selector.
++   - Watch-Party Sidebar: Collapsible right panel with room members, RTT, sync health indicator badge (Green, Amber, Red), real-time smart chat, and slash-command input.
++   - File Management: Native file selection via `rfd` (XDG Desktop Portal on Fedora Linux, Win32 on Windows), drag-and-drop file loading, and recent media history.
++   - Triple-Buffered Atomic Snapshot: 72-byte `PlayerUiSnapshot` published exclusively by Telemetry Aggregator; read wait-free by UI thread.
++   - Headless / Terminal Fallback: Command-line flags (`--headless`, `--terminal`) preserved for automated test suites and TTY environments.
+ 8. **`syncplay-core`**:
+-   - Coordinator binding demuxer, decoder, clock, sync, chat, and presentation loops.
++   - Coordinator binding universal demuxer, decoder, master clock, audio sink (`cpal`), sync engine, smart chat, and UI presentation.
+    - Telemetry Aggregator polling subsystems and publishing unified `PlayerUiSnapshot` to `syncplay-ui`.
+ 
+ ---
+@@ -117,16 +96,17 @@
+ 2. **Mandatory Documentation**: Public interfaces MUST include `#![deny(missing_docs)]` and thorough docstrings explaining algorithms, invariants, and edge cases.
+ 3. **Strongly Typed Errors**: Never use `String`, `&str`, or `Box<dyn Error>` for operational error handling. Define strongly typed enums with `#[derive(thiserror::Error, Debug)]`.
+ 4. **Memory Safety & Unsafe Code Rules**:
+-   - `#![deny(unsafe_code)]` is standard across all crates.
+-   - Unsafe code is permitted ONLY where strictly necessary for SIMD intrinsics (`syncplay-codecs`) or lock-free slot indexing (`syncplay-clock`).
++   - `#![deny(unsafe_code)]` is standard across crates.
++   - Unsafe code is permitted ONLY where strictly necessary for C-FFI multimedia bindings (`ffmpeg-sys-next`), SIMD intrinsics (`syncplay-codecs`), or lock-free slot indexing (`syncplay-clock`).
+    - Every `unsafe` block MUST be preceded by a formal `// SAFETY:` comment proving memory safety, bounds validity, alignment, and absence of data races.
+ 5. **SIMD & Memory Alignment**:
+    - YUV420p frame row strides MUST be aligned to 16-byte boundaries (`(width + 15) & !15`).
+    - Frame plane allocations MUST be aligned to 64 bytes with $+16$B SIMD tail padding.
+    - SPSC ring-buffer atomic head/tail structures MUST be aligned to 128 bytes (`#[repr(align(128))]`) to eliminate false sharing.
+-6. **Integer Arithmetic & No Floating-Point in Codec/Demux Paths**:
++6. **Integer Arithmetic & Pacing Continuity**:
+    - Use fixed-point Q8 arithmetic for color space transformations.
+    - Use 64-bit integer arithmetic for container timescale conversions to avoid float precision loss or 32-bit integer overflows.
++   - Ensure $C^0$ mathematical continuity across all playback speed transitions.
+ 
+ ---
+ 
+@@ -135,7 +115,7 @@
+ Agents MUST verify their work using the following standard commands before declaring a task complete:
+ 
+ ```bash
+-# 1. Dependency Blacklist Audit (Ensures zero forbidden multimedia/database engines)
++# 1. Dependency Blacklist Audit (Ensures zero banned monolithic players or database engines)
+ ./scripts/audit_dependencies.sh
+ 
+ # 2. Workspace Compilation & Warning Check
+--- a/openspec/project.md
++++ a/openspec/project.md.new
+@@ -1,19 +1,19 @@
+ # Syncplay-Alt: Master Project Specification
+ 
+ **Status**: Living Architectural Baseline  
+-**Target Milestone**: Phase 1 Specifications & Workspace Foundations  
+-**Authoritative Scope**: Zero-Dependency Pure-Rust Standalone Media Player & Long-Distance Synchronized Watch-Party Engine  
++**Target Milestone**: Phase 4 Desktop Graphical UI & Universal Media Compatibility  
++**Authoritative Scope**: Standalone Native Media Player with VLC-Grade GUI and Universal Format Compatibility  
+ 
+ ---
+ 
+ ## 1. System Vision & Architecture Philosophy
+ 
+-Syncplay-Alt is an open-source, high-efficiency standalone media player and long-distance synchronized watch-party platform built in pure Rust. Traditional synchronized media solutions function as scripting wrappers around external players (e.g., `mpv`, `vlc`) or rely on massive C/C++ multimedia libraries (`ffmpeg`, `libav*`, `gstreamer`, `symphonia`). 
++Syncplay-Alt is an open-source, ultra-efficient standalone desktop media player and long-distance synchronized watch-party platform built in pure Rust. Traditional synchronized media solutions function as fragile scripting wrappers around external monolithic players (e.g., `mpv`, `vlc`) or depend on external database daemons (`sqlite`, `rocksdb`). 
+ 
+-Syncplay-Alt fundamentally diverges from these approaches by implementing its media stack entirely from first principles:
+-1. **Zero External Media, Codec, or Database Frameworks**: No external C/C++ multimedia dependencies, no dynamic FFI wrappers, and no embedded relational engines (`sqlite`, `rocksdb`).
+-2. **Deterministic Mathematical Synchronization**: A network engine combining RFC 5905 NTP 4-timestamp exchange, sliding-window minimum RTT filtering, discrete Proportional-Integral (PI) Phase-Locked Loop (PLL) drift steering, and two-phase barrier unpausing capable of maintaining cross-peer audio/video alignment within $< 15\text{ ms}$ over 250–400ms high-jitter WAN links.
+-3. **Decoupled Lock-Free Threading**: Sub-microsecond cross-thread handoffs via 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) ring buffers and triple-buffered atomic UI snapshots (`PlayerUiSnapshot`), ensuring audio callbacks never suffer buffer underruns and the UI maintains desktop-grade responsiveness (< 16ms input-to-visual latency).
++Syncplay-Alt fundamentally diverges from these approaches by implementing a standalone native architecture with universal format compatibility:
++1. **Standalone Native Architecture with Universal Media Compatibility**: Syncplay-Alt is a standalone player running its own presentation and decoding pipeline, strictly eliminating external monolithic player scripting/IPC wrappers (`mpv`, `vlc`) and external database engines (`sqlite`, `diesel`, `rocksdb`). Universal container demuxing (MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1, MPEG-2/4, VC-1; AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS, PCM) are handled via direct multimedia library bindings (`ffmpeg-next`, `symphonia`), feeding into in-tree planar YUV420p, packed RGBA, and PCM audio models. Smart chat persistence is built from first principles with an in-tree binary log (`syncplay_chat.bin`) and inverted index.
++2. **Deterministic Mathematical Synchronization**: A network engine combining RFC 5905 NTP 4-timestamp exchange, sliding-window minimum RTT filtering with dispersion freezing defense, discrete Proportional-Integral (PI) Phase-Locked Loop (PLL) drift steering ($r \in [0.96, 1.04]$), and two-phase barrier unpausing capable of maintaining cross-peer audio/video alignment within $< 15\text{ ms}$ over 250–400ms high-jitter WAN links.
++3. **Decoupled Lock-Free Threading & Native Desktop Graphical UI**: A modern, hardware-accelerated desktop player window (`eframe`/`egui`/`wgpu`) running natively on Linux (Wayland/X11) and Windows. Cross-thread communication uses 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) ring buffers and triple-buffered atomic UI snapshots (`PlayerUiSnapshot`, 72 bytes) published via a centralized Telemetry Aggregator, guaranteeing sub-microsecond handoffs, zero mutex contention, zero audio buffer underruns, and desktop-grade UI responsiveness (< 16ms input-to-visual latency).
+ 4. **Locally Persisted Dual-Temporal Smart Chat**: A crash-resilient append-only binary log (`syncplay_chat.bin`) with `0xAA55` framing and CRC32 verification, an in-memory inverted index supporting sub-millisecond full-text search, moving-window timeline queries for on-screen bullet comments, and interactive slash-commands (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
+ 
+ ---
+@@ -22,15 +22,15 @@
+ 
+ All crates and components within the Syncplay-Alt workspace MUST strictly adhere to the following architectural invariants:
+ 
+-### 2.1 The Zero-External-Codec Invariant
+-The workspace MUST NOT link against, wrap, or depend on external multimedia or database engines. Specifically:
+-- **Forbidden Media/Player Frameworks**: `ffmpeg`, `libavcodec`, `libavformat`, `libavutil`, `gstreamer`, `mpv`, `vlc`, `symphonia`, `dav1d`, `rav1e`, `openh264`, `minimp3`.
+-- **Forbidden Database/Search Engines**: `sqlite`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `heed`, `tantivy`, `meilisearch`.
+-- **Permitted Dependencies**: Pure-Rust utility primitives such as `thiserror` (typed error derivation), standard library networking/threading (`std::net`, `std::sync::atomic`, `std::time::Instant`), and in-tree math/serialization primitives.
++### 2.1 Preserved Architectural Invariants & Forbidden Frameworks
++The workspace MUST NOT link against, wrap, or depend on external monolithic player engines or external database systems. Specifically:
++- **Forbidden Monolithic Player Frameworks & IPC Wrappers**: `mpv`, `mpv-sys`, `libmpv`, `vlc`, `libvlc`, and any subprocess/IPC wrapper around external player binaries. Syncplay-Alt MUST execute presentation, decoding, and playback control within its own native process space.
++- **Forbidden Database & Search Engines**: `sqlite`, `sqlite3`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `rocksdb-sys`, `heed`, `tantivy`, `meilisearch`, `diesel`. All chat persistence and full-text search MUST use the in-tree `syncplay_chat.bin` binary log and inverted index.
++- **Permitted Multimedia & GUI Dependencies**: Pure-Rust utility primitives such as `thiserror`, standard library networking/threading (`std::net`, `std::sync::atomic`, `std::time::Instant`), direct multimedia libraries (`ffmpeg-next`, `ffmpeg-sys-next`, `symphonia`, `symphonia-core`), native audio output sinks (`cpal`, `rodio`), and cross-platform desktop GUI libraries (`eframe`, `egui`, `wgpu`, `winit`, `rfd`).
+ 
+ ### 2.2 Memory Safety & Concurrency Invariant
+ - `#![deny(unsafe_code)]` SHALL be enforced across all crates by default.
+-- Any necessary unsafe code (restricted strictly to SIMD color space intrinsics and the lock-free SPSC ring buffer slots) MUST be isolated, heavily audited, and documented with explicit `// SAFETY:` proofs.
++- Any necessary unsafe code (restricted strictly to FFI multimedia bindings, SIMD color space intrinsics, and lock-free atomic slots) MUST be isolated, heavily audited, and documented with explicit `// SAFETY:` proofs.
+ - Lock-free memory orderings MUST use explicit `Acquire`/`Release` semantics. No spinlocks or busy-waits are permitted on the UI event thread or audio rendering callback.
+ 
+ ### 2.3 Monotonic Clocking Invariant
+@@ -52,8 +52,8 @@
+                ▼                         ▼                      ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │      syncplay-ui       │  │     syncplay-sync      │  │     syncplay-chat      │
+-│  Triple-buffered UI    │  │  NTP filter, discrete  │  │  Custom binary log,    │
+-│  state & OSD overlay   │  │  PI PLL, barrier sync  │  │  inverted index & cmds │
++│  eframe/egui desktop   │  │  NTP filter, discrete  │  │  Custom binary log,    │
++│  window, GPU viewport  │  │  PI PLL, barrier sync  │  │  inverted index & cmds │
+ └──────────────┬─────────┘  └────────────┬───────────┘  └───────────┬────────────┘
+                │                         │                          │
+                └─────────────────────────┼──────────────────────────┘
+@@ -61,16 +61,16 @@
+                                          ▼
+                             ┌────────────────────────┐
+                             │     syncplay-clock     │
+-                            │  Master clock, PTS map │
+-                            │  & SPSC ring buffers   │
++                            │  Master clock, audio   │
++                            │  pacer & SPSC buffers  │
+                             └────────────┬───────────┘
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ▼                               ▼
+             ┌────────────────────────┐      ┌────────────────────────┐
+             │    syncplay-demux      │      │    syncplay-codecs     │
+-            │  EBML/MKV & ISOBMFF/   │      │  YUV420p frames, Q8    │
+-            │  MP4 stream demuxers   │      │  fixed-point color SIMD│
++            │  UniversalDemuxer &    │      │  UniversalDecoder,     │
++            │  pure-Rust demuxers    │      │  YUV420p, RGBA, PCM    │
+             └────────────┬───────────┘      └────────────┬───────────┘
+                          │                               │
+                          └───────────────┬───────────────┘
+@@ -85,49 +85,52 @@
+ 
+ ### 3.1 Crate Responsibilities
+ 1. **`syncplay-common`**: Foundational types (`MediaTime`, `WallTime`, `Rational`), byte and bitstream readers (`ByteReader`, `BitReader`), IEEE 802.3 CRC32 checksum engine, and unified error models.
+-2. **`syncplay-demux`**: Zero-dependency stream demuxers for Matroska (EBML RFC 8794 variable-length integer parser, Element ID router, Cluster/SimpleBlock decoder) and ISOBMFF/MP4 (32/64-bit box tree parser: `ftyp`, `moov`, `mvhd`, `trak`, `mdia`, `stbl`, `stsd`, `stts`, `stsc`, `stsz`, `stco`, `co64`).
+-3. **`syncplay-codecs`**: Planar YUV420p and packed RGB24/RGBA32 frame memory models, and pure-Rust Q8 fixed-point integer color space converter ($Y'CbCr \to R'G'B'$ limited range) with branchless saturation.
+-4. **`syncplay-clock`**: Monotonic presentation clock with continuous rate-shift re-anchoring and 128-byte cache-aligned lock-free Single-Producer Single-Consumer (SPSC) ring buffers.
+-5. **`syncplay-sync`**: Long-distance high-RTT synchronization protocol featuring RFC 5905 4-timestamp probe exchange, sliding-window minimum RTT filtering, deterministic reference timeline equation, discrete PI PLL micro-speed controller ($r \in [0.96, 1.04]$), and two-phase barrier unpause state machine.
++2. **`syncplay-demux`**: Universal container demuxer (`UniversalDemuxer` via `ffmpeg-next`) supporting MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG, alongside in-tree zero-dependency demuxers (`EbmlDemuxer`, `IsoBmffDemuxer`) for synthetic test vectors.
++3. **`syncplay-codecs`**: Universal video and audio decoders (`UniversalDecoder` via `ffmpeg-next`), planar YUV420p (`VideoFrameYUV420p`), packed RGBA32 (`VideoFrameRGBA`), and normalized audio PCM (`AudioFramePCM`, 48kHz, stereo, f32) memory models, and pure-Rust Q8 fixed-point color space conversion.
++4. **`syncplay-clock`**: Monotonic presentation clock with continuous SeqLock rate-shift re-anchoring, `AudioPacer` with silence frame underrun protection, and 128-byte cache-aligned lock-free Single-Producer Single-Consumer (SPSC) ring buffers.
++5. **`syncplay-sync`**: Long-distance high-RTT synchronization protocol featuring RFC 5905 4-timestamp probe exchange, sliding-window minimum RTT filtering with effective dispersion floor $D_{\text{effective}} \ge 5.0\text{ms}$, deterministic reference timeline equation, discrete PI PLL micro-speed controller ($r \in [0.96, 1.04]$), and two-phase barrier unpause state machine.
+ 6. **`syncplay-chat`**: Crash-resilient append-only binary chat engine (`syncplay_chat.bin`) with `0xAA55` framing and CRC32 checks, in-memory inverted index FTS, timeline overlay window query, and slash-command grammar (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
+-7. **`syncplay-ui`**: High-responsiveness (< 16ms input latency) UI state model driven by triple-buffered atomic snapshots (`PlayerUiSnapshot`), floating chat bubbles, sync badges, and interactive scrub-bar layout.
+-8. **`syncplay-core`**: Top-level coordinator binding demuxing, decoding, clock, sync, chat, and presentation threads into a unified application lifecycle.
++7. **`syncplay-ui`**: High-responsiveness (< 16ms input latency) desktop graphical user interface built on `eframe`/`egui`/`wgpu` hosting GPU video viewport with aspect ratio preservation (letterboxing/pillarboxing), bottom playback controls bar, 10Hz debounced interactive seekbar, collapsible watch-party sidebar, native file dialogs (`rfd`), and headless/terminal fallback.
++8. **`syncplay-core`**: Top-level coordinator binding demuxing, decoding, clock, audio output sink (`cpal`), sync, chat, and GUI threads into a unified application lifecycle with centralized `TelemetryAggregator`.
+ 
+ ---
+ 
+ ## 4. End-to-End Threading & Data-Flow Architecture
+ 
+-Work is strictly partitioned across isolated threads communicating via lock-free primitives to eliminate lock contention, audio underruns, and UI hitching:
++Work is strictly partitioned across isolated threads communicating via lock-free primitives:
+ 
+ ```
+                           ┌──────────────────────────┐
+                           │   Media File / Network   │
+                           └────────────┬─────────────┘
+                                        │
+-                                       ▼ [ReadSeek]
++                                       ▼ [ReadSeek / File Path]
+                           ┌──────────────────────────┐
+-                          │     Demuxer Thread       │
+-                          │   (EBML / ISOBMFF Box)   │
++                          │ Universal Demuxer Thread │
++                          │ (MKV, MP4, AVI, TS, OGG) │
+                           └────────────┬─────────────┘
+                                        │
+                                        ▼ [Lock-Free SPSC DemuxPacket Queue]
+                           ┌──────────────────────────┐
+-                          │   Video Decoder Thread   │
+-                          │   (Bitstream -> YUV420p  │
+-                          │   -> Q8 Color Converter) │
++                          │ Universal Decoder Thread │
++                          │ (Video & Audio Decoding) │
+                           └────────────┬─────────────┘
+                                        │
+-                                       ▼ [Lock-Free SPSC VideoFrame Queue]
+-                          ┌──────────────────────────┐
+-                          │   Presentation Thread    │◄──────────────┐
+-                          │ (Wayland SHM / GPU VSync)│               │
+-                          └──────────────────────────┘               │
+-                                                                     │
+-┌──────────────────────────┐      [Atomic Snapshot]       ┌──────────┴───────────────┐
+-│     UI / Window Loop     │◄─────────────────────────────┤       Master Clock       │
+-│ - Wayland/X11 input      │                              │  PTS(t) = anchor_pts +   │
+-│ - OSD compositing        ├─────────────────────────────►│    (t - anchor_wall) * r │
+-│ - Floating chat bubbles  │      [SPSC Command Queue]    └──────────┬───────────────┘
++            ┌──────────────────────────┴──────────────────────────┐
++            ▼ [SPSC VideoFrame Queue]                             ▼ [SPSC AudioFrame Queue]
++┌──────────────────────────┐                              ┌──────────────────────────┐
++│   Presentation Thread    │◄──────────────┐              │     Audio Sink Thread    │
++│  (GPU Texture Upload /   │               │              │   (cpal / PipeWire /     │
++│   VSync Compositing)     │               │              │    ALSA Output Stream)   │
++└───────────┬──────────────┘               │              └────────────┬─────────────┘
++            │                              │                           │
++            ▼                              │                           ▼
++┌──────────────────────────┐      [Atomic Snapshot]       ┌────────────┴─────────────┐
++│   eframe / egui GUI Loop │◄─────────────────────────────┤       Master Clock       │
++│ - Wayland/X11 window     │                              │  PTS(t) = anchor_pts +   │
++│ - GPU Video Viewport     ├─────────────────────────────►│    (t - anchor_wall) * r │
++│ - Bottom Controls Bar    │      [SPSC Command Queue]    └──────────┬───────────────┘
++│ - Watch-Party Sidebar    │                                         │
+ └──────────┬───────────────┘                                         │
+            │                                                         │
+            ▼                                                         ▼
+@@ -156,6 +159,16 @@
+ 
+ ### 5.2 Codec & Frame Contract
+ ```rust
++pub trait VideoDecoder: Send {
++    fn decode_packet(&mut self, packet: &DemuxPacket) -> Result<Vec<VideoFrameYUV420p>, CodecError>;
++    fn flush(&mut self) -> Result<(), CodecError>;
++}
++
++pub trait AudioDecoder: Send {
++    fn decode_packet(&mut self, packet: &DemuxPacket) -> Result<Vec<AudioFramePCM>, CodecError>;
++    fn flush(&mut self) -> Result<(), CodecError>;
++}
++
+ pub trait ColorSpaceConverter: Send + Sync {
+     fn convert_yuv420p_to_rgba(
+         &self,
+@@ -181,7 +194,23 @@
+ }
+ ```
+ 
+-### 5.4 Network Sync Engine Contract
++### 5.4 UI Command Contract
++```rust
++#[derive(Debug, Clone, PartialEq)]
++pub enum PlayerCommand {
++    TogglePause,
++    Stop,
++    Seek(u64),
++    SetSpeed(f64),
++    SetVolume(f32),
++    ToggleMute,
++    OpenFile(std::path::PathBuf),
++    SendChatMessage(String),
++    ExecuteSlashCommand(String),
++}
++```
++
++### 5.5 Network Sync Engine Contract
+ ```rust
+ pub trait SyncEngine: Send {
+     fn process_incoming_packet(&mut self, packet_bytes: &[u8]) -> Result<(), SyncError>;
+@@ -190,7 +219,7 @@
+ }
+ ```
+ 
+-### 5.5 Smart Chat & Storage Engine Contract
++### 5.6 Smart Chat & Storage Engine Contract
+ ```rust
+ pub trait ChatEngine: Send + Sync {
+     fn append_message(&mut self, sender: &str, text: &str, media_pts: Option<MediaTime>) -> Result<u64, ChatError>;
+@@ -206,8 +235,9 @@
+ ## 6. Verification and Acceptance Criteria
+ 
+ The system architecture is validated against concrete criteria:
+-1. **Zero External Codec Invariant**: Static verification confirming 0 banned dependencies in `Cargo.toml` and `Cargo.lock`.
+-2. **Deterministic High-RTT Sync**: Automated simulation across 250–400ms RTT and $\pm 30\text{ms}$ jitter verifying the NTP filter and discrete PI PLL converge phase error to $< 15\text{ ms}$ without a hard seek for drifts $< 1.5\text{s}$, and barrier unpause starts across peers within $< 10\text{ ms}$.
+-3. **Synthetic Bitstream Parsing**: In-tree byte-exact test vectors verifying EBML VINT/Element ID parsing and ISOBMFF 32/64-bit box parsing.
+-4. **Chat Persistence & FTS**: Binary log crash-recovery, IEEE 802.3 CRC32 verification, Boolean AND search, and temporal overlay queries.
+-5. **Compilation Cleanliness**: Zero warnings under `cargo check --workspace` and `cargo test --workspace`.
++1. **Preserved Invariants & Audit Cleanliness**: Static verification confirming 0 banned monolithic player wrappers (`mpv`, `vlc`) and 0 banned database engines (`sqlite`) via `./scripts/audit_dependencies.sh`.
++2. **Universal Format Compatibility**: Smooth demuxing and decoding across MKV, MP4, WebM, AVI containers with H.264, H.265, VP9, AV1 video and AAC, MP3, Opus, Vorbis audio.
++3. **Desktop Graphical UI Responsiveness**: Launching the application opens an `eframe`/`egui` desktop window with GPU video viewport preserving aspect ratio (letterboxing/pillarboxing), bottom playback controls bar, 10Hz debounced interactive seekbar, watch-party sidebar, and sub-16ms latency.
++4. **Deterministic High-RTT Sync**: Automated simulation across 250–400ms RTT and $\pm 30\text{ms}$ jitter verifying the NTP filter and discrete PI PLL converge phase error to $< 15\text{ ms}$ without a hard seek for drifts $< 1.5\text{s}$, and barrier unpause starts across peers within $< 10\text{ ms}$.
++5. **Chat Persistence & FTS**: Binary log crash-recovery, IEEE 802.3 CRC32 verification, Boolean AND search, and temporal overlay queries.
++6. **Compilation Cleanliness**: Zero warnings under `cargo check --workspace` and `cargo test --workspace`.
+--- a/openspec/specs/ui-renderer/spec.md
++++ a/openspec/specs/ui-renderer/spec.md.new
+@@ -1,29 +1,56 @@
+-# Capability Specification: Native UI & OSD Architecture (`syncplay-ui`)
++# Capability Specification: Desktop Graphical UI & Renderer (`syncplay-ui`)
+ 
+ **Component**: `syncplay-ui`  
+-**Standards Compliance**: Desktop Windowing Compositor Protocols (Wayland `wl_shm`, X11 XShm), Sub-16ms Input Latency Bounds  
++**Standards Compliance**: Desktop Windowing Compositor Protocols (Wayland `xdg_shell`, X11 EWMH/NetWM, Win32), GPU Texture Presentation (`wgpu`, VSync), Sub-16ms Input Latency Bounds, RFC 2119  
+ **Status**: Authoritative OpenSpec Specification  
+ 
+ ---
+ 
+ ## 1. Overview & Architectural Role
+ 
+-The `syncplay-ui` crate specifies the native player user interface and On-Screen Display (OSD) overlay architecture. Desktop video players frequently suffer from input stutter, sluggish timeline scrubbing, and UI lockouts when interface rendering shares lock-guarded state with media decoding or network synchronization routines.
++The `syncplay-ui` crate specifies the native desktop graphical player user interface, GPU video viewport, On-Screen Display (OSD), and watch-party sidebar architecture. Desktop video players frequently suffer from input stutter, sluggish timeline scrubbing, audio crackle, and UI lockouts when interface rendering shares lock-guarded state with media decoding or network synchronization routines.
+ 
+-`syncplay-ui` guarantees "VLC-grade responsiveness" (< 16ms input-to-visual response) and an ultra-lean memory footprint (< 15MB RAM, < 1% CPU utilization) by enforcing:
+-1. **Thread Partitioning**: Complete isolation of the UI event loop from media demuxing, video decoding, and UDP network handling.
+-2. **Lock-Free Triple-Buffered Atomic State Snapshots**: Telemetry exchange via `PlayerUiSnapshot` pointers swapped with atomic memory operations, guaranteeing readers never lock or wait.
+-3. **OSD Overlay Compositing Pipeline**: Hardware-composited HUD layers presenting transport glyphs, timecodes, live sync health badges, floating chat bubbles, and an interactive scrub-bar.
+-4. **Debounced Timeline Scrubbing**: Decoupling 60–144 Hz visual scrubber feedback from 10 Hz rate-limited seek triggers.
++`syncplay-ui` delivers a modern, VLC-grade desktop player application running natively on Linux (Wayland and X11) and Windows while enforcing:
++1. **Thread Partitioning**: Complete isolation of the graphical UI event loop from media demuxing, video/audio decoding, audio output streaming, and UDP network handling.
++2. **Lock-Free Triple-Buffered Atomic State Snapshots**: Telemetry exchange via `PlayerUiSnapshot` pointers swapped with atomic memory operations, guaranteeing UI readers never lock or wait ($< 50\text{ ns}$).
++3. **GPU Video Viewport & Aspect Ratio Preservation**: Hardware-accelerated rendering surface maintaining exact media aspect ratio with automatic pillarboxing/letterboxing and vsync frame pacing.
++4. **Docked Playback Controls Bar**: Intuitive bottom panel featuring transport controls, timecode display, volume/mute controls, and playback speed selector.
++5. **Debounced Timeline Scrubbing with Hover Preview**: Decoupling 60–144 Hz visual scrubber and tooltip feedback from 10 Hz rate-limited seek command emissions.
++6. **In-Player Watch-Party Sidebar**: Collapsible right panel hosting room metadata, peer status, live sync diagnostics, and real-time dual-temporal smart chat with slash-command dispatching.
++7. **Native File Management**: Desktop integration with native file open dialogs via `rfd` (XDG Desktop Portal) and window drag-and-drop file loading.
+ 
+ ---
+ 
+ ## 2. Requirements & Scenarios
+ 
++The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119.
++
++### Requirement: Native Desktop Windowing & Compositor Lifecycle (Wayland & X11)
++The application SHALL instantiate a native desktop graphical window utilizing `eframe` / `egui` and `winit`:
++1. **Compositor Protocols**: The window SHALL interface natively with Wayland compositors (via `xdg_shell` protocol on Fedora Linux / GNOME) and fallback to X11 (via EWMH/NetWM) when Wayland is unavailable, as well as native Windows desktop windowing.
++2. **Window Operations**: The window MUST support standard desktop window management operations: minimize, maximize, smooth interactive window resizing, and clean close without leaking GPU buffers or OS handles.
++3. **Fullscreen Toggle**: The application SHALL support toggling fullscreen mode via the `F11` keypress and via double-clicking the video viewport surface. In fullscreen mode, window title bar decorations SHALL be hidden, and playback controls and sidebars SHALL automatically fade/hide after $2.5\text{ seconds}$ of mouse inactivity, reappearing immediately upon mouse cursor movement.
++4. **CLI Headless & Terminal Fallback**: The application MUST maintain support for command-line arguments `--headless` and `--terminal`, enabling automated testing harnesses, headless servers, and ANSI terminal rendering without requiring an active graphical display server.
++
++#### Scenario: Launch Desktop Application Window
++- **Given** an invocation of `syncplay-alt` without arguments on a Wayland desktop session
++- **When** the application starts up
++- **Then** a graphical desktop window titled "Syncplay-Alt" appears with default geometry ($1280 \times 720\text{ px}$)
++- **And** the window responds smoothly to window manager resize, minimize, and maximize actions.
++
++#### Scenario: Toggle Fullscreen Mode via F11
++- **Given** an active video playback session in windowed mode
++- **When** the user presses `F11` or double-clicks the video viewport
++- **Then** the application enters borderless fullscreen mode spanning the active display
++- **And** when the mouse cursor remains stationary for $> 2.5\text{ seconds}$, the bottom control bar and top header auto-hide
++- **And** upon subsequent mouse movement, controls reappear within $< 16\text{ ms}$.
++
++---
++
+ ### Requirement: Thread Decoupling & Mutex-Free State Sharing
+-The UI event and presentation loop SHALL NOT acquire mutex locks shared with media decoding, audio output, or network synchronization threads. Player state MUST be communicated to the UI via an immutable, self-contained `PlayerUiSnapshot` published through a triple-buffered atomic exchange mechanism adhering to a strict **Single-Producer Single-Consumer (SPSC)** thread topology:
++The UI event and presentation loop SHALL NOT acquire mutex locks shared with media demuxing, video decoding, audio output, or network synchronization threads. Player state MUST be communicated to the UI via an immutable, self-contained `PlayerUiSnapshot` published through a triple-buffered atomic exchange mechanism adhering to a strict **Single-Producer Single-Consumer (SPSC)** thread topology:
+ 
+-1. **Sole Publisher Mandate**: A single, dedicated **Telemetry Aggregator** thread (executing within the `syncplay-core` coordinator loop) SHALL be the sole publisher authorized to write to the triple buffer. Subsystem threads (demuxer, video decoder, audio sink, network sync) SHALL NOT publish directly to the triple buffer; they SHALL report metrics to the Telemetry Aggregator via atomic variables or bounded lock-free queues.
++1. **Sole Publisher Mandate**: A single, dedicated **Telemetry Aggregator** thread (executing within the `syncplay-core` coordinator loop) SHALL be the sole publisher authorized to write to the triple buffer. Subsystem threads SHALL NOT publish directly to the triple buffer; they SHALL report metrics to the Telemetry Aggregator via atomic variables or bounded lock-free queues.
+ 2. **Atomic Publication**: The Telemetry Aggregator compiles telemetry into the dirty buffer and executes a release-ordered atomic swap with the clean index at a periodic tick rate (e.g. 60–120 Hz).
+ 3. **Wait-Free Polling**: Polling the latest snapshot (`poll_latest_snapshot`) by the UI consumer thread MUST complete in $O(1)$ time ($< 50\text{ ns}$) with zero blocking, locking, system calls, or read tearing.
+ 
+@@ -36,14 +63,15 @@
+ ---
+ 
+ ### Requirement: Player UI Snapshot Schema & Telemetry
+-The `PlayerUiSnapshot` struct MUST encapsulate all telemetry required for the UI and OSD HUD:
++The `PlayerUiSnapshot` struct MUST encapsulate all telemetry required for the UI, OSD HUD, and watch-party sidebar:
+ ```rust
+-#[derive(Debug, Clone, Copy)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++#[repr(C)]
+ pub struct PlayerUiSnapshot {
+-    pub monotonic_timestamp: u64, // Nanoseconds
++    pub monotonic_timestamp: u64, // Nanoseconds (CLOCK_MONOTONIC)
+     pub media_position_pts: u64,  // Presentation timestamp (nanoseconds)
+     pub media_duration_pts: u64,  // Total file duration (nanoseconds)
+-    pub playback_state: PlaybackState, // Playing, Paused, Seeking, Buffering
++    pub playback_state: u64,      // 0 = Stopped, 1 = Playing, 2 = Paused, 3 = Seeking
+     pub network_rtt_nanos: u64,   // Filtered round-trip time
+     pub clock_offset_nanos: i64,  // Filtered clock offset θ
+     pub phase_error_nanos: i64,   // PLL phase error e(t)
+@@ -54,7 +82,7 @@
+ }
+ ```
+ 
+-The size of the snapshot struct MUST NOT exceed 128 bytes to ensure fast cache-line copying.
++The size of the snapshot struct MUST NOT exceed 128 bytes (verified at 72 bytes) to ensure fast cache-line copying and prevent false sharing.
+ 
+ #### Scenario: Read Consistent Atomic Snapshot Under SPSC Telemetry Aggregation
+ - **Given** audio, video, and network subsystems concurrently updating internal counters
+@@ -64,67 +92,144 @@
+ 
+ ---
+ 
+-### Requirement: Sub-16ms Input Handling & Speculative UI State
+-User input events (play/pause toggle via Space, relative seeking via Arrow keys) MUST produce immediate visual feedback on the subsequent display refresh frame ($< 16\text{ ms}$ at 60 Hz).
+-The UI thread SHALL:
+-1. Apply speculative local visual updates immediately (e.g. toggling the pause indicator or advancing the scrubber thumb).
+-2. Push a lightweight `PlayerCommand` into a lock-free Single-Producer Single-Consumer (SPSC) command queue for the core engine.
+-
+-The core engine SHALL drain and execute commands on its next tick without stalling the UI thread.
+-
+-#### Scenario: Press Space to Pause Under 60 Hz VSync
+-- **Given** playback in progress at 60 Hz display refresh
+-- **When** the user presses the Space key
+-- **Then** the UI speculative state immediately transitions to Paused
+-- **And** the Pause glyph is composited in the next display frame within $16\text{ ms}$
+-- **And** a `PlayerCommand::TogglePause` command is queued to the core engine.
+-
+----
+-
+-### Requirement: OSD Visual Overlay Elements & Compositing
+-The OSD layer SHALL composite the following elements over the video plane:
+-1. **Transport State Glyphs**: Transient $96 \times 96\text{ px}$ indicators (Play `▶`, Pause `❚❚`, Seek `◄◄ / ►►`) decaying exponentially over $600\text{ ms}$ ($\alpha(t) = 0.8 \cdot e^{-5t}$).
+-2. **Timecode HUD**: Fixed-width monospace timecode `HH:MM:SS / HH:MM:SS` positioned at the bottom-left corner $24\text{ px}$ above the scrubber.
+-3. **Sync Health Diagnostic Badge**: Top-right corner HUD displaying live RTT, phase error drift, PLL speed multiplier, and a color-coded status dot:
+-   - **Green (`#22C55E`)**: Phase error $|e(t)| < 15\text{ ms}$ (Deadband in-sync).
+-   - **Amber (`#F59E0B`)**: Phase error $15\text{ ms} \le |e(t)| \le 1500\text{ ms}$ (Active PLL micro-speed slew).
+-   - **Red (`#EF4444`)**: Phase error $|e(t)| > 1500\text{ ms}$ or packet loss $> 10\%$ (Desynchronized / Hard seek).
+-4. **Floating In-Player Chat Bubbles**: Semi-transparent rounded pills stacking upward at bottom-left ($60\text{ px}$ above scrubber). Bubbles MUST remain fully visible for $4.0\text{ seconds}$, then fade out over $1.0\text{ second}$. Maximum active visible bubbles SHALL be capped at 5.
+-
+-#### Scenario: Render Sync Health Badge Reflecting Current Drift
+-- **Given** a snapshot with phase error $e(t) = +35\text{ ms}$ and PLL speed $1.025\times$
+-- **When** the OSD composites the diagnostic badge
+-- **Then** the status dot color is Amber (`#F59E0B`)
+-- **And** the badge text indicates active micro-speed drift correction.
+-
+----
+-
+-### Requirement: Debounced Interactive Scrub-Bar
+-When the user scrubs the interactive timeline slider:
+-1. The visual scrubber thumb and timestamp tooltip MUST update at the full native display refresh rate ($60\text{--}144\text{ Hz}$).
+-2. Seek commands emitted to the demuxer and network sync engine during active dragging MUST be rate-limited (debounced) to a maximum frequency of $10\text{ Hz}$ ($100\text{ ms}$ minimum interval between intermediate seek packets).
+-3. Upon mouse release (scrub complete), a final authoritative seek command MUST be dispatched immediately to guarantee accurate landing on the user's release position.
++### Requirement: GPU Video Viewport & Aspect Ratio Preservation
++The UI SHALL render decoded video frames onto a GPU texture surface using `wgpu` or `egui::ColorImage` texture allocation:
++1. **Aspect Ratio Preservation**: The video viewport MUST preserve the native aspect ratio ($\text{AR}_{\text{video}} = W_{\text{video}} / H_{\text{video}}$) of the media stream regardless of the player window dimensions.
++2. **Pillarboxing & Letterboxing**:
++   - If the available viewport aspect ratio is wider than the video aspect ratio ($\text{AR}_{\text{avail}} > \text{AR}_{\text{video}}$), the viewport MUST apply vertical **pillarboxing** (black bars on left and right) with horizontally centered video rendering.
++   - If the available viewport aspect ratio is taller than the video aspect ratio ($\text{AR}_{\text{avail}} < \text{AR}_{\text{video}}$), the viewport MUST apply horizontal **letterboxing** (black bars on top and bottom) with vertically centered video rendering.
++3. **Geometry Calculation**:
++   $$\text{scale} = \min\left(\frac{W_{\text{avail}}}{W_{\text{video}}}, \frac{H_{\text{avail}}}{H_{\text{video}}}\right)$$
++   $$W_{\text{rendered}} = W_{\text{video}} \cdot \text{scale}, \quad H_{\text{rendered}} = H_{\text{video}} \cdot \text{scale}$$
++   $$X_{\text{offset}} = X_{\text{avail}} + \frac{W_{\text{avail}} - W_{\text{rendered}}}{2}, \quad Y_{\text{offset}} = Y_{\text{avail}} + \frac{H_{\text{avail}} - H_{\text{rendered}}}{2}$$
++4. **VSync Pacing**: Texture uploads and surface presentations SHALL be synchronized with the compositor's VSync refresh rate (60–144 Hz) to prevent screen tearing and frame pacing stutter.
++
++#### Scenario: Pillarboxing Under Ultra-Wide Window Resizing
++- **Given** a 16:9 video stream ($1920 \times 1080$, $\text{AR} \approx 1.778$)
++- **When** the user resizes the window to an ultra-wide dimension ($2560 \times 1080$, $\text{AR} \approx 2.370$)
++- **Then** the rendered video height fills the available height ($1080\text{ px}$)
++- **And** the rendered video width is scaled to $1920\text{ px}$
++- **And** black pillarbox bars of width $(2560 - 1920) / 2 = 320\text{ px}$ are displayed symmetrically on both left and right flanks.
++
++#### Scenario: Letterboxing Under Tall Window Resizing
++- **Given** a 16:9 video stream ($1920 \times 1080$, $\text{AR} \approx 1.778$)
++- **When** the user resizes the window to a square aspect ratio ($1280 \times 1280$, $\text{AR} = 1.0$)
++- **Then** the rendered video width fills the available width ($1280\text{ px}$)
++- **And** the rendered video height is scaled to $1280 / (16/9) = 720\text{ px}$
++- **And** black letterbox bars of height $(1280 - 720) / 2 = 280\text{ px}$ are displayed symmetrically on both top and bottom.
++
++---
++
++### Requirement: Interactive Playback Controls Bar
++The UI SHALL provide an intuitive docked controls bar at the bottom of the window (height $48\text{--}56\text{ px}$):
++1. **Transport Buttons**:
++   - **Play/Pause Toggle**: Displays `▶` when paused and `❚❚` when playing. Triggered by button click or Spacebar shortcut.
++   - **Stop Button**: Stops playback and resets media position PTS to 0.
++2. **Timecode HUD**: Fixed-width monospace timecode `HH:MM:SS / HH:MM:SS` displaying current media PTS and total media duration.
++3. **Volume & Mute Controls**:
++   - Horizontal volume slider with range $[0.0, 1.0]$ ($0\%\text{--}100\%$).
++   - Mute toggle button (shortcut `M`) that mutes audio output while preserving the previous volume level.
++4. **Playback Speed Selector**: Dropdown or step selector supporting speeds $0.5\times, 0.75\times, 1.0\times, 1.25\times, 1.5\times, 2.0\times$.
++5. **Panel Toggle Buttons**: Quick-access toggles for Watch-Party Sidebar visibility and Fullscreen mode.
++
++#### Scenario: Spacebar Toggles Play/Pause
++- **Given** an active video playback session
++- **When** the user presses the Spacebar
++- **Then** the UI speculative state immediately transitions between Playing and Paused
++- **And** a `PlayerCommand::TogglePause` is queued to the core coordinator within $< 16\text{ ms}$.
++
++#### Scenario: Volume Slider and Mute Toggle Adjust Audio Gain
++- **Given** active audio playback with volume set to $80\%$ ($0.80$)
++- **When** the user clicks the Mute toggle or presses `M`
++- **Then** audio output is muted ($0.00$ gain) and the mute icon is displayed
++- **And** when the user un-mutes, volume restores immediately to $80\%$.
++
++---
++
++### Requirement: Interactive Seekbar with Hover Preview & 10Hz Debounced Scrubbing
++The timeline slider SHALL decouple smooth high-refresh visual feedback from rate-limited command emissions:
++1. **Visual Feedback & Hover Tooltip**:
++   - The visual scrubber thumb position and hover timestamp tooltip MUST update at the full display refresh rate ($60\text{--}144\text{ Hz}$).
++   - Hovering over the seekbar MUST display a floating tooltip indicating the exact target timestamp (`HH:MM:SS`) corresponding to the cursor's horizontal position.
++2. **Debounced Command Emissions**:
++   - Seek commands emitted to the demuxer and network sync engine during active mouse dragging MUST be rate-limited (debounced) to a maximum frequency of $10\text{ Hz}$ ($100\text{ ms}$ minimum interval between intermediate seek packets).
++3. **Authoritative Release Command**:
++   - Upon mouse release (drag completion), a final authoritative seek command MUST be dispatched immediately to guarantee accurate landing on the user's release position.
+ 
+-#### Scenario: Rapid Mouse Drag on Progress Scrub-Bar
++#### Scenario: Rapid Mouse Drag on Progress Scrub-Bar with Tooltip Preview
+ - **Given** a user continuously dragging the scrub thumb across the timeline for $500\text{ ms}$
+ - **When** mouse move events fire at $120\text{ Hz}$ (60 events)
+ - **Then** the visual thumb updates 60 times without lag
+-- **And** exactly 5 throttled intermediate seek commands are dispatched during the drag
++- **And** the hover timestamp tooltip reflects current mouse position continuously
++- **And** exactly 5 throttled intermediate seek commands are dispatched during the drag ($10\text{ Hz}$)
+ - **And** when the mouse button is released, a 6th final authoritative seek command is dispatched immediately, for a total of 6 emitted seek commands.
+ 
+ ---
+ 
+-### Requirement: Memory Footprint & Hot-Loop Zero-Allocation Budget
+-The entire `syncplay-ui` subsystem MUST operate within strict resource constraints:
+-- **Total Memory Budget**: Maximum $15\text{ MB}$ RAM footprint across all UI buffers. To guarantee compliance:
+-  - The font glyph atlas texture MUST use a single-channel Alpha8 (`R8_UNORM`, 1 byte per texel) layout, bounding a $2048 \times 2048$ atlas to $\le 4.0\text{ MB}$ (or $1024 \times 1024$ to $\le 1.0\text{ MB}$). Shaders SHALL sample the single channel as alpha coverage modulated by vertex color. 32-bit RGBA glyph textures are prohibited.
+-  - OSD rendering SHALL utilize dirty-rect compositing, bounding framebuffer allocations to $\le 8.5\text{ MB}$.
+-  - State snapshot buffers and SPSC command queues SHALL be bounded to $\le 1.0\text{ MB}$.
+-- **CPU Overhead**: In steady-state playback with idle OSD, UI core utilization MUST remain $< 0.2\%$. Under active chat animations, CPU utilization MUST NOT exceed $1.2\%$.
+-- **Allocation Invariant**: Zero heap allocations (`malloc` / `Vec::new`) SHALL occur in the hot per-frame render loop; all vertex arrays and glyph quads MUST use pre-allocated static or ring buffers.
+-
+-#### Scenario: Measure Steady-State Memory Allocation
+-- **Given** continuous 60 FPS playback for 10 minutes with active OSD compositing and a 2048x2048 R8_UNORM font atlas
+-- **When** monitoring process heap allocation
++### Requirement: In-Player Watch-Party Sidebar & Real-Time Smart Chat
++The UI SHALL provide a collapsible right sidebar panel (nominal width $280\text{--}320\text{ px}$) dedicated to watch-party interaction:
++1. **Connection & Sync Diagnostics**:
++   - Displays room role (Host / Client) and peer count.
++   - Real-time network sync diagnostic badge displaying filtered RTT ($\text{ms}$), clock offset $\theta$ ($\text{ms}$), phase error $e(t)$ ($\text{ms}$), and PLL micro-speed multiplier.
++   - Status dot color-coded according to drift zone:
++     - **Green (`#22C55E`)**: Phase error $|e(t)| < 15\text{ ms}$ (Deadband in-sync).
++     - **Amber (`#F59E0B`)**: Phase error $15\text{ ms} \le |e(t)| \le 1500\text{ ms}$ (Active PLL micro-speed slew).
++     - **Red (`#EF4444`)**: Phase error $|e(t)| > 1500\text{ ms}$ or packet loss $> 10\%$ (Desynchronized / Hard seek).
++2. **Scrollable Chat Stream**:
++   - Displays incoming and historical chat messages retrieved from `syncplay_chat.bin`.
++   - Each message displays author name, wall-clock time, media timestamp ($t_{\text{media}}$) with click-to-seek jump, and text payload.
++3. **Interactive Chat Input**:
++   - Single-line text input field supporting Enter-to-send.
++   - Automatic slash-command parsing and dispatching: `/seek <timecode>`, `/bookmark`, `/clip`, `/poll <question>`, `/sync-status`.
++
++#### Scenario: Render Watch-Party Sidebar with Live Room Telemetry
++- **Given** a connected watch-party session with 3 peers, RTT $280\text{ ms}$, phase error $e(t) = +22\text{ ms}$, and PLL speed $1.018\times$
++- **When** the watch-party sidebar is rendered
++- **Then** the status badge dot is Amber (`#F59E0B`) indicating active micro-speed slew
++- **And** the peer list displays all 3 connected room members
++- **And** new chat messages scroll smoothly into view without hitching video playback.
++
++---
++
++### Requirement: Native File Selection & Drag-and-Drop Loading
++The application SHALL provide user-friendly file loading methods:
++1. **Native OS File Dialogs**:
++   - The application SHALL support opening media files via `rfd` (Rust File Dialog).
++   - On Fedora Linux / Wayland, `rfd` SHALL interface with the `xdg-desktop-portal` (GNOME portal) via D-Bus, presenting the user with the system-native GTK/GNOME file picker without requiring direct GTK3/GTK4 compilation dependencies.
++   - Supported file extensions in the file filter SHALL include: `*.mkv`, `*.webm`, `*.mp4`, `*.m4v`, `*.mov`, `*.avi`, `*.ts`, `*.flv`, `*.ogg`, `*.ogv`.
++2. **Drag-and-Drop File Loading**:
++   - The application window SHALL accept dropped files directly from desktop file managers (e.g. GNOME Files / Nautilus, Windows Explorer).
++   - Upon dropping a file onto the player window, the player SHALL immediately load the file, parse container headers, and initiate playback.
++3. **Recent Media History**:
++   - The application SHOULD persist a recent media history (up to 10 entries) stored in `$XDG_CONFIG_HOME/syncplay-alt/recent_history.json`, accessible via a "Recent Files" menu.
++
++#### Scenario: Open File via Native File Picker Dialog
++- **Given** the player running with no media loaded
++- **When** the user clicks "Open File" (shortcut `Ctrl+O`)
++- **Then** the native OS file picker dialog appears via XDG Desktop Portal
++- **When** the user selects a video file `movie.mkv` and confirms
++- **Then** the player immediately demuxes container headers and begins synchronized playback.
++
++#### Scenario: Drag-and-Drop Video File into Window
++- **Given** the player running in windowed mode
++- **When** the user drags a video file `video.mp4` from GNOME Files and drops it into the player window
++- **Then** the player detects the drop event, loads `video.mp4`, and begins video presentation.
++
++---
++
++### Requirement: Memory Footprint & Hot-Loop Performance Budget
++The graphical UI subsystem MUST operate within bounded resource limits:
++1. **Memory Budget**:
++   - **GPU Texture Memory**: Bounded by video frame size ($1920 \times 1080 \times 4\text{ bytes} \approx 8.3\text{ MB}$ per double-buffered texture $\approx 16.6\text{ MB}$).
++   - **Egui UI State & Meshes**: $\le 25\text{ MB}$.
++   - **Overall Application Resident Set Size (RSS) Idle**: $\le 85\text{ MB}$ in steady-state playback.
++2. **CPU Utilization**:
++   - At 60 FPS video playback with active sidebar, UI thread CPU utilization MUST remain $\le 5\%$ on modern multi-core x86_64 processors.
++3. **Allocation Invariant**:
++   - Zero unnecessary heap allocations SHALL occur in the per-frame render loop; UI vertex meshes and font textures MUST be cached and updated in-place.
++
++#### Scenario: Measure Steady-State Memory Allocation Under Active Desktop Playback
++- **Given** continuous 60 FPS video playback for 10 minutes with active video viewport, bottom controls, and watch-party sidebar open
++- **When** monitoring process heap allocation and GPU texture usage
+ - **Then** zero continuous memory growth occurs
+-- **And** total UI memory allocation remains strictly under $15\text{ MB}$.
++- **And** total application RSS remains strictly under $85\text{ MB}$.

@@ -1,0 +1,150 @@
+--- a/crates/syncplay-clock/src/master_clock.rs
++++ b/crates/syncplay-clock/src/master_clock.rs
+@@ -104,6 +104,50 @@ impl MasterClock {
+         }
+     }
+ 
++    /// Returns the current playback state of the clock.
++    pub fn state(&self) -> PlaybackState {
++        loop {
++            let s1 = self.seq.load(Ordering::Acquire);
++            if s1 & 1 != 0 {
++                std::hint::spin_loop();
++                continue;
++            }
++
++            // SAFETY: s1 was observed even, read state optimistically.
++            let state = unsafe { (*self.state.get()).state };
++
++            let s2 = self.seq.load(Ordering::Acquire);
++            if s1 == s2 && (s2 & 1 == 0) {
++                return state;
++            }
++            std::hint::spin_loop();
++        }
++    }
++
++    /// Returns whether the clock is currently in the `PlaybackState::Playing` state.
++    pub fn is_playing(&self) -> bool {
++        self.state() == PlaybackState::Playing
++    }
++
++    /// Returns the current playback speed ratio.
++    pub fn speed(&self) -> f64 {
++        loop {
++            let s1 = self.seq.load(Ordering::Acquire);
++            if s1 & 1 != 0 {
++                std::hint::spin_loop();
++                continue;
++            }
++
++            // SAFETY: s1 was observed even, read speed optimistically.
++            let speed = unsafe { (*self.state.get()).speed };
++
++            let s2 = self.seq.load(Ordering::Acquire);
++            if s1 == s2 && (s2 & 1 == 0) {
++                return speed;
++            }
++            std::hint::spin_loop();
++        }
++    }
++
+     /// Re-anchors the timeline to a new playback speed at wall instant `now`.
+     ///
+     /// Preserves mathematical $C^0$ continuity with zero discontinuous jumps.
+@@ -237,4 +281,19 @@ mod tests {
+             PresentationAction::DropLateFrame
+         );
+     }
++
++    #[test]
++    fn test_master_clock_state_and_speed_getters() {
++        let clock = MasterClock::new(0.0, 1.0, PlaybackState::Paused);
++        assert_eq!(clock.state(), PlaybackState::Paused);
++        assert!(!clock.is_playing());
++        assert!((clock.speed() - 1.0).abs() < 1e-6);
++
++        let now = Instant::now();
++        clock.set_state(now, PlaybackState::Playing);
++        assert_eq!(clock.state(), PlaybackState::Playing);
++        assert!(clock.is_playing());
++
++        clock.reanchor(now, 1.04);
++        assert!((clock.speed() - 1.04).abs() < 1e-6);
++    }
+ }
+--- a/crates/syncplay-core/src/coordinator.rs
++++ b/crates/syncplay-core/src/coordinator.rs
+@@ -61,11 +61,16 @@ impl PlayerCoordinator {
+         let metrics = SubsystemMetrics {
+             monotonic_timestamp: elapsed_nanos,
+             media_position_pts: (curr_pts_ms * 1_000_000.0) as u64,
+             media_duration_pts: 0,
+-            playback_state: 1, // Playing
++            playback_state: match self.clock.state() {
++                PlaybackState::Paused => 0,
++                PlaybackState::Playing => 1,
++                PlaybackState::Seeking => 2,
++                PlaybackState::Buffering => 3,
++            },
+             network_rtt_nanos: median_rtt as u64,
+             clock_offset_nanos: filtered_offset as i64,
+             phase_error_nanos: 0,
+-            speed_ratio: 1.0,
++            speed_ratio: self.clock.speed(),
+             peer_count: 1,
+             peers_ready: 1,
+             room_sequence: elapsed_nanos,
+@@ -82,9 +87,12 @@ impl PlayerCoordinator {
+     pub fn handle_command(&mut self, cmd: PlayerCommand, now: Instant) -> Result<(), CoreError> {
+         match cmd {
+             PlayerCommand::TogglePause => {
+-                let curr_pts = self.clock.current_pts(now);
+-                self.clock.set_state(now, PlaybackState::Playing);
+-                let _ = curr_pts;
++                let next_state = if self.clock.state() == PlaybackState::Playing {
++                    PlaybackState::Paused
++                } else {
++                    PlaybackState::Playing
++                };
++                self.clock.set_state(now, next_state);
+             }
+             PlayerCommand::Seek(target_pts_ms) => {
+                 self.clock.seek_to(target_pts_ms as f64, now);
+@@ -116,4 +124,37 @@ mod tests {
+         assert!((coordinator.clock.current_pts(now) - 15000.0).abs() < 1e-3);
+     }
++
++    #[test]
++    fn test_coordinator_toggle_pause() {
++        let mut coordinator = PlayerCoordinator::new();
++        let now = Instant::now();
++
++        // Initial state is Paused
++        assert_eq!(coordinator.clock.state(), PlaybackState::Paused);
++        assert!(!coordinator.clock.is_playing());
++
++        let snap_init = coordinator.tick(now);
++        assert_eq!(snap_init.playback_state, 0);
++
++        // Toggle 1: Paused -> Playing
++        coordinator
++            .handle_command(PlayerCommand::TogglePause, now)
++            .unwrap();
++        assert_eq!(coordinator.clock.state(), PlaybackState::Playing);
++        assert!(coordinator.clock.is_playing());
++
++        let snap_playing = coordinator.tick(now);
++        assert_eq!(snap_playing.playback_state, 1);
++
++        // Toggle 2: Playing -> Paused
++        coordinator
++            .handle_command(PlayerCommand::TogglePause, now)
++            .unwrap();
++        assert_eq!(coordinator.clock.state(), PlaybackState::Paused);
++        assert!(!coordinator.clock.is_playing());
++
++        let snap_paused = coordinator.tick(now);
++        assert_eq!(snap_paused.playback_state, 0);
++    }
+ }

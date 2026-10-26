@@ -1,0 +1,155 @@
+{
+  "version": "4.0.0",
+  "framework": "pi-framework",
+  "authority": "AGENTS.md",
+  "intents": [
+    {
+      "id": "INTENT-01",
+      "name": "Universal Media Compatibility & Zero Monolithic Player / Database Wrappers",
+      "description": "Comprehensive container demuxing (MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1; AAC, MP3, Opus, Vorbis, FLAC, PCM) while strictly prohibiting monolithic player IPC wrappers (mpv, vlc) and external database engines (sqlite, diesel, rocksdb).",
+      "openspec_ref": "openspec/project.md#2-invariant-prohibitions--dependency-whitelist",
+      "capabilities": ["demuxer", "codecs", "av-pipeline", "sync-engine", "smart-chat", "ui-renderer"],
+      "verification": {
+        "command": "./scripts/audit_dependencies.sh",
+        "type": "static_audit",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Universal media compatibility across standard modern containers (MKV, MP4, WebM, AVI, TS, FLV) and codecs (H.264, H.265, VP8, VP9, AV1, AAC, MP3, Opus, FLAC)",
+        "Zero monolithic player script/IPC wrappers (mpv, mpv-sys, libmpv, vlc, libvlc)",
+        "Zero external database engines (sqlite, rusqlite, sqlx, sled, rocksdb, heed, tantivy, meilisearch, diesel)",
+        "Dual-temporal smart chat persists via custom crash-resilient binary log (syncplay_chat.bin) and in-memory inverted index FTS"
+      ]
+    },
+    {
+      "id": "INTENT-02",
+      "name": "Deterministic High-RTT Network Clock Synchronization",
+      "description": "Clock phase alignment across transatlantic/transpacific WAN links (250-400ms RTT, +-30ms jitter) using RFC 5905 NTP 4-timestamp exchange, sliding-window min-RTT filtering with dispersion freezing defense, and discrete PI PLL micro-speed steering.",
+      "openspec_ref": "openspec/specs/sync-engine/spec.md",
+      "capabilities": ["sync-engine"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_sync_engine.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Effective dispersion floor D_effective >= 5.0ms preventing zero-dispersion freeze",
+        "Watchdog timer flushes buffer upon 8 consecutive rejections to recover from route shifts",
+        "Tri-zone drift policy: Zone 1 deadband (|e| < 15ms) holding r=1.0x, Zone 2 micro-speed (15ms <= |e| <= 1500ms) with r in [0.96, 1.04], Zone 3 hard seek (|e| > 1500ms)",
+        "Critically damped dynamics: e(0)=+450ms enters < 15ms deadband within <= 20s with 0 overshoot past -15ms"
+      ]
+    },
+    {
+      "id": "INTENT-03",
+      "name": "Barrier-Synchronized Two-Phase Commit Unpause",
+      "description": "Scheduled playback resumption after seek or pause guaranteeing positive arrival margins across all peers and cross-peer start alignment under 10ms.",
+      "openspec_ref": "openspec/specs/sync-engine/spec.md#barrier-unpause",
+      "capabilities": ["sync-engine"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_sync_engine.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Target schedule: T_target_server = t_server_now + 1.5 * max(RTT) + t_preroll_budget + 100ms",
+        "Commit arrival safety margin >= 100ms across all pre-roll intervals",
+        "Cross-peer playback start time delta < 10ms"
+      ]
+    },
+    {
+      "id": "INTENT-04",
+      "name": "Crash-Resilient Dual-Temporal Local Smart Chat",
+      "description": "Local append-only binary log (syncplay_chat.bin) with 0xAA55 framing, dual timestamps (t_wall, t_media), IEEE 802.3 CRC32 checksums, byte-by-byte false-sync recovery, in-memory inverted index FTS (CJK unigram/bigram segmentation with single ideograph exemption), and media slash commands (/seek, /bookmark, /clip, /poll, /sync-status).",
+      "openspec_ref": "openspec/specs/smart-chat/spec.md",
+      "capabilities": ["smart-chat"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_smart_chat.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Record total length = body_len + 10 (>= 48 bytes)",
+        "Forward scanner recovers from embedded 0xAA55 false-sync patterns without truncating valid trailing records",
+        "Authoritative truncation applied only to incomplete trailing writes at EOF",
+        "Unicode case folding (including Turkish dotted I) and CJK unigram + overlapping bigram indexing",
+        "Single ideograph indexing for CJK (1..48 chars)",
+        "Media slash commands parsed and normalized to integer milliseconds"
+      ]
+    },
+    {
+      "id": "INTENT-05",
+      "name": "Desktop Graphical UI Architecture & Decoupled Lock-Free Responsiveness",
+      "description": "Native cross-platform desktop window (Wayland/X11 and Windows via eframe/egui with GPU texture viewport), aspect ratio preservation (letterbox/pillarbox), 128-byte cache-line aligned SPSC ring buffer eliminating false sharing, triple-buffered atomic UI snapshots (PlayerUiSnapshot, 72 bytes) published via Telemetry Aggregator, 10Hz scrubber debouncer, and <=15MB UI memory footprint.",
+      "openspec_ref": "openspec/specs/av-pipeline/spec.md,openspec/specs/ui-renderer/spec.md",
+      "capabilities": ["av-pipeline", "ui-renderer"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_ui_renderer.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Native desktop graphical window with Wayland/X11 and Windows support, GPU video surface, bottom playback controls, and watch-party sidebar",
+        "Video viewport aspect ratio preservation math guaranteeing deterministic letterboxing and pillarboxing without image distortion",
+        "SPSC head and tail pointers aligned to 128 bytes (#[repr(align(128))])",
+        "PlayerUiSnapshot fits in single 128-byte cache line pair (72 bytes <= 128 bytes)",
+        "Centralized Telemetry Aggregator topology guarantees zero torn reads for UI thread",
+        "10Hz scrubber debouncer: 500ms drag at 120Hz yields exactly 5 intermediate seeks + 1 final release seek = 6 commands",
+        "Single-channel Alpha8 font atlas (4MB) and bounded overlay (max 5 bubbles) conform to <= 15MB UI RAM budget"
+      ]
+    },
+    {
+      "id": "INTENT-06",
+      "name": "Zero-Allocation Fixed-Point Color Transformation",
+      "description": "Pure-Rust Q8 fixed-point integer color space conversion (YUV420p to RGBA) for ITU-R BT.601 and BT.709 limited range with branchless clamping and zero heap allocations in hot loop.",
+      "openspec_ref": "openspec/specs/codecs/spec.md",
+      "capabilities": ["codecs"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_demux_codecs_clock.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Planar YUV420p row strides aligned to 16 bytes ((width + 15) & !15)",
+        "Plane allocations aligned to 64 bytes with +16B SIMD tail padding",
+        "Q8 fixed-point integer conversion matches reference primaries within +/-1 LSB",
+        "Zero heap allocations inside the per-frame transform loop"
+      ]
+    },
+    {
+      "id": "INTENT-07",
+      "name": "Robust Container Demuxing & Timescale Integer Arithmetic",
+      "description": "RFC 8794 EBML VINT decoder and ISOBMFF 32/64-bit box parser rejecting malformed sizes, with 64-bit integer PTS timescale conversion avoiding overflow across 24h playback.",
+      "openspec_ref": "openspec/specs/demuxer/spec.md",
+      "capabilities": ["demuxer"],
+      "verification": {
+        "command": "python3 tests/empirical_challenge/test_demux_codecs_clock.py",
+        "type": "empirical_simulation",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "EBML VINT octet widths 1-8 decoded via leading_zeros() + 1",
+        "Matroska SimpleBlock PTS arithmetic computed with 64-bit integer arithmetic without overflow",
+        "ISOBMFF box parser validates 16 <= largesize <= i64::MAX and rejects invalid box headers",
+        "In-tree synthetic 48-byte EBML and 132-byte MP4 test vectors parsed with zero errors"
+      ]
+    },
+    {
+      "id": "INTENT-08",
+      "name": "OpenSpec Traceability & Anti-Drift Guarantee",
+      "description": "Every capability requirement in openspec/specs/ and every change proposal in openspec/changes/ is mapped to executable Rust and empirical tests. No agent may self-certify without passing the Intent Harness.",
+      "openspec_ref": "openspec/project.md",
+      "capabilities": ["demuxer", "codecs", "av-pipeline", "sync-engine", "smart-chat", "ui-renderer"],
+      "verification": {
+        "command": "cargo check --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace -- --nocapture",
+        "type": "rust_workspace_tests",
+        "expected_exit_code": 0
+      },
+      "invariants": [
+        "Zero compiler warnings across workspace (cargo check --workspace --all-targets)",
+        "Zero clippy warnings across workspace (cargo clippy --workspace --all-targets -- -D warnings)",
+        "Mandatory public documentation (#![deny(missing_docs)])",
+        "100% pass rate across all Rust unit and integration test fixtures"
+      ]
+    }
+  ]
+}

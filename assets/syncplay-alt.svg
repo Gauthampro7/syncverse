@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="50%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#090d16"/>
+    </linearGradient>
+    <linearGradient id="playGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background Squircle -->
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#bgGrad)" stroke="#334155" stroke-width="4"/>
+
+  <!-- Sync Orbital Rings -->
+  <circle cx="256" cy="256" r="180" fill="none" stroke="url(#ringGrad)" stroke-width="6" stroke-dasharray="14 10" opacity="0.6"/>
+  <circle cx="256" cy="256" r="140" fill="none" stroke="#6366f1" stroke-width="3" stroke-dasharray="8 6" opacity="0.4"/>
+
+  <!-- Glowing Sync Nodes -->
+  <circle cx="256" cy="76" r="10" fill="#10b981" filter="url(#glow)"/>
+  <circle cx="436" cy="256" r="10" fill="#06b6d4" filter="url(#glow)"/>
+  <circle cx="256" cy="436" r="10" fill="#8b5cf6" filter="url(#glow)"/>
+  <circle cx="76" cy="256" r="10" fill="#ec4899" filter="url(#glow)"/>
+
+  <!-- Central Play Symbol (Equilateral Triangular Arrow) with Neon Gradient & Glow -->
+  <polygon points="210,160 360,256 210,352" fill="url(#playGrad)" filter="url(#glow)"/>
+
+  <!-- Floating Chat Indicator Bubble -->
+  <g transform="translate(320, 110)">
+    <circle cx="36" cy="36" r="32" fill="#0f172a" stroke="#06b6d4" stroke-width="3"/>
+    <circle cx="26" cy="36" r="4" fill="#38bdf8"/>
+    <circle cx="36" cy="36" r="4" fill="#38bdf8"/>
+    <circle cx="46" cy="36" r="4" fill="#38bdf8"/>
+  </g>
+</svg>

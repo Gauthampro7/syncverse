@@ -1,0 +1,81 @@
+{
+  "timestamp": "2026-10-26T07:35:28Z",
+  "total_intents": 8,
+  "passed_intents": 8,
+  "compliance_score_percent": 100.0,
+  "status": "PASS",
+  "results": [
+    {
+      "id": "INTENT-01",
+      "name": "Universal Media Compatibility & Zero Monolithic Player / Database Wrappers",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.383,
+      "invariants_count": 4,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-02",
+      "name": "Deterministic High-RTT Network Clock Synchronization",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.039,
+      "invariants_count": 4,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-03",
+      "name": "Barrier-Synchronized Two-Phase Commit Unpause",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.034,
+      "invariants_count": 3,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-04",
+      "name": "Crash-Resilient Dual-Temporal Local Smart Chat",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.043,
+      "invariants_count": 6,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-05",
+      "name": "Desktop Graphical UI Architecture & Decoupled Lock-Free Responsiveness",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.752,
+      "invariants_count": 7,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-06",
+      "name": "Zero-Allocation Fixed-Point Color Transformation",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.379,
+      "invariants_count": 4,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-07",
+      "name": "Robust Container Demuxing & Timescale Integer Arithmetic",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 0.375,
+      "invariants_count": 4,
+      "error_snippet": null
+    },
+    {
+      "id": "INTENT-08",
+      "name": "OpenSpec Traceability & Anti-Drift Guarantee",
+      "success": true,
+      "exit_code": 0,
+      "duration_s": 14.511,
+      "invariants_count": 4,
+      "error_snippet": null
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Rust build targets
+/target/
+target/
+**/*.rs.bk
+
+# Chat log & test binaries
+syncplay_chat.bin
+*.bin
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs & temp files
+*.log
+/tmp/

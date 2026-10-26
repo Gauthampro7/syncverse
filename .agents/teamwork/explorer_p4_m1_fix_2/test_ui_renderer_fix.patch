@@ -1,0 +1,60 @@
+--- a/tests/empirical_challenge/test_ui_renderer.py
++++ b/tests/empirical_challenge/test_ui_renderer.py
+@@ -333,6 +333,9 @@ def test_desktop_graphical_ui_architecture():
+     
+     # 1. Letterboxing and Pillarboxing Aspect Ratio Calculation
+     def calculate_video_viewport(viewport_w: float, viewport_h: float, video_w: float, video_h: float):
++        if viewport_w <= 0.0 or viewport_h <= 0.0 or video_w <= 0.0 or video_h <= 0.0:
++            return 0.0, 0.0, 0.0, 0.0, "empty"
++
+         aspect_video = video_w / video_h
+         aspect_avail = viewport_w / viewport_h
+         
+@@ -390,6 +393,47 @@ def test_desktop_graphical_ui_architecture():
+     assert rw == 1920.0 and rh == 1080.0 and ox == 320.0 and oy == 0.0
+     print(f"  [PASS] Pillarboxing 16:9 video in 21:9 ultrawide viewport: render = 1920x1080, ox = 320px")
+ 
++    # Case F: 0x0 / non-positive dimensions (uninitialized, minimized, or unloaded media) -> Empty fallback
++    rw, rh, ox, oy, mode = calculate_video_viewport(0.0, 0.0, 1920.0, 1080.0)
++    assert mode == "empty" and rw == 0.0 and rh == 0.0 and ox == 0.0 and oy == 0.0
++    rw, rh, ox, oy, mode = calculate_video_viewport(1280.0, 720.0, 0.0, 0.0)
++    assert mode == "empty" and rw == 0.0 and rh == 0.0 and ox == 0.0 and oy == 0.0
++    rw, rh, ox, oy, mode = calculate_video_viewport(0.0, 720.0, 1920.0, 1080.0)
++    assert mode == "empty" and rw == 0.0 and rh == 0.0 and ox == 0.0 and oy == 0.0
++    rw, rh, ox, oy, mode = calculate_video_viewport(1280.0, 0.0, 1920.0, 1080.0)
++    assert mode == "empty" and rw == 0.0 and rh == 0.0 and ox == 0.0 and oy == 0.0
++    rw, rh, ox, oy, mode = calculate_video_viewport(-100.0, -100.0, 1920.0, 1080.0)
++    assert mode == "empty" and rw == 0.0 and rh == 0.0 and ox == 0.0 and oy == 0.0
++    print("  [PASS] Non-positive / 0x0 dimensions: returns mode = 'empty' with zero bounds (division by zero avoided)")
++
++    # Case G: 32:9 extreme ultrawide video (5120x1440) in 16:9 viewport (1920x1080) -> Letterboxing
++    rw, rh, ox, oy, mode = calculate_video_viewport(1920.0, 1080.0, 5120.0, 1440.0)
++    assert mode == "letterbox"
++    assert rw == 1920.0 and rh == 540.0 and ox == 0.0 and oy == 270.0
++    assert abs((rw / rh) - (32.0 / 9.0)) < 1e-6
++    print(f"  [PASS] Letterboxing 32:9 extreme ultrawide: render = {rw:.1f}x{rh:.1f}, oy = {oy:.1f}px")
++
++    # Case H: 1:1 square video (1080x1080) in 16:9 viewport (1920x1080) -> Pillarboxing
++    rw, rh, ox, oy, mode = calculate_video_viewport(1920.0, 1080.0, 1080.0, 1080.0)
++    assert mode == "pillarbox"
++    assert rw == 1080.0 and rh == 1080.0 and ox == 420.0 and oy == 0.0
++    assert abs((rw / rh) - 1.0) < 1e-6
++    print(f"  [PASS] Pillarboxing 1:1 square video: render = {rw:.1f}x{rh:.1f}, ox = {ox:.1f}px")
++
++    # Case I: 9:16 mobile portrait video (1080x1920) in 16:9 viewport (1920x1080) -> Pillarboxing
++    rw, rh, ox, oy, mode = calculate_video_viewport(1920.0, 1080.0, 1080.0, 1920.0)
++    assert mode == "pillarbox"
++    assert rw == 607.5 and rh == 1080.0 and ox == 656.25 and oy == 0.0
++    assert abs((rw / rh) - (9.0 / 16.0)) < 1e-6
++    print(f"  [PASS] Pillarboxing 9:16 mobile portrait video: render = {rw:.1f}x{rh:.1f}, ox = {ox:.1f}px")
++
++    # Case J: 16:9 video in 9:16 portrait viewport (1080x1920) -> Letterboxing
++    rw, rh, ox, oy, mode = calculate_video_viewport(1080.0, 1920.0, 1920.0, 1080.0)
++    assert mode == "letterbox"
++    assert rw == 1080.0 and rh == 607.5 and ox == 0.0 and oy == 656.25
++    assert abs((rw / rh) - (16.0 / 9.0)) < 1e-6
++    print(f"  [PASS] Letterboxing 16:9 video in 9:16 portrait viewport: render = {rw:.1f}x{rh:.1f}, oy = {oy:.1f}px")
++
+     # 2. Scrubber Hover Tooltip Math & Timecode HUD formatting
+     duration_ms = 7200000 # 2 hours
+     track_start_x = 50.0

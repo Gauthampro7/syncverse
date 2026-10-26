@@ -1,0 +1,29 @@
+--- /home/gautham/syncplay-alt/.pi/agents/storage_auditor.md	2026-10-25 05:33:37.533306974 +0530
++++ /home/gautham/syncplay-alt/.agents/teamwork/explorer_m2_fix_1/proposed_storage_auditor.md	2026-10-25 05:49:16.980119356 +0530
+@@ -9,7 +9,7 @@
+ ## 2. Core Invariants & Prohibitions
+ 
+ 1. **Zero Database Libraries**:
+-   - The storage layer MUST NOT use SQLite, RocksDB, Sled, Heed, or any embedded KV/relational engine.
++   - The storage layer MUST NOT use `sqlite`, `sqlite3`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `rocksdb-sys`, `heed`, `tantivy`, `meilisearch`, `diesel`, or any embedded KV, relational, or ORM framework.
+    - All persistence is implemented via a custom append-only binary log (`syncplay_chat.bin`) using `std::fs::File`.
+ 2. **Zero External Search Engines**:
+    - Inverted indexing, tokenization, and query execution MUST be implemented from scratch in pure Rust using `std::collections::BTreeMap`.
+@@ -29,7 +29,7 @@
+   - `header_crc32`: IEEE 802.3 CRC32 over the preceding 12 bytes.
+ - **Record Wire Format**:
+   - `sync_word`: `[0xAA, 0x55]` (2 bytes).
+-  - `record_total_len`: `u32` (4 bytes, little-endian) = length of body + 4.
++  - `record_total_len`: `u32` (4 bytes, little-endian) = total record length in bytes (sync word 2B + length 4B + body + crc32 4B = length of body + 10, $\ge 48$).
+   - `body`:
+     - `record_type`: `u8` (1 byte).
+     - `flags`: `u8` (1 byte).
+@@ -48,7 +48,7 @@
+ 2. **Torn Write at EOF**: Detects incomplete trailing record at end-of-file, records 1 torn write, and safely truncates/ignores it without corrupting earlier records.
+ 3. **Bit-Flip / CRC Mismatch**: When a bit flip occurs in a record body, the scanner invalidates that record and advances forward byte-by-byte (`offset + 1`) until the next valid `0xAA55` frame with matching CRC is found.
+ 4. **False-Sync Word Resilience**:
+-   - If an application payload contains bytes `[0xAA, 0x55]` followed by an oversized length that exceeds remaining file length or fails CRC, the recovery scanner MUST treat it as a false candidate.
++   - If an application payload contains bytes `[0xAA, 0x55]` followed by an invalid length (`record_total_len < 48` or `current_offset + record_total_len > file_len`) or fails CRC, the recovery scanner MUST treat it as a false candidate.
+    - The scanner MUST advance by 1 byte and continue searching. It MUST NOT abort recovery or drop subsequent valid records!
+ 
+ ---

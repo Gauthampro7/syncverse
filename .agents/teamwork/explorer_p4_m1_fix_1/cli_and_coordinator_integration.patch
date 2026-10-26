@@ -1,0 +1,17 @@
+--- a/crates/syncplay-core/tests/cli_and_coordinator_integration.rs
++++ b/crates/syncplay-core/tests/cli_and_coordinator_integration.rs
+@@ -15,3 +15,3 @@
+ use syncplay_core::{
+-    PartyRole, PlayerCoordinator, SubsystemMetrics, TelemetryAggregator,
++    normalize_target_path, PartyRole, PlayerCoordinator, SubsystemMetrics, TelemetryAggregator,
+ };
+@@ -461,3 +461,3 @@
+     use std::fs;
+-    use syncplay_core::{normalize_target_path, InteractivePlayer};
++    use syncplay_core::InteractivePlayer;
+     use syncplay_demux::build_synthetic_full_mkv;
+@@ -527,3 +527,3 @@
+ #[test]
+ fn test_interactive_player_multibyte_utf8_title_handling() {
+-    use syncplay_core::{normalize_target_path, InteractivePlayer};
++    use syncplay_core::InteractivePlayer;

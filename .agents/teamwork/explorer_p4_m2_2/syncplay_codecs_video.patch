@@ -1,0 +1,41 @@
+diff --git a/crates/syncplay-codecs/Cargo.toml b/crates/syncplay-codecs/Cargo.toml
+--- a/crates/syncplay-codecs/Cargo.toml
++++ b/crates/syncplay-codecs/Cargo.toml
+@@ -9,2 +9,3 @@
+ syncplay-common = { path = "../syncplay-common" }
++ffmpeg-next = "9.0.0"
+ thiserror.workspace = true
+diff --git a/crates/syncplay-codecs/src/error.rs b/crates/syncplay-codecs/src/error.rs
+--- a/crates/syncplay-codecs/src/error.rs
++++ b/crates/syncplay-codecs/src/error.rs
+@@ -49,2 +49,10 @@
+     InvalidSlice(String),
++
++    /// Decoder initialization or operational error from FFmpeg backend.
++    #[error("decoder error: {0}")]
++    Decoder(String),
++
++    /// Unsupported video codec format or configuration.
++    #[error("unsupported video codec: {0}")]
++    UnsupportedCodec(String),
+ 
+     /// Underlying bitstream or common reader error.
+     #[error("common error: {0}")]
+     Common(#[from] syncplay_common::error::CommonError),
+ }
++
++impl From<ffmpeg_next::Error> for CodecError {
++    fn from(err: ffmpeg_next::Error) -> Self {
++        CodecError::Decoder(err.to_string())
++    }
++}
+diff --git a/crates/syncplay-codecs/src/lib.rs b/crates/syncplay-codecs/src/lib.rs
+--- a/crates/syncplay-codecs/src/lib.rs
++++ b/crates/syncplay-codecs/src/lib.rs
+@@ -10,2 +10,3 @@
+ pub mod h264;
++pub mod universal_video;
+ 
+@@ -26,2 +27,3 @@
+ };
++pub use universal_video::UniversalVideoDecoder;

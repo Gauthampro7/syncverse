@@ -1,0 +1,140 @@
+--- a/crates/syncplay-demux/src/ebml.rs
++++ b/crates/syncplay-demux/src/ebml.rs
+@@ -21,11 +21,14 @@ pub fn compute_simpleblock_pts(
+     let total_ticks = cluster_timecode_ticks
+         .checked_add(block_timecode_ticks as i64)
+         .ok_or(DemuxError::IntegerOverflow)?;
+ 
++    let scale = i64::try_from(timestamp_scale_ns)
++        .map_err(|_| DemuxError::IntegerOverflow)?;
++
+     let pts_ns = total_ticks
+-        .checked_mul(timestamp_scale_ns as i64)
++        .checked_mul(scale)
+         .ok_or(DemuxError::IntegerOverflow)?;
+ 
+     let pts_ms = pts_ns.div_euclid(1_000_000);
+     Ok((pts_ns, pts_ms))
+ }
+@@ -273,16 +276,18 @@ impl Demuxer for EbmlDemuxer {
+                     let flags = block_data[track_len + 2];
+                     let is_keyframe = (flags & 0x80) != 0;
+                     let payload = block_data[track_len + 3..].to_vec();
+ 
++                    let cluster_ticks = i64::try_from(self.current_cluster_timecode)
++                        .map_err(|_| DemuxError::IntegerOverflow)?;
+                     let (_, pts_ms) = compute_simpleblock_pts(
+-                        self.current_cluster_timecode as i64,
++                        cluster_ticks,
+                         rel_timecode,
+                         self.timestamp_scale_ns,
+                     )?;
+ 
+                     return Ok(Some(DemuxPacket {
+                         track_id,
+-                        pts_ms: pts_ms as u64,
++                        pts_ms: pts_ms.max(0) as u64,
+                         dts_ms: None,
+                         is_keyframe,
+                         data: payload,
+@@ -290,8 +295,10 @@ impl Demuxer for EbmlDemuxer {
+                 }
+                 _ => {
+                     // Skip unrecognized element
++                    let seek_offset = i64::try_from(data_size)
++                        .map_err(|_| DemuxError::IntegerOverflow)?;
+                     reader
+-                        .seek(SeekFrom::Current(data_size as i64))
++                        .seek(SeekFrom::Current(seek_offset))
+                         .map_err(|e| DemuxError::Io(e.to_string()))?;
+                 }
+             }
+@@ -345,4 +352,65 @@ mod tests {
+         assert_eq!(pts_ms_24h, ms_24h);
+         assert_eq!(pts_ns_24h, 86_400_000_000_000);
+     }
++
++    #[test]
++    fn test_compute_simpleblock_pts_boundary_and_overflow_rejection() {
++        // 1. Valid baseline computations
++        let (pts_ns, pts_ms) = compute_simpleblock_pts(1000, 0, 1_000_000).unwrap();
++        assert_eq!(pts_ns, 1_000_000_000);
++        assert_eq!(pts_ms, 1000);
++
++        // 2. Reject u64::MAX timescale (defect reproduction)
++        assert_eq!(
++            compute_simpleblock_pts(1000, 0, u64::MAX),
++            Err(DemuxError::IntegerOverflow)
++        );
++        assert_eq!(
++            compute_simpleblock_pts(0, 0, u64::MAX),
++            Err(DemuxError::IntegerOverflow)
++        );
++
++        // 3. Reject timescale strictly exceeding i64::MAX
++        let overflow_scale = (i64::MAX as u64) + 1;
++        assert_eq!(
++            compute_simpleblock_pts(1, 0, overflow_scale),
++            Err(DemuxError::IntegerOverflow)
++        );
++
++        // 4. Accept boundary timescale == i64::MAX with tick 1, reject with tick >= 2
++        let max_scale = i64::MAX as u64;
++        let (max_ns, max_ms) = compute_simpleblock_pts(1, 0, max_scale).unwrap();
++        assert_eq!(max_ns, i64::MAX);
++        assert_eq!(max_ms, i64::MAX / 1_000_000);
++
++        assert_eq!(
++            compute_simpleblock_pts(2, 0, max_scale),
++            Err(DemuxError::IntegerOverflow)
++        );
++
++        // 5. Total ticks addition overflow
++        assert_eq!(
++            compute_simpleblock_pts(i64::MAX, 1, 1_000_000),
++            Err(DemuxError::IntegerOverflow)
++        );
++        assert_eq!(
++            compute_simpleblock_pts(i64::MIN, -1, 1_000_000),
++            Err(DemuxError::IntegerOverflow)
++        );
++
++        // 6. Multiplication overflow with standard timescale (1_000_000 ns = 1 ms)
++        let max_safe_ticks = i64::MAX / 1_000_000;
++        let (pts_ns_safe, pts_ms_safe) = compute_simpleblock_pts(max_safe_ticks, 0, 1_000_000).unwrap();
++        assert_eq!(pts_ns_safe, max_safe_ticks * 1_000_000);
++        assert_eq!(pts_ms_safe, max_safe_ticks);
++
++        assert_eq!(
++            compute_simpleblock_pts(max_safe_ticks + 1, 0, 1_000_000),
++            Err(DemuxError::IntegerOverflow)
++        );
++
++        // 7. Negative multiplication underflow
++        assert_eq!(
++            compute_simpleblock_pts(-(max_safe_ticks + 1), 0, 1_000_000),
++            Err(DemuxError::IntegerOverflow)
++        );
++    }
+ }
+--- a/crates/syncplay-core/tests/adversarial_crates_1_to_4.rs
++++ b/crates/syncplay-core/tests/adversarial_crates_1_to_4.rs
+@@ -569,10 +569,13 @@ fn test_common_and_demux_primitives_adversarial() {
+     // 2. Multiplication overflow: (i64::MAX / 2) * 3
+     assert!(compute_simpleblock_pts(i64::MAX / 2, 0, 3).is_err());
+ 
+-    // 3. DEFECT DEMONSTRATION: Lossy u64 -> i64 cast when timestamp_scale_ns > i64::MAX as u64
+-    // u64::MAX is cast via `as i64` to -1, which bypasses checked_mul and inverts the sign of PTS!
+-    let (pts_ns_flawed, pts_ms_flawed) = compute_simpleblock_pts(1000, 0, u64::MAX).unwrap();
+-    assert_eq!(pts_ns_flawed, -1000);
+-    assert_eq!(pts_ms_flawed, -1);
++    // 3. Extreme timescale overflow detection:
++    // u64::MAX and timescales > i64::MAX MUST strictly return Err(DemuxError::IntegerOverflow)
++    assert_eq!(
++        compute_simpleblock_pts(1000, 0, u64::MAX),
++        Err(DemuxError::IntegerOverflow)
++    );
++    assert_eq!(
++        compute_simpleblock_pts(i64::MAX / 2, 0, u64::MAX),
++        Err(DemuxError::IntegerOverflow)
++    );

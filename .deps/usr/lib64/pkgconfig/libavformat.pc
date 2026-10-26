@@ -1,0 +1,14 @@
+prefix=/home/gautham/syncplay-alt/.deps/usr
+exec_prefix=${prefix}
+libdir=/usr/lib64
+includedir=/home/gautham/syncplay-alt/.deps/usr/include/ffmpeg
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 62.12.103
+Requires: 
+Requires.private: libavcodec >= 62.28.103, libswresample >= 6.3.103, libavutil >= 60.26.103
+Conflicts:
+Libs: -L${libdir}  -lavformat 
+Libs.private: -lm -latomic -lxml2 -lbz2 -lgme -lmodplug -lopenmpt -lstdc++ -lchromaprint -lbluray -lgcrypt -lgpg-error -lz -lgnutls -lsrt -lssh -lsmbclient -lzmq
+Cflags: -I${includedir}

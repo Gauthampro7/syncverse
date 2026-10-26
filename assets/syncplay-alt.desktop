@@ -1,0 +1,25 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Syncplay-Alt
+GenericName=Synchronized Media Player
+Comment=Zero-dependency standalone synchronized watch-party media player
+Exec=syncplay-alt %U
+Icon=syncplay-alt
+Terminal=false
+Categories=AudioVideo;Player;Video;
+MimeType=video/x-matroska;video/mp4;video/webm;video/quicktime;
+Keywords=video;movie;player;sync;watchparty;terminal;
+Actions=HostParty;ConnectParty;Inspect;
+
+[Desktop Action HostParty]
+Name=Host Watch Party Room
+Exec=syncplay-alt party host
+
+[Desktop Action ConnectParty]
+Name=Connect to Watch Party
+Exec=syncplay-alt party connect 127.0.0.1:18242
+
+[Desktop Action Inspect]
+Name=Inspect Media Container
+Exec=syncplay-alt inspect %U

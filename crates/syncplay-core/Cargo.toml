@@ -1,0 +1,22 @@
+[package]
+name = "syncplay-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+syncplay-common = { path = "../syncplay-common" }
+syncplay-demux = { path = "../syncplay-demux" }
+syncplay-codecs = { path = "../syncplay-codecs" }
+syncplay-clock = { path = "../syncplay-clock" }
+syncplay-sync = { path = "../syncplay-sync" }
+syncplay-chat = { path = "../syncplay-chat" }
+syncplay-ui = { path = "../syncplay-ui" }
+thiserror.workspace = true
+ffmpeg-next.workspace = true
+
+
+[[bin]]
+name = "syncplay-alt"
+path = "src/main.rs"
