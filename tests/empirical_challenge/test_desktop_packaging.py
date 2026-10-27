@@ -2,11 +2,11 @@
 """
 Empirical Challenge: Desktop Application Packaging & XDG Compliance (Milestone 4 / R1)
 Verifies:
-1. assets/syncplay-alt.desktop strictly adheres to XDG Desktop Entry Spec v1.5.
+1. assets/syncverse.desktop strictly adheres to XDG Desktop Entry Spec v1.5.
 2. desktop-file-validate executes cleanly with exit code 0 on both repo and installed files.
 3. Required keys (Type, Name, GenericName, Comment, Exec, Icon, Terminal, Categories, MimeType, Keywords) are present.
-4. assets/syncplay-alt.svg is a valid standalone XML vector asset.
-5. ~/.local/bin/syncplay-alt is executable.
+4. assets/syncverse.svg is a valid standalone XML vector asset.
+5. ~/.local/bin/syncverse is executable.
 6. GTK4 icon discovery succeeds if python3-gobject is available.
 """
 import os
@@ -17,11 +17,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DESKTOP_PATH = ROOT / "assets" / "syncplay-alt.desktop"
-SVG_PATH = ROOT / "assets" / "syncplay-alt.svg"
-USER_DESKTOP_PATH = Path.home() / ".local" / "share" / "applications" / "syncplay-alt.desktop"
-USER_ICON_PATH = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps" / "syncplay-alt.svg"
-USER_BIN_PATH = Path.home() / ".local" / "bin" / "syncplay-alt"
+DESKTOP_PATH = ROOT / "assets" / "syncverse.desktop"
+SVG_PATH = ROOT / "assets" / "syncverse.svg"
+USER_DESKTOP_PATH = Path.home() / ".local" / "share" / "applications" / "syncverse.desktop"
+USER_ICON_PATH = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps" / "syncverse.svg"
+USER_BIN_PATH = Path.home() / ".local" / "bin" / "syncverse"
 
 def test_svg():
     print("--> [1/4] Verifying SVG vector icon asset...")
@@ -40,16 +40,16 @@ def test_desktop_file():
 
     required_pairs = [
         ("Type", "Application"),
-        ("Name", "Syncplay-Alt"),
+        ("Name", "Syncverse"),
         ("GenericName", "Synchronized Media Player"),
         ("Comment", "Zero-dependency standalone synchronized watch-party media player"),
-        ("Icon", "syncplay-alt"),
-        ("Terminal", "true"),
+        ("Icon", "syncverse"),
+        ("Terminal", "false"),
     ]
     for key, expected in required_pairs:
         assert f"{key}={expected}" in content, f"Missing or invalid {key}={expected}"
 
-    assert "Exec=syncplay-alt play %U" in content, "Exec line must be syncplay-alt play %U"
+    assert "Exec=syncverse %U" in content, "Exec line must be syncverse %U"
     assert "Categories=" in content and "AudioVideo;" in content and "Video;" in content
     assert "MimeType=" in content and "video/x-matroska;" in content and "video/mp4;" in content
     assert "Keywords=" in content and "watchparty;" in content
@@ -59,7 +59,7 @@ def test_desktop_file():
     if shutil.which("desktop-file-validate"):
         res = subprocess.run(["desktop-file-validate", str(DESKTOP_PATH)], capture_output=True, text=True)
         assert res.returncode == 0, f"desktop-file-validate failed: {res.stdout} {res.stderr}"
-        print("  [PASS] desktop-file-validate on assets/syncplay-alt.desktop verified with 0 errors.")
+        print("  [PASS] desktop-file-validate on assets/syncverse.desktop verified with 0 errors.")
     else:
         print("  [WARN] desktop-file-validate not in PATH; skipping external CLI check.")
 
@@ -77,7 +77,7 @@ def test_installed_environment():
         assert os.access(USER_BIN_PATH, os.X_OK), "Installed binary must be executable"
         res = subprocess.run([str(USER_BIN_PATH), "--help"], capture_output=True, text=True)
         assert res.returncode == 0, f"Binary --help failed with code {res.returncode}"
-        assert "syncplay-alt" in res.stdout.lower()
+        assert "syncverse" in res.stdout.lower()
         print("  [PASS] User binary is executable and responds to --help.")
 
 def test_gtk_icon_theme():
@@ -87,32 +87,32 @@ def test_gtk_icon_theme():
         gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk
         theme = Gtk.IconTheme.new()
-        if theme.has_icon("syncplay-alt"):
-            print("  [PASS] GTK4 IconTheme successfully discovered syncplay-alt icon!")
+        if theme.has_icon("syncverse"):
+            print("  [PASS] GTK4 IconTheme successfully discovered syncverse icon!")
         else:
-            print("  [INFO] GTK4 IconTheme did not find syncplay-alt icon (cache update pending or headless).")
+            print("  [INFO] GTK4 IconTheme did not find syncverse icon (cache update pending or headless).")
     except Exception as e:
         print(f"  [INFO] GTK4 python binding check skipped: {e}")
 
-def get_syncplay_bin():
+def get_syncverse_bin():
     if USER_BIN_PATH.exists() and os.access(USER_BIN_PATH, os.X_OK):
         return USER_BIN_PATH
-    release_bin = ROOT / "target" / "release" / "syncplay-alt"
+    release_bin = ROOT / "target" / "release" / "syncverse"
     if release_bin.exists() and os.access(release_bin, os.X_OK):
         return release_bin
-    debug_bin = ROOT / "target" / "debug" / "syncplay-alt"
+    debug_bin = ROOT / "target" / "debug" / "syncverse"
     if debug_bin.exists() and os.access(debug_bin, os.X_OK):
         return debug_bin
     return None
 
 def test_uri_argument_handling():
     print("--> [5/5] Verifying file:// URI target handling and percent-decoding...")
-    bin_path = get_syncplay_bin()
+    bin_path = get_syncverse_bin()
     if bin_path:
         cmd_prefix = [str(bin_path)]
     else:
         cargo_bin = os.path.expanduser("~/.cargo/bin/cargo")
-        cmd_prefix = [cargo_bin if os.path.exists(cargo_bin) else "cargo", "run", "-q", "-p", "syncplay-core", "--"]
+        cmd_prefix = [cargo_bin if os.path.exists(cargo_bin) else "cargo", "run", "-q", "-p", "syncverse-core", "--"]
 
     SYNTHETIC_EBML_VECTOR = bytes([
         0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01, 0x42, 0xF7, 0x81, 0x01,

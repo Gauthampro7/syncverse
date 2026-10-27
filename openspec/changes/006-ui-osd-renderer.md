@@ -18,7 +18,7 @@ To achieve "VLC-grade responsiveness" (< 16ms input latency) and avoid UI hitchi
 ```
 [003-clock-pipeline] ────────┐
                              │
-[004-network-sync-protocol] ─┼─► [006-ui-osd-renderer] (syncplay-ui, syncplay-core)
+[004-network-sync-protocol] ─┼─► [006-ui-osd-renderer] (syncverse-ui, syncverse-core)
                              │
 [005-smart-chat-storage] ────┘
 ```
@@ -30,14 +30,14 @@ To achieve "VLC-grade responsiveness" (< 16ms input latency) and avoid UI hitchi
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-ui`**:
+- **`crates/syncverse-ui`**:
   - `src/snapshot/model.rs`: `PlayerUiSnapshot` struct and SPSC triple-buffer atomic publisher constrained to a single Telemetry Aggregator.
   - `src/command/queue.rs`: Lock-free SPSC `UICommandQueue` for user actions.
   - `src/osd/hud.rs`: Transport state glyphs, monospace timecode HUD.
   - `src/osd/sync_badge.rs`: Real-time sync health badge with green/amber/red status dot.
   - `src/osd/chat_overlay.rs`: Floating semi-transparent chat bubbles with exponential decay.
   - `src/osd/scrub_bar.rs`: Interactive timeline slider with 10 Hz debounced seek dispatching (5 intermediate + 1 release = 6 commands).
-- **`crates/syncplay-core`**:
+- **`crates/syncverse-core`**:
   - `src/coordinator.rs`: Runtime loop integrating demuxer, decoder, clock, sync, chat, and UI with central Telemetry Aggregator.
 
 ---
@@ -70,13 +70,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crates
-cargo check -p syncplay-ui -p syncplay-core
+cargo check -p syncverse-ui -p syncverse-core
 
 # 2. Run unit tests verifying snapshot atomicity and scrub-bar debouncing
-cargo test -p syncplay-ui -- --nocapture
+cargo test -p syncverse-ui -- --nocapture
 
 # 3. Verify zero banned GUI toolkits or external media dependencies
-cargo tree -p syncplay-ui --edges no-dev
+cargo tree -p syncverse-ui --edges no-dev
 ```
 
 Expected output: Snapshot tests verify concurrent reading and writing without data races or lock contention; debouncer unit tests verify rate-limiting to $10\text{ Hz}$.

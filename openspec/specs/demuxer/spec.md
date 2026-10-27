@@ -1,6 +1,6 @@
-# Capability Specification: Container Demuxing (`syncplay-demux`)
+# Capability Specification: Container Demuxing (`syncverse-demux`)
 
-**Component**: `syncplay-demux`  
+**Component**: `syncverse-demux`  
 **Standard Compliance**: RFC 8794 (EBML), Matroska Specification, ISO/IEC 14496-12 (ISOBMFF)  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,7 +8,7 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-demux` crate provides zero-dependency stream demuxing for Matroska (MKV/WebM) and ISO Base Media File Format (ISOBMFF / MP4) containers. In compliance with the project's zero-external-codec invariant, demuxing is implemented directly from raw byte streams without linking against `libavformat`, `gstreamer`, `nom-ebml`, or any external C/C++ or Rust parsing libraries.
+The `syncverse-demux` crate provides zero-dependency stream demuxing for Matroska (MKV/WebM) and ISO Base Media File Format (ISOBMFF / MP4) containers. In compliance with the project's zero-external-codec invariant, demuxing is implemented directly from raw byte streams without linking against `libavformat`, `gstreamer`, `nom-ebml`, or any external C/C++ or Rust parsing libraries.
 
 The demuxer extracts compressed audio and video packets (`DemuxPacket`), parses container timing metadata (timescales, frame presentation timestamps, keyframe flags), and maps random-access seek tables (`Cues` in MKV, `stbl` in MP4) to enable deterministic seeking and pre-roll decoding.
 

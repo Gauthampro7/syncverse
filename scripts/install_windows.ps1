@@ -1,8 +1,8 @@
-# Syncplay-Alt Windows Installer (PowerShell)
+# Syncverse Windows Installer (PowerShell)
 # Pure-Rust, zero-external-dependencies
 
 Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host " Syncplay-Alt Windows Installer" -ForegroundColor Cyan
+Write-Host " Syncverse Windows Installer" -ForegroundColor Cyan
 Write-Host "==================================================" -ForegroundColor Cyan
 
 # 1. Build release binary
@@ -14,14 +14,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 2. Determine target install directory
-$InstallDir = "$env:LOCALAPPDATA\Programs\Syncplay-Alt"
+$InstallDir = "$env:LOCALAPPDATA\Programs\Syncverse"
 if (!(Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 
 # 3. Copy executable
-Write-Host "[2/3] Installing binary to $InstallDir\syncplay-alt.exe..." -ForegroundColor Yellow
-Copy-Item "target\release\syncplay-alt.exe" "$InstallDir\syncplay-alt.exe" -Force
+Write-Host "[2/3] Installing binary to $InstallDir\syncverse.exe..." -ForegroundColor Yellow
+Copy-Item "target\release\syncverse.exe" "$InstallDir\syncverse.exe" -Force
 
 # 4. Check or Add to User PATH
 Write-Host "[3/3] Checking User PATH environment variable..." -ForegroundColor Yellow
@@ -33,17 +33,17 @@ if ($UserPath -notlike "*$InstallDir*") {
 
 # 5. Create Desktop Shortcut
 $WshShell = New-Object -ComObject WScript.Shell
-$ShortcutPath = [System.IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Syncplay-Alt.lnk")
+$ShortcutPath = [System.IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Syncverse.lnk")
 $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = "$InstallDir\syncplay-alt.exe"
+$Shortcut.TargetPath = "$InstallDir\syncverse.exe"
 $Shortcut.Arguments = "play synthetic-mkv"
-$Shortcut.Description = "Syncplay-Alt Standalone Media Player & Watch Party"
+$Shortcut.Description = "Syncverse Standalone Media Player & Watch Party"
 $Shortcut.WorkingDirectory = $InstallDir
 $Shortcut.Save()
 
 Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host " [SUCCESS] Syncplay-Alt successfully installed on Windows!" -ForegroundColor Green
-Write-Host " Binary:    $InstallDir\syncplay-alt.exe"
+Write-Host " [SUCCESS] Syncverse successfully installed on Windows!" -ForegroundColor Green
+Write-Host " Binary:    $InstallDir\syncverse.exe"
 Write-Host " Shortcut:  $ShortcutPath"
-Write-Host " Launch:    syncplay-alt play synthetic-mkv (in Windows Terminal)"
+Write-Host " Launch:    syncverse play synthetic-mkv (in Windows Terminal)"
 Write-Host "==================================================" -ForegroundColor Cyan

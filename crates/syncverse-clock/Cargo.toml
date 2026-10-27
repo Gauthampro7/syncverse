@@ -1,0 +1,10 @@
+[package]
+name = "syncverse-clock"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+syncverse-codecs = { path = "../syncverse-codecs" }
+thiserror.workspace = true

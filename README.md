@@ -1,4 +1,4 @@
-# Syncplay-Alt
+# Syncverse
 
 > **Ultra-Efficient Standalone Desktop Media Player & Long-Distance Synchronized Watch-Party Platform**  
 > *Written in pure, idiomatic Rust • Hardware-accelerated desktop GUI (`eframe`/`egui`/`wgpu`) • Universal container & codec compatibility • Mathematical WAN clock synchronization*
@@ -7,7 +7,7 @@
 
 ## 🌟 Highlights
 
-Syncplay-Alt is a standalone desktop media player and synchronized watch-party platform built from the ground up to eliminate the clunkiness, IPC wrappers, and jitter of traditional solutions.
+Syncverse is a standalone desktop media player and synchronized watch-party platform built from the ground up to eliminate the clunkiness, IPC wrappers, and jitter of traditional solutions.
 
 - **Desktop Graphical Player UI**: A modern, hardware-accelerated desktop window natively supporting **Linux (Wayland & X11)** and **Windows**. Features a GPU video viewport with aspect ratio preservation (letterboxing / pillarboxing), dark theme, and fluid vsync frame pacing.
 - **VLC-Grade Format Compatibility**: Universal container demuxing (**MKV, MP4, WebM, AVI, MOV, MPEG-TS, FLV, OGG**) and video/audio bitstream decoding (**H.264, H.265 / HEVC 10-bit, VP8, VP9, AV1, MPEG-2/4, VC-1**; **AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS / DTS-HD MA, PCM**).
@@ -21,19 +21,19 @@ Syncplay-Alt is a standalone desktop media player and synchronized watch-party p
 ## 🚀 Quick Start
 
 ### 1. Launching from the Desktop (GNOME / Fedora)
-Press <kbd>Super</kbd> (Windows key), type **Syncplay-Alt**, and press <kbd>Enter</kbd>.
+Press <kbd>Super</kbd> (Windows key), type **Syncverse**, and press <kbd>Enter</kbd>.
 
 ### 2. Launching from the Terminal
 ```bash
 # Open the graphical desktop player (with file picker & drag-and-drop):
-syncplay-alt
+syncverse
 
 # Open the graphical player directly with a video file:
-syncplay-alt play ~/Videos/movie.mkv
+syncverse play ~/Videos/movie.mkv
 # Supports .mkv, .mp4, .webm, .avi, .mov, .ts, etc.
 
 # Open in terminal presentation mode (TUI):
-syncplay-alt play ~/Videos/movie.mkv --terminal
+syncverse play ~/Videos/movie.mkv --terminal
 ```
 
 ---
@@ -57,7 +57,7 @@ syncplay-alt play ~/Videos/movie.mkv --terminal
 
 ## 👥 Long-Distance Watch Parties
 
-Syncplay-Alt enables low-latency, stutter-free watch parties over international distances without external database daemons or player scripting bridges.
+Syncverse enables low-latency, stutter-free watch parties over international distances without external database daemons or player scripting bridges.
 
 ### 1. From the Desktop Graphical UI (Recommended)
 - **Host Room**: Click `Watch Party -> Host Watch Party Room...` (or click `🌐 Host Room` at the top of the sidebar). It automatically displays your detected local LAN and loopback IP addresses (`192.168.x.x:18242`) with a single-click `📋 Copy` button to share with peers.
@@ -67,10 +67,10 @@ Syncplay-Alt enables low-latency, stutter-free watch parties over international 
 ### 2. From the Terminal
 ```bash
 # Host a Watch-Party Room
-syncplay-alt party host --port 18242 --file /path/to/movie.mkv
+syncverse party host --port 18242 --file /path/to/movie.mkv
 
 # Connect to a Watch-Party Room
-syncplay-alt party connect 192.168.1.14:18242 --file /path/to/movie.mkv
+syncverse party connect 192.168.1.14:18242 --file /path/to/movie.mkv
 ```
 - The client exchanges NTP probes, filters transit jitter, and locks its playback clock to the reference timeline using the discrete PI PLL micro-speed controller.
 
@@ -111,16 +111,16 @@ Type these commands into the chat bar during playback:
 
 ```bash
 # Inspect container headers, timescale, and audio/video tracks:
-syncplay-alt inspect /path/to/media.mkv
+syncverse inspect /path/to/media.mkv
 
 # Run 5-tick non-interactive playback simulation:
-syncplay-alt play /path/to/media.mkv --ticks 5
+syncverse play /path/to/media.mkv --ticks 5
 
 # Search local binary chat log via inverted index:
-syncplay-alt chat query "awesome solo"
+syncverse chat query "awesome solo"
 
 # Verify all architectural invariants and Intent Contracts:
-syncplay-alt verify
+syncverse verify
 ```
 
 ---
@@ -129,21 +129,21 @@ syncplay-alt verify
 
 ```
 crates/
-├── syncplay-common/     # MediaTime, WallTime, CRC32, zero-copy ByteReader / BitReader
-├── syncplay-demux/      # Universal container demuxer (MKV, MP4, AVI, TS, FLV, OGG)
-├── syncplay-codecs/     # Universal video/audio decoders, planar YUV420p, RGBA, PCM
-├── syncplay-clock/      # Master monotonic clock, rate re-anchoring, 128B SPSC ring buffers
-├── syncplay-sync/       # RFC 5905 NTP filter, discrete PI PLL micro-speed controller
-├── syncplay-chat/       # syncplay_chat.bin log, false-sync recovery, inverted index FTS
-├── syncplay-ui/         # eframe/egui desktop player window, GPU video viewport, sidebar
-└── syncplay-core/       # Application coordinator, background playback runtime, audio sink
+├── syncverse-common/     # MediaTime, WallTime, CRC32, zero-copy ByteReader / BitReader
+├── syncverse-demux/      # Universal container demuxer (MKV, MP4, AVI, TS, FLV, OGG)
+├── syncverse-codecs/     # Universal video/audio decoders, planar YUV420p, RGBA, PCM
+├── syncverse-clock/      # Master monotonic clock, rate re-anchoring, 128B SPSC ring buffers
+├── syncverse-sync/       # RFC 5905 NTP filter, discrete PI PLL micro-speed controller
+├── syncverse-chat/       # syncplay_chat.bin log, false-sync recovery, inverted index FTS
+├── syncverse-ui/         # eframe/egui desktop player window, GPU video viewport, sidebar
+└── syncverse-core/       # Application coordinator, background playback runtime, audio sink
 ```
 
 ---
 
 ## 📜 Invariant Guarantees & Verification
 
-Syncplay-Alt enforces strict engineering standards:
+Syncverse enforces strict engineering standards:
 1. **Zero Warnings Policy**: All crates compile with `#![deny(warnings)]` and `#![deny(missing_docs)]`.
 2. **Zero Monolithic Player Wrappers**: Strictly independent of external player processes (`mpv`, `vlc`).
 3. **Zero External Database Daemons**: Chat persistence and search are implemented entirely in-tree via `syncplay_chat.bin` and inverted indexing.
@@ -156,3 +156,10 @@ cargo test --workspace                # Full unit & integration test suite
 python3 scripts/intent_harness.py     # 100% Intent Compliance Harness
 ./scripts/verify_phase4.sh            # Complete 8-stage automated verification
 ```
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE) — see the LICENSE file for details.  
+Copyright (c) 2026 Gautham.

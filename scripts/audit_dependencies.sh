@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Syncplay-Alt Phase 4 Dependency & Architectural Invariant Audit Script
+# Syncverse Phase 4 Dependency & Architectural Invariant Audit Script
 # Authority: AGENTS.md Section 2 (Phase 4 Realignment) & ORIGINAL_REQUEST.md
 #
 # Enforces Architectural Invariants:
 # 1. Zero Monolithic Player Wrappers: External player processes and IPC scripting
-#    wrappers (mpv, vlc, gstreamer) are strictly prohibited. Syncplay-Alt is a
+#    wrappers (mpv, vlc, gstreamer) are strictly prohibited. Syncverse is a
 #    true standalone player with in-process demuxing, decoding, and presentation.
 # 2. Zero External Database Engines: Relational and document databases (sqlite,
 #    diesel, sqlx, sled, rocksdb, heed, tantivy, meilisearch) are strictly prohibited.

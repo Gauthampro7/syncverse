@@ -4,7 +4,7 @@
 - **Workflow ID**: `006-ui-workflow`
 - **Target Change Proposal**: `openspec/changes/006-ui-osd-renderer.md`
 - **Capability Specification**: `openspec/specs/ui-renderer/spec.md`
-- **Target Crates**: `syncplay-ui`, `syncplay-core`
+- **Target Crates**: `syncverse-ui`, `syncverse-core`
 - **Primary Agents**: `spec_implementer`
 - **Required Skills**: `openspec-change-mapping`, `zero-dependency-audit`
 
@@ -21,18 +21,18 @@
 
 ## 3. Step-by-Step Execution Plan
 
-### Step 1: Triple-Buffered Atomic Snapshot Exchange (`syncplay-ui/src/snapshot/`)
+### Step 1: Triple-Buffered Atomic Snapshot Exchange (`syncverse-ui/src/snapshot/`)
 1. Implement `PlayerUiSnapshot` (`model.rs`):
    - Encapsulate monotonic timestamp, PTS position, duration, playback state, RTT, clock offset, phase error, PLL speed ratio (Q16), peer counts, and room sequence.
    - Constrain memory footprint to 72 bytes (fitting within a single 128-byte cache line pair).
 2. Enforce SPSC publication topology:
-   - A single centralized `TelemetryAggregator` in `syncplay-core` collects metrics from decode, clock, and sync loops and publishes snapshots to the triple buffer.
+   - A single centralized `TelemetryAggregator` in `syncverse-core` collects metrics from decode, clock, and sync loops and publishes snapshots to the triple buffer.
    - The UI rendering thread reads via atomic pointer swap with zero locking and zero partial/torn reads.
 
-### Step 2: Lock-Free UI Command Queue (`syncplay-ui/src/command/`)
+### Step 2: Lock-Free UI Command Queue (`syncverse-ui/src/command/`)
 Implement lock-free SPSC queue (`queue.rs`) passing user actions (`TogglePause`, `SeekRelative`, `SendChatMessage`) from UI thread to the core coordinator.
 
-### Step 3: OSD Overlay Architecture (`syncplay-ui/src/osd/`)
+### Step 3: OSD Overlay Architecture (`syncverse-ui/src/osd/`)
 1. Implement Monospace Timecode HUD (`hud.rs`).
 2. Implement Sync Health Badge (`sync_badge.rs`):
    - Green ($|e| < 15\text{ ms}$): In-sync deadband.
@@ -50,7 +50,7 @@ Implement lock-free SPSC queue (`queue.rs`) passing user actions (`TogglePause`,
    - $2048 \times 2048 \times 1\text{ byte} = 4.0\text{ MB}$ texture footprint (saving 12 MB compared to RGBA8).
 2. Verify total UI memory consumption (Atlas 4MB + Framebuffer 8.5MB + State 1MB) strictly conforms to $\le 15.0\text{ MB}$.
 
-### Step 5: Core Application Coordinator (`syncplay-core/src/coordinator.rs`)
+### Step 5: Core Application Coordinator (`syncverse-core/src/coordinator.rs`)
 Implement the top-level application coordinator binding all subsystem threads and driving the Telemetry Aggregator.
 
 ---
@@ -59,15 +59,15 @@ Implement the top-level application coordinator binding all subsystem threads an
 Execute the automated test suite:
 ```bash
 # Crate unit test verification
-cargo test -p syncplay-ui -- --nocapture
-cargo test -p syncplay-core -- --nocapture
+cargo test -p syncverse-ui -- --nocapture
+cargo test -p syncverse-core -- --nocapture
 
 # Adversarial UI renderer empirical test
 python3 tests/empirical_challenge/test_ui_renderer.py
 
 # Lint inspection
-cargo clippy -p syncplay-ui --all-targets -- -D warnings
-cargo clippy -p syncplay-core --all-targets -- -D warnings
+cargo clippy -p syncverse-ui --all-targets -- -D warnings
+cargo clippy -p syncverse-core --all-targets -- -D warnings
 ```
 Criteria for success:
 - 100% test pass rate with 0 errors.

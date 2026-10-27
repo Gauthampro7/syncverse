@@ -4,7 +4,7 @@
 - **Workflow ID**: `002-codecs-workflow`
 - **Target Change Proposal**: `openspec/changes/002-codecs-presentation.md`
 - **Capability Specification**: `openspec/specs/codecs/spec.md`
-- **Target Crates**: `syncplay-codecs`
+- **Target Crates**: `syncverse-codecs`
 - **Primary Agents**: `spec_implementer`
 - **Required Skills**: `openspec-change-mapping`, `zero-dependency-audit`
 
@@ -14,14 +14,14 @@
 - **Upstream Dependencies**: `001-demuxer-workflow` (Needs `MediaTime` and packet primitives).
 - **Blocks**: `003-clock-workflow`.
 - **Pre-flight Checks**:
-  1. Confirm `syncplay-common` and `syncplay-demux` tests pass cleanly.
+  1. Confirm `syncverse-common` and `syncverse-demux` tests pass cleanly.
   2. Confirm zero external codec dependencies (`libswscale`, `dav1d`, etc.).
 
 ---
 
 ## 3. Step-by-Step Execution Plan
 
-### Step 1: Memory-Aligned Frame Data Models (`syncplay-codecs/src/frame/`)
+### Step 1: Memory-Aligned Frame Data Models (`syncverse-codecs/src/frame/`)
 1. Implement `VideoFrameYUV420p` (`video.rs`):
    - Separate 64-byte aligned luminance ($Y$) and chroma ($U, V$) planes.
    - Enforce 16-byte row stride alignment: `stride = (width + 15) & !15`.
@@ -31,7 +31,7 @@
 3. Implement `AudioFramePCM` (`audio.rs`):
    - Interleaved 32-bit floating-point audio samples normalized in range $[-1.0, 1.0]$.
 
-### Step 2: Q8 Fixed-Point Color Space Conversion (`syncplay-codecs/src/color/`)
+### Step 2: Q8 Fixed-Point Color Space Conversion (`syncverse-codecs/src/color/`)
 1. Implement ITU-R BT.601 limited-range conversion (`bt601.rs`):
    - $Q8$ integer arithmetic with $+128$ rounding offset:
      $$C = Y - 16, \quad D = U - 128, \quad E = V - 128$$
@@ -52,13 +52,13 @@
 Execute the automated test suite:
 ```bash
 # Crate unit test verification
-cargo test -p syncplay-codecs -- --nocapture
+cargo test -p syncverse-codecs -- --nocapture
 
 # Adversarial stride and SIMD alignment verification
 python3 tests/empirical_challenge/test_demux_codecs_clock.py
 
 # Lint inspection
-cargo clippy -p syncplay-codecs --all-targets -- -D warnings
+cargo clippy -p syncverse-codecs --all-targets -- -D warnings
 ```
 Criteria for success:
 - 100% test pass rate with 0 errors.

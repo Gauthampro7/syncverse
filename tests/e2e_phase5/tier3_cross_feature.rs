@@ -9,13 +9,13 @@
 
 use std::fs;
 
-use syncplay_chat::{ChatRecord, ChatStore};
-use syncplay_sync::wire::{
+use syncverse_chat::{ChatRecord, ChatStore};
+use syncverse_sync::wire::{
     PacketPayload, PacketType, WirePacket,
 };
-use syncplay_ui::gui::updater::parse_release_json;
-use syncplay_ui::snapshot::PlayerUiSnapshot;
-use syncplay_ui::UiEvent;
+use syncverse_ui::gui::updater::parse_release_json;
+use syncverse_ui::snapshot::PlayerUiSnapshot;
+use syncverse_ui::UiEvent;
 
 use super::contract_models::*;
 

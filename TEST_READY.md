@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Verification Command
 
-A comprehensive, opaque-box integration test suite for Syncplay-Alt Phase 5 (Watch-Party Social & Auto-Update Polish) has been authored and verified across 4 rigorous tiers. The suite covers all 18 inventoried features from `PROJECT.md`, validates boundary and corner conditions, exercises cross-feature pairwise combinations, and simulates real-world watch-party scenarios.
+A comprehensive, opaque-box integration test suite for Syncverse Phase 5 (Watch-Party Social & Auto-Update Polish) has been authored and verified across 4 rigorous tiers. The suite covers all 18 inventoried features from `PROJECT.md`, validates boundary and corner conditions, exercises cross-feature pairwise combinations, and simulates real-world watch-party scenarios.
 
 ### Test Execution Command
 ```bash
@@ -32,7 +32,7 @@ cargo clippy --test e2e_phase5 -- -D warnings
 
 ## 2. Test Architecture & Directory Layout
 
-The tests are located in `tests/e2e_phase5/` and integrated into the cargo test runner via `crates/syncplay-core/tests/e2e_phase5.rs`:
+The tests are located in `tests/e2e_phase5/` and integrated into the cargo test runner via `crates/syncverse-core/tests/e2e_phase5.rs`:
 
 ```
 tests/e2e_phase5/
@@ -43,7 +43,7 @@ tests/e2e_phase5/
 ├── tier3_cross_feature.rs       # Tier 3: 5 pairwise integration & cross-feature tests
 └── tier4_scenarios.rs           # Tier 4: 5 realistic end-to-end watch-party workflow scenarios
 
-crates/syncplay-core/tests/
+crates/syncverse-core/tests/
 └── e2e_phase5.rs                # Integration test entry point with #![deny(warnings)]
 ```
 

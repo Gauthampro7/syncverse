@@ -4,10 +4,10 @@
 //! across wire packets, file matching tolerances, SemVer comparison, unpause gating,
 //! and network rate-limiting.
 
-use syncplay_sync::wire::{
+use syncverse_sync::wire::{
     PacketPayload, WirePacket,
 };
-use syncplay_ui::gui::updater::{
+use syncverse_ui::gui::updater::{
     is_newer_version, normalize_semver_tag, parse_release_json, UpdateError,
 };
 

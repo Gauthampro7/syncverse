@@ -1,4 +1,4 @@
-# Syncplay-Alt: Master Project Specification
+# Syncverse: Master Project Specification
 
 **Status**: Living Architectural Baseline  
 **Target Milestone**: Phase 4 Desktop Graphical UI & Universal Media Compatibility  
@@ -8,10 +8,10 @@
 
 ## 1. System Vision & Architecture Philosophy
 
-Syncplay-Alt is an open-source, ultra-efficient standalone desktop media player and long-distance synchronized watch-party platform built in pure Rust. Traditional synchronized media solutions function as fragile scripting wrappers around external monolithic players (e.g., `mpv`, `vlc`) or depend on external database daemons (`sqlite`, `rocksdb`). 
+Syncverse is an open-source, ultra-efficient standalone desktop media player and long-distance synchronized watch-party platform built in pure Rust. Traditional synchronized media solutions function as fragile scripting wrappers around external monolithic players (e.g., `mpv`, `vlc`) or depend on external database daemons (`sqlite`, `rocksdb`). 
 
-Syncplay-Alt fundamentally diverges from these approaches by implementing a standalone native architecture with universal format compatibility:
-1. **Standalone Native Architecture with Universal Media Compatibility**: Syncplay-Alt is a standalone player running its own presentation and decoding pipeline, strictly eliminating external monolithic player scripting/IPC wrappers (`mpv`, `vlc`) and external database engines (`sqlite`, `diesel`, `rocksdb`). Universal container demuxing (MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1, MPEG-2/4, VC-1; AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS, PCM) are handled via direct multimedia library bindings (`ffmpeg-next`, `symphonia`), feeding into in-tree planar YUV420p, packed RGBA, and PCM audio models. Smart chat persistence is built from first principles with an in-tree binary log (`syncplay_chat.bin`) and inverted index.
+Syncverse fundamentally diverges from these approaches by implementing a standalone native architecture with universal format compatibility:
+1. **Standalone Native Architecture with Universal Media Compatibility**: Syncverse is a standalone player running its own presentation and decoding pipeline, strictly eliminating external monolithic player scripting/IPC wrappers (`mpv`, `vlc`) and external database engines (`sqlite`, `diesel`, `rocksdb`). Universal container demuxing (MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG) and video/audio bitstream decoding (H.264, H.265, VP8, VP9, AV1, MPEG-2/4, VC-1; AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS, PCM) are handled via direct multimedia library bindings (`ffmpeg-next`, `symphonia`), feeding into in-tree planar YUV420p, packed RGBA, and PCM audio models. Smart chat persistence is built from first principles with an in-tree binary log (`syncplay_chat.bin`) and inverted index.
 2. **Deterministic Mathematical Synchronization**: A network engine combining RFC 5905 NTP 4-timestamp exchange, sliding-window minimum RTT filtering with dispersion freezing defense, discrete Proportional-Integral (PI) Phase-Locked Loop (PLL) drift steering ($r \in [0.96, 1.04]$), and two-phase barrier unpausing capable of maintaining cross-peer audio/video alignment within $< 15\text{ ms}$ over 250–400ms high-jitter WAN links.
 3. **Decoupled Lock-Free Threading & Native Desktop Graphical UI**: A modern, hardware-accelerated desktop player window (`eframe`/`egui`/`wgpu`) running natively on Linux (Wayland/X11) and Windows. Cross-thread communication uses 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) ring buffers and triple-buffered atomic UI snapshots (`PlayerUiSnapshot`, 72 bytes) published via a centralized Telemetry Aggregator, guaranteeing sub-microsecond handoffs, zero mutex contention, zero audio buffer underruns, and desktop-grade UI responsiveness (< 16ms input-to-visual latency).
 4. **Locally Persisted Dual-Temporal Smart Chat**: A crash-resilient append-only binary log (`syncplay_chat.bin`) with `0xAA55` framing and CRC32 verification, an in-memory inverted index supporting sub-millisecond full-text search, moving-window timeline queries for on-screen bullet comments, and interactive slash-commands (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
@@ -20,11 +20,11 @@ Syncplay-Alt fundamentally diverges from these approaches by implementing a stan
 
 ## 2. Architectural Invariants & Prohibitions
 
-All crates and components within the Syncplay-Alt workspace MUST strictly adhere to the following architectural invariants:
+All crates and components within the Syncverse workspace MUST strictly adhere to the following architectural invariants:
 
 ### 2.1 Preserved Architectural Invariants & Forbidden Frameworks
 The workspace MUST NOT link against, wrap, or depend on external monolithic player engines or external database systems. Specifically:
-- **Forbidden Monolithic Player Frameworks & IPC Wrappers**: `mpv`, `mpv-sys`, `libmpv`, `vlc`, `libvlc`, and any subprocess/IPC wrapper around external player binaries. Syncplay-Alt MUST execute presentation, decoding, and playback control within its own native process space.
+- **Forbidden Monolithic Player Frameworks & IPC Wrappers**: `mpv`, `mpv-sys`, `libmpv`, `vlc`, `libvlc`, and any subprocess/IPC wrapper around external player binaries. Syncverse MUST execute presentation, decoding, and playback control within its own native process space.
 - **Forbidden Database & Search Engines**: `sqlite`, `sqlite3`, `rusqlite`, `sqlx`, `sled`, `rocksdb`, `rocksdb-sys`, `heed`, `tantivy`, `meilisearch`, `diesel`. All chat persistence and full-text search MUST use the in-tree `syncplay_chat.bin` binary log and inverted index.
 - **Permitted Multimedia & GUI Dependencies**: Pure-Rust utility primitives such as `thiserror`, standard library networking/threading (`std::net`, `std::sync::atomic`, `std::time::Instant`), direct multimedia libraries (`ffmpeg-next`, `ffmpeg-sys-next`, `symphonia`, `symphonia-core`), native audio output sinks (`cpal`, `rodio`), and cross-platform desktop GUI libraries (`eframe`, `egui`, `wgpu`, `winit`, `rfd`).
 
@@ -45,13 +45,13 @@ The codebase is organized into an 8-crate workspace under `crates/`:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                             syncplay-core                              │
+│                             syncverse-core                              │
 │         Top-level runtime coordinator & application orchestrator        │
 └──────────────┬─────────────────────────┬──────────────────────┬────────┘
                │                         │                      │
                ▼                         ▼                      ▼
 ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
-│      syncplay-ui       │  │     syncplay-sync      │  │     syncplay-chat      │
+│      syncverse-ui       │  │     syncverse-sync      │  │     syncverse-chat      │
 │  eframe/egui desktop   │  │  NTP filter, discrete  │  │  Custom binary log,    │
 │  window, GPU viewport  │  │  PI PLL, barrier sync  │  │  inverted index & cmds │
 └──────────────┬─────────┘  └────────────┬───────────┘  └───────────┬────────────┘
@@ -60,7 +60,7 @@ The codebase is organized into an 8-crate workspace under `crates/`:
                                          │
                                          ▼
                             ┌────────────────────────┐
-                            │     syncplay-clock     │
+                            │     syncverse-clock     │
                             │  Master clock, audio   │
                             │  pacer & SPSC buffers  │
                             └────────────┬───────────┘
@@ -68,7 +68,7 @@ The codebase is organized into an 8-crate workspace under `crates/`:
                          ┌───────────────┴───────────────┐
                          ▼                               ▼
             ┌────────────────────────┐      ┌────────────────────────┐
-            │    syncplay-demux      │      │    syncplay-codecs     │
+            │    syncverse-demux      │      │    syncverse-codecs     │
             │  UniversalDemuxer &    │      │  UniversalDecoder,     │
             │  pure-Rust demuxers    │      │  YUV420p, RGBA, PCM    │
             └────────────┬───────────┘      └────────────┬───────────┘
@@ -77,21 +77,21 @@ The codebase is organized into an 8-crate workspace under `crates/`:
                                          │
                                          ▼
                             ┌────────────────────────┐
-                            │    syncplay-common     │
+                            │    syncverse-common     │
                             │  MediaTime, CRC32,     │
                             │  ByteReader, errors    │
                             └────────────────────────┘
 ```
 
 ### 3.1 Crate Responsibilities
-1. **`syncplay-common`**: Foundational types (`MediaTime`, `WallTime`, `Rational`), byte and bitstream readers (`ByteReader`, `BitReader`), IEEE 802.3 CRC32 checksum engine, and unified error models.
-2. **`syncplay-demux`**: Universal container demuxer (`UniversalDemuxer` via `ffmpeg-next`) supporting MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG, alongside in-tree zero-dependency demuxers (`EbmlDemuxer`, `IsoBmffDemuxer`) for synthetic test vectors.
-3. **`syncplay-codecs`**: Universal video and audio decoders (`UniversalDecoder` via `ffmpeg-next`), planar YUV420p (`VideoFrameYUV420p`), packed RGBA32 (`VideoFrameRGBA`), and normalized audio PCM (`AudioFramePCM`, 48kHz, stereo, f32) memory models, and pure-Rust Q8 fixed-point color space conversion.
-4. **`syncplay-clock`**: Monotonic presentation clock with continuous SeqLock rate-shift re-anchoring, `AudioPacer` with silence frame underrun protection, and 128-byte cache-aligned lock-free Single-Producer Single-Consumer (SPSC) ring buffers.
-5. **`syncplay-sync`**: Long-distance high-RTT synchronization protocol featuring RFC 5905 4-timestamp probe exchange, sliding-window minimum RTT filtering with effective dispersion floor $D_{\text{effective}} \ge 5.0\text{ms}$, deterministic reference timeline equation, discrete PI PLL micro-speed controller ($r \in [0.96, 1.04]$), and two-phase barrier unpause state machine.
-6. **`syncplay-chat`**: Crash-resilient append-only binary chat engine (`syncplay_chat.bin`) with `0xAA55` framing and CRC32 checks, in-memory inverted index FTS, timeline overlay window query, and slash-command grammar (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
-7. **`syncplay-ui`**: High-responsiveness (< 16ms input latency) desktop graphical user interface built on `eframe`/`egui`/`wgpu` hosting GPU video viewport with aspect ratio preservation (letterboxing/pillarboxing), bottom playback controls bar, 10Hz debounced interactive seekbar, collapsible watch-party sidebar, native file dialogs (`rfd`), and headless/terminal fallback.
-8. **`syncplay-core`**: Top-level coordinator binding demuxing, decoding, clock, audio output sink (`cpal`), sync, chat, and GUI threads into a unified application lifecycle with centralized `TelemetryAggregator`.
+1. **`syncverse-common`**: Foundational types (`MediaTime`, `WallTime`, `Rational`), byte and bitstream readers (`ByteReader`, `BitReader`), IEEE 802.3 CRC32 checksum engine, and unified error models.
+2. **`syncverse-demux`**: Universal container demuxer (`UniversalDemuxer` via `ffmpeg-next`) supporting MKV/WebM, MP4/MOV, AVI, MPEG-TS, FLV, OGG, alongside in-tree zero-dependency demuxers (`EbmlDemuxer`, `IsoBmffDemuxer`) for synthetic test vectors.
+3. **`syncverse-codecs`**: Universal video and audio decoders (`UniversalDecoder` via `ffmpeg-next`), planar YUV420p (`VideoFrameYUV420p`), packed RGBA32 (`VideoFrameRGBA`), and normalized audio PCM (`AudioFramePCM`, 48kHz, stereo, f32) memory models, and pure-Rust Q8 fixed-point color space conversion.
+4. **`syncverse-clock`**: Monotonic presentation clock with continuous SeqLock rate-shift re-anchoring, `AudioPacer` with silence frame underrun protection, and 128-byte cache-aligned lock-free Single-Producer Single-Consumer (SPSC) ring buffers.
+5. **`syncverse-sync`**: Long-distance high-RTT synchronization protocol featuring RFC 5905 4-timestamp probe exchange, sliding-window minimum RTT filtering with effective dispersion floor $D_{\text{effective}} \ge 5.0\text{ms}$, deterministic reference timeline equation, discrete PI PLL micro-speed controller ($r \in [0.96, 1.04]$), and two-phase barrier unpause state machine.
+6. **`syncverse-chat`**: Crash-resilient append-only binary chat engine (`syncplay_chat.bin`) with `0xAA55` framing and CRC32 checks, in-memory inverted index FTS, timeline overlay window query, and slash-command grammar (`/seek`, `/bookmark`, `/clip`, `/poll`, `/sync-status`).
+7. **`syncverse-ui`**: High-responsiveness (< 16ms input latency) desktop graphical user interface built on `eframe`/`egui`/`wgpu` hosting GPU video viewport with aspect ratio preservation (letterboxing/pillarboxing), bottom playback controls bar, 10Hz debounced interactive seekbar, collapsible watch-party sidebar, native file dialogs (`rfd`), and headless/terminal fallback.
+8. **`syncverse-core`**: Top-level coordinator binding demuxing, decoding, clock, audio output sink (`cpal`), sync, chat, and GUI threads into a unified application lifecycle with centralized `TelemetryAggregator`.
 
 ---
 

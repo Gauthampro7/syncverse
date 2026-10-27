@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Syncplay-Alt Pi Framework Intent Verification Harness (Phase 4 Realigned)
+Syncverse Pi Framework Intent Verification Harness (Phase 4 Realigned)
 ========================================================================
 Authority: AGENTS.md & .pi/harness/intent_matrix.json
 
@@ -86,7 +86,7 @@ def run_intent_test(intent, timeout=120):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Syncplay-Alt Pi Framework Intent Verification Harness"
+        description="Syncverse Pi Framework Intent Verification Harness"
     )
     parser.add_argument(
         "--intent", "-i",
@@ -155,7 +155,7 @@ def main():
 
     if not args.quiet:
         print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.BLUE} SYNCPLAY-ALT: PI FRAMEWORK INTENT VERIFICATION HARNESS (PHASE 4) {Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.BLUE} SYNCVERSE: PI FRAMEWORK INTENT VERIFICATION HARNESS (PHASE 4) {Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.BLUE} Authority: AGENTS.md & .pi/harness/intent_matrix.json {Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.BLUE}=============================================================================={Colors.RESET}\n")
         log_info(f"Loaded {len(intents)} intent(s) to evaluate. Beginning verification...\n")

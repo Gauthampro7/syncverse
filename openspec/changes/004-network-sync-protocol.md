@@ -19,7 +19,7 @@ Long-distance watch parties across transatlantic or transpacific links (250–40
 [003-clock-pipeline]
          │
          ▼
-[004-network-sync-protocol] (syncplay-sync)
+[004-network-sync-protocol] (syncverse-sync)
          │
          ├─► [005-smart-chat-storage] (chat slash commands dispatch to sync)
          └─► [006-ui-osd-renderer] (sync badges & telemetry display)
@@ -32,7 +32,7 @@ Long-distance watch parties across transatlantic or transpacific links (250–40
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-sync`**:
+- **`crates/syncverse-sync`**:
   - `src/ntp/probe.rs`: 4-timestamp probe packet encoding/decoding and offset math.
   - `src/ntp/filter.rs`: RFC 5905 8-sample sliding-window minimum RTT filter with dispersion rejection, $D_{\text{effective}}$ floor, and watchdog reset.
   - `src/pll/controller.rs`: Discrete Proportional-Integral (PI) drift controller ($K_p=0.17\text{ s}^{-1}, K_i=0.0072\text{ s}^{-2}$).
@@ -68,13 +68,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crate
-cargo check -p syncplay-sync
+cargo check -p syncverse-sync
 
 # 2. Run unit tests including NTP filter and PLL mathematical proofs
-cargo test -p syncplay-sync -- --nocapture
+cargo test -p syncverse-sync -- --nocapture
 
 # 3. Verify zero external networking or codec dependencies
-cargo tree -p syncplay-sync --edges no-dev
+cargo tree -p syncverse-sync --edges no-dev
 ```
 
 Expected output: All unit tests pass; mathematical convergence tests verify phase error reduces to $< 15\text{ ms}$ under 250–400ms simulated RTT without issuing hard seeks.

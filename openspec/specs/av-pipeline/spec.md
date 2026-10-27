@@ -1,6 +1,6 @@
-# Capability Specification: Master A/V Clock & Pipeline (`syncplay-clock`)
+# Capability Specification: Master A/V Clock & Pipeline (`syncverse-clock`)
 
-**Component**: `syncplay-clock`  
+**Component**: `syncverse-clock`  
 **Standard Compliance**: POSIX `CLOCK_MONOTONIC`, C11/Rust Atomic Memory Model  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,7 +8,7 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-clock` crate governs media presentation timing, continuous PTS progression across variable playback speeds, and thread-decoupling via lock-free ring buffers. Presentation pacing requires an absolute monotonic reference that is immune to system wall-clock discontinuities (e.g., NTP adjustments or daylight saving shifts).
+The `syncverse-clock` crate governs media presentation timing, continuous PTS progression across variable playback speeds, and thread-decoupling via lock-free ring buffers. Presentation pacing requires an absolute monotonic reference that is immune to system wall-clock discontinuities (e.g., NTP adjustments or daylight saving shifts).
 
 Furthermore, media playback requires transferring decoded video and audio frames across threads (Demuxer $\to$ Decoder $\to$ Presentation) without thread blocking, mutex locks, or priority inversions. This is achieved via a 128-byte cache-line aligned Single-Producer Single-Consumer (SPSC) lock-free ring buffer that eliminates CPU core false sharing.
 

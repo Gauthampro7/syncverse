@@ -21,7 +21,7 @@ Validates:
    - `cargo test --test adversarial_phase5_challenge`
    - `cargo test --test e2e_phase5`
    - `cargo test --test unpause_gate_and_peer_diagnostics_integration`
-   - `cargo test -p syncplay-sync --test peer_status_test`
+   - `cargo test -p syncverse-sync --test peer_status_test`
 """
 
 import os
@@ -342,7 +342,7 @@ def main():
         "Unpause Gate & Peer Diagnostics Integration",
     )
     run_rust_test_suite(
-        ["cargo", "test", "-p", "syncplay-sync", "--test", "peer_status_test", "--", "--nocapture"],
+        ["cargo", "test", "-p", "syncverse-sync", "--test", "peer_status_test", "--", "--nocapture"],
         "Peer Status Wire & Transport Tests",
     )
 

@@ -43,7 +43,7 @@ Before beginning implementation of change proposal `X`:
 1. Extract all RFC-2119 clauses from the spec into a structured table:
    | Requirement ID | RFC-2119 Clause | Scope / Crate | Test Scenario |
    |---|---|---|---|
-   | DEMUX-01 | MUST resolve VINT width 1..8 | syncplay-demux | `test_vint_widths` |
+   | DEMUX-01 | MUST resolve VINT width 1..8 | syncverse-demux | `test_vint_widths` |
 2. Match every `#### Scenario:` to a concrete Rust unit test function in the target crate.
 
 ### Step 3: Atomic Slice Slicing

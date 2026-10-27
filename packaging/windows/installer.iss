@@ -1,17 +1,17 @@
 ; ==============================================================================
-; Syncplay-Alt Windows Installer (Inno Setup 6 Script)
+; Syncverse Windows Installer (Inno Setup 6 Script)
 ; Industry Standard Installation & Uninstallation Package
 ; ==============================================================================
 
-#define MyAppName "Syncplay Alt"
+#define MyAppName "Syncverse"
 #define MyAppVersion "0.1.1"
-#define MyAppPublisher "Syncplay Alt Project"
-#define MyAppURL "https://github.com/Gauthampro7/syncplay-desktop-preview"
-#define MyAppExeName "syncplay-alt.exe"
-#define MyAppAssocPrefix "SyncplayAlt"
+#define MyAppPublisher "Syncverse Project"
+#define MyAppURL "https://github.com/Gauthampro7/syncverse"
+#define MyAppExeName "syncverse.exe"
+#define MyAppAssocPrefix "Syncverse"
 
 [Setup]
-; Unique AppId generated for Syncplay Alt
+; Unique AppId generated for Syncverse
 AppId={{8B41FE19-D21F-43DE-875F-2D384D02C130}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -20,7 +20,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
-DefaultDirName={autopf}\SyncplayAlt
+DefaultDirName={autopf}\Syncverse
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 ; 64-bit Windows requirement & Modern Wizard Style
@@ -31,7 +31,7 @@ WizardResizable=no
 ShowLanguageDialog=auto
 
 ; Installer & Uninstaller Icons
-SetupIconFile=..\..\assets\syncplay-alt.ico
+SetupIconFile=..\..\assets\syncverse.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 ; Compression settings for high-efficiency packaging
@@ -41,7 +41,7 @@ InternalCompressLevel=ultra64
 
 ; Output directory and installer filename
 OutputDir=..\..\target\windows-dist
-OutputBaseFilename=SyncplayAlt-Setup-v{#MyAppVersion}-x64
+OutputBaseFilename=Syncverse-Setup-v{#MyAppVersion}-x64
 
 ; Privileges: per-machine (Program Files) with elevation prompt if standard user
 PrivilegesRequired=lowest
@@ -57,18 +57,19 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "quicklaunchicon"; Description: "Create a Quick Launch icon"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; OnlyBelowVersion: 6.1; Check: not IsAdminInstallMode
-Name: "associate_media"; Description: "Associate Syncplay Alt with supported media files (.mkv, .mp4, .webm, .avi, .mov)"; GroupDescription: "File Associations:"
+Name: "associate_media"; Description: "Associate Syncverse with supported media files (.mkv, .mp4, .webm, .avi, .mov)"; GroupDescription: "File Associations:"
 
 [Files]
 ; Primary executable
 Source: "..\..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; Supporting Assets
-Source: "..\..\assets\syncplay-alt.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\..\assets\syncverse.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 ; Any runtime dynamic link libraries present in target/release
 Source: "..\..\target\release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; Documentation & License
 Source: "..\..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion isreadme
 Source: "..\..\AGENTS.md"; DestDir: "{app}"; DestName: "ARCHITECTURE.txt"; Flags: ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
@@ -76,7 +77,7 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-; Register Application in Windows App Paths (Enables Win+R > "syncplay-alt")
+; Register Application in Windows App Paths (Enables Win+R > "syncverse")
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
@@ -110,10 +111,10 @@ Root: HKA; Subkey: "Software\Classes\{#MyAppAssocPrefix}.webm"; ValueType: strin
 Root: HKA; Subkey: "Software\Classes\{#MyAppAssocPrefix}.webm\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey; Tasks: associate_media
 Root: HKA; Subkey: "Software\Classes\{#MyAppAssocPrefix}.webm\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associate_media
 
-; Right-click "Play with Syncplay Alt" context menu for all video files
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\SyncplayAlt"; ValueType: string; ValueName: ""; ValueData: "Play with Syncplay Alt"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\SyncplayAlt"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\SyncplayAlt\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
+; Right-click "Play with Syncverse" context menu for all video files
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\Syncverse"; ValueType: string; ValueName: ""; ValueData: "Play with Syncverse"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\Syncverse"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppExeName},0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\Syncverse\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

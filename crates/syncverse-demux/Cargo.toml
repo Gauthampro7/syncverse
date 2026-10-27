@@ -1,0 +1,10 @@
+[package]
+name = "syncverse-demux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ffmpeg-next.workspace = true

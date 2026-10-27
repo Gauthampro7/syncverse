@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "=================================================="
-echo " Syncplay-Alt Windows Cross-Compilation (Fedora -> Windows)"
+echo " Syncverse Windows Cross-Compilation (Fedora -> Windows)"
 echo "=================================================="
 
 # Check for mingw toolchain
@@ -22,5 +22,5 @@ cargo build --release --target x86_64-pc-windows-gnu --workspace
 
 echo "=================================================="
 echo " [SUCCESS] Windows binary created!"
-echo " Location: target/x86_64-pc-windows-gnu/release/syncplay-alt.exe"
+echo " Location: target/x86_64-pc-windows-gnu/release/syncverse.exe"
 echo "=================================================="

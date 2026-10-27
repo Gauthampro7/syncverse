@@ -5,17 +5,17 @@
 use std::fs;
 use std::time::Duration;
 
-use syncplay_chat::{ChatRecord, ChatRecoveryScanner, ChatStore};
-use syncplay_sync::wire::{
+use syncverse_chat::{ChatRecord, ChatRecoveryScanner, ChatStore};
+use syncverse_sync::wire::{
     PacketPayload, PacketType, PeerStatusPayload, WirePacket,
 };
-use syncplay_sync::SyncError;
-use syncplay_ui::gui::updater::{
+use syncverse_sync::SyncError;
+use syncverse_ui::gui::updater::{
     clean_semver_tag, is_newer_version, normalize_semver_tag, parse_release_json,
     select_asset_for_os, select_platform_download_url, UpdateError, UpdateInfo,
 };
-use syncplay_ui::snapshot::PlayerUiSnapshot;
-use syncplay_ui::UiEvent;
+use syncverse_ui::snapshot::PlayerUiSnapshot;
+use syncverse_ui::UiEvent;
 
 use super::contract_models::*;
 
@@ -27,7 +27,7 @@ use super::contract_models::*;
 fn test_f1_update_check_success_parsing() {
     let raw_json = serde_json::json!({
         "tag_name": "v0.1.2",
-        "html_url": "https://github.com/Gauthampro7/syncplay-desktop-preview/releases/tag/v0.1.2",
+        "html_url": "https://github.com/Gauthampro7/syncverse/releases/tag/v0.1.2",
         "body": "Phase 5 Social & Update release",
         "assets": [
             {
@@ -42,7 +42,7 @@ fn test_f1_update_check_success_parsing() {
     let info = res.unwrap();
     assert_eq!(info.current_version, "0.1.1");
     assert_eq!(info.latest_version, "0.1.2");
-    assert_eq!(info.release_url, "https://github.com/Gauthampro7/syncplay-desktop-preview/releases/tag/v0.1.2");
+    assert_eq!(info.release_url, "https://github.com/Gauthampro7/syncverse/releases/tag/v0.1.2");
     assert_eq!(info.release_notes.as_deref(), Some("Phase 5 Social & Update release"));
 }
 

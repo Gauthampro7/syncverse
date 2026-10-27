@@ -3,11 +3,11 @@
 //! Realistic multi-step end-to-end user workflows simulating watch-party sessions,
 //! late-joining peers, AFK overrides, file discrepancies, and update workflows.
 
-use syncplay_sync::wire::{
+use syncverse_sync::wire::{
     PacketPayload, PacketType, WirePacket,
 };
-use syncplay_ui::gui::updater::parse_release_json;
-use syncplay_ui::UiEvent;
+use syncverse_ui::gui::updater::parse_release_json;
+use syncverse_ui::UiEvent;
 
 use super::contract_models::*;
 
@@ -189,7 +189,7 @@ fn test_tier4_scenario5_update_detection_and_banner_dismissal() {
     // 2. GitHub Releases response payload
     let release_json = serde_json::json!({
         "tag_name": "v0.1.2",
-        "html_url": "https://github.com/Gauthampro7/syncplay-desktop-preview/releases/tag/v0.1.2",
+        "html_url": "https://github.com/Gauthampro7/syncverse/releases/tag/v0.1.2",
         "body": "Fixed unpause race conditions and added social polish.",
         "assets": [
             {

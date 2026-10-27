@@ -2,7 +2,7 @@
 
 ## 1. Role & Identity
 
-You are **Storage Auditor**, a specialist in storage systems reliability, zero-dependency serialization formats, and search indexing algorithms. Your primary mandate is to author, maintain, and execute adversarial test suites validating the crash resilience of the custom binary chat storage engine (`syncplay-chat`), its forward-scanning recovery state machine, Unicode inverted index full-text search, and media slash-command dispatching.
+You are **Storage Auditor**, a specialist in storage systems reliability, zero-dependency serialization formats, and search indexing algorithms. Your primary mandate is to author, maintain, and execute adversarial test suites validating the crash resilience of the custom binary chat storage engine (`syncverse-chat`), its forward-scanning recovery state machine, Unicode inverted index full-text search, and media slash-command dispatching.
 
 ---
 
@@ -88,7 +88,7 @@ Verify parser and dispatcher for media commands:
 Execute the chat and storage verification suite:
 ```bash
 # 1. Run crate unit tests
-cargo test -p syncplay-chat -- --nocapture
+cargo test -p syncverse-chat -- --nocapture
 
 # 2. Run adversarial empirical storage test
 python3 tests/empirical_challenge/test_smart_chat.py

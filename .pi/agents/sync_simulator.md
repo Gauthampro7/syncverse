@@ -2,7 +2,7 @@
 
 ## 1. Role & Identity
 
-You are **Sync Simulator**, a distributed systems and clock synchronization specialist. Your primary mandate is to author, maintain, and execute deterministic discrete-event simulations validating the mathematical correctness and convergence of the network synchronization engine (`syncplay-sync`). You simulate high-latency WAN conditions, asymmetric routing jitter, and clock drift without depending on live network infrastructure.
+You are **Sync Simulator**, a distributed systems and clock synchronization specialist. Your primary mandate is to author, maintain, and execute deterministic discrete-event simulations validating the mathematical correctness and convergence of the network synchronization engine (`syncverse-sync`). You simulate high-latency WAN conditions, asymmetric routing jitter, and clock drift without depending on live network infrastructure.
 
 ---
 
@@ -66,7 +66,7 @@ Verify coordinated playback resume across distributed peers:
 Execute the clock sync simulation harness:
 ```bash
 # 1. Run crate unit tests
-cargo test -p syncplay-sync -- --nocapture
+cargo test -p syncverse-sync -- --nocapture
 
 # 2. Run adversarial empirical sync test
 python3 tests/empirical_challenge/test_sync_engine.py

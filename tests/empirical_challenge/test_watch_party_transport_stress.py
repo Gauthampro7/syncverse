@@ -16,9 +16,9 @@ Validates:
    - Buffer overflow / oversized declared lengths (65535 bytes)
    - High-density LFSR pseudorandom fuzz sequences
 3. Execution and Invariant Verification of Rust Stress Test Suites:
-   - `cargo test -p syncplay-sync --test chat_transport_adversarial` (high concurrency, anti-echo, joins/leaves)
-   - `cargo test -p syncplay-sync --test multi_client_watch_party_chat`
-   - `cargo test -p syncplay-sync --test watch_party_transport`
+   - `cargo test -p syncverse-sync --test chat_transport_adversarial` (high concurrency, anti-echo, joins/leaves)
+   - `cargo test -p syncverse-sync --test multi_client_watch_party_chat`
+   - `cargo test -p syncverse-sync --test watch_party_transport`
 """
 
 import os
@@ -163,9 +163,9 @@ def run_rust_tests():
     env["PATH"] = os.path.expanduser("~/.cargo/bin:") + env.get("PATH", "")
 
     test_commands = [
-        ["cargo", "test", "-p", "syncplay-sync", "--test", "chat_transport_adversarial", "--", "--nocapture"],
-        ["cargo", "test", "-p", "syncplay-sync", "--test", "multi_client_watch_party_chat", "--", "--nocapture"],
-        ["cargo", "test", "-p", "syncplay-sync", "--test", "watch_party_transport", "--", "--nocapture"],
+        ["cargo", "test", "-p", "syncverse-sync", "--test", "chat_transport_adversarial", "--", "--nocapture"],
+        ["cargo", "test", "-p", "syncverse-sync", "--test", "multi_client_watch_party_chat", "--", "--nocapture"],
+        ["cargo", "test", "-p", "syncverse-sync", "--test", "watch_party_transport", "--", "--nocapture"],
     ]
 
     for cmd in test_commands:

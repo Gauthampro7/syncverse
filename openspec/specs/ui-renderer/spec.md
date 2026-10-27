@@ -1,6 +1,6 @@
-# Capability Specification: Desktop Graphical UI & Renderer (`syncplay-ui`)
+# Capability Specification: Desktop Graphical UI & Renderer (`syncverse-ui`)
 
-**Component**: `syncplay-ui`  
+**Component**: `syncverse-ui`  
 **Standards Compliance**: Desktop Windowing Compositor Protocols (Wayland `xdg_shell`, X11 EWMH/NetWM, Win32), GPU Texture Presentation (`wgpu`, VSync), Sub-16ms Input Latency Bounds, RFC 2119  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,9 +8,9 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-ui` crate specifies the native desktop graphical player user interface, GPU video viewport, On-Screen Display (OSD), and watch-party sidebar architecture. Desktop video players frequently suffer from input stutter, sluggish timeline scrubbing, audio crackle, and UI lockouts when interface rendering shares lock-guarded state with media decoding or network synchronization routines.
+The `syncverse-ui` crate specifies the native desktop graphical player user interface, GPU video viewport, On-Screen Display (OSD), and watch-party sidebar architecture. Desktop video players frequently suffer from input stutter, sluggish timeline scrubbing, audio crackle, and UI lockouts when interface rendering shares lock-guarded state with media decoding or network synchronization routines.
 
-`syncplay-ui` delivers a modern, VLC-grade desktop player application running natively on Linux (Wayland and X11) and Windows while enforcing:
+`syncverse-ui` delivers a modern, VLC-grade desktop player application running natively on Linux (Wayland and X11) and Windows while enforcing:
 1. **Thread Partitioning**: Complete isolation of the graphical UI event loop from media demuxing, video/audio decoding, audio output streaming, and UDP network handling.
 2. **Lock-Free Triple-Buffered Atomic State Snapshots**: Telemetry exchange via `PlayerUiSnapshot` pointers swapped with atomic memory operations, guaranteeing UI readers never lock or wait ($< 50\text{ ns}$).
 3. **GPU Video Viewport & Aspect Ratio Preservation**: Hardware-accelerated rendering surface maintaining exact media aspect ratio with automatic pillarboxing/letterboxing and vsync frame pacing.
@@ -33,9 +33,9 @@ The application SHALL instantiate a native desktop graphical window utilizing `e
 4. **CLI Headless & Terminal Fallback**: The application MUST maintain support for command-line arguments `--headless` and `--terminal`, enabling automated testing harnesses, headless servers, and ANSI terminal rendering without requiring an active graphical display server.
 
 #### Scenario: Launch Desktop Application Window
-- **Given** an invocation of `syncplay-alt` without arguments on a Wayland desktop session
+- **Given** an invocation of `syncverse` without arguments on a Wayland desktop session
 - **When** the application starts up
-- **Then** a graphical desktop window titled "Syncplay-Alt" appears with default geometry ($1280 \times 720\text{ px}$)
+- **Then** a graphical desktop window titled "Syncverse" appears with default geometry ($1280 \times 720\text{ px}$)
 - **And** the window responds smoothly to window manager resize, minimize, and maximize actions.
 
 #### Scenario: Toggle Fullscreen Mode via F11
@@ -50,7 +50,7 @@ The application SHALL instantiate a native desktop graphical window utilizing `e
 ### Requirement: Thread Decoupling & Mutex-Free State Sharing
 The UI event and presentation loop SHALL NOT acquire mutex locks shared with media demuxing, video decoding, audio output, or network synchronization threads. Player state MUST be communicated to the UI via an immutable, self-contained `PlayerUiSnapshot` published through a triple-buffered atomic exchange mechanism adhering to a strict **Single-Producer Single-Consumer (SPSC)** thread topology:
 
-1. **Sole Publisher Mandate**: A single, dedicated **Telemetry Aggregator** thread (executing within the `syncplay-core` coordinator loop) SHALL be the sole publisher authorized to write to the triple buffer. Subsystem threads SHALL NOT publish directly to the triple buffer; they SHALL report metrics to the Telemetry Aggregator via atomic variables or bounded lock-free queues.
+1. **Sole Publisher Mandate**: A single, dedicated **Telemetry Aggregator** thread (executing within the `syncverse-core` coordinator loop) SHALL be the sole publisher authorized to write to the triple buffer. Subsystem threads SHALL NOT publish directly to the triple buffer; they SHALL report metrics to the Telemetry Aggregator via atomic variables or bounded lock-free queues.
 2. **Atomic Publication**: The Telemetry Aggregator compiles telemetry into the dirty buffer and executes a release-ordered atomic swap with the clean index at a periodic tick rate (e.g. 60–120 Hz).
 3. **Wait-Free Polling**: Polling the latest snapshot (`poll_latest_snapshot`) by the UI consumer thread MUST complete in $O(1)$ time ($< 50\text{ ns}$) with zero blocking, locking, system calls, or read tearing.
 
@@ -201,7 +201,7 @@ The application SHALL provide user-friendly file loading methods:
    - The application window SHALL accept dropped files directly from desktop file managers (e.g. GNOME Files / Nautilus, Windows Explorer).
    - Upon dropping a file onto the player window, the player SHALL immediately load the file, parse container headers, and initiate playback.
 3. **Recent Media History**:
-   - The application SHOULD persist a recent media history (up to 10 entries) stored in `$XDG_CONFIG_HOME/syncplay-alt/recent_history.json`, accessible via a "Recent Files" menu.
+   - The application SHOULD persist a recent media history (up to 10 entries) stored in `$XDG_CONFIG_HOME/syncverse/recent_history.json`, accessible via a "Recent Files" menu.
 
 #### Scenario: Open File via Native File Picker Dialog
 - **Given** the player running with no media loaded

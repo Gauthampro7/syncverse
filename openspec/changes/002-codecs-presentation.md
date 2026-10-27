@@ -19,7 +19,7 @@ Presentation surfaces (Wayland SHM buffers, X11 shared memory, GPU framebuffers)
 [001-demuxer-bitstream]
          │
          ▼
-[002-codecs-presentation] (syncplay-codecs)
+[002-codecs-presentation] (syncverse-codecs)
          │
          ▼
 [003-clock-pipeline]
@@ -32,7 +32,7 @@ Presentation surfaces (Wayland SHM buffers, X11 shared memory, GPU framebuffers)
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-codecs`**:
+- **`crates/syncverse-codecs`**:
   - `src/frame/video.rs`: 64-byte cache-aligned `VideoFrameYUV420p` with 16-byte row stride padding and packed `VideoFrameRGBA`.
   - `src/frame/audio.rs`: Normalized interleaved `AudioFramePCM` (`f32` samples in $[-1.0, 1.0]$).
   - `src/color/bt601.rs`: ITU-R BT.601 limited-range Q8 integer conversion.
@@ -65,13 +65,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crate
-cargo check -p syncplay-codecs
+cargo check -p syncverse-codecs
 
 # 2. Run unit tests including color accuracy matrices
-cargo test -p syncplay-codecs -- --nocapture
+cargo test -p syncverse-codecs -- --nocapture
 
 # 3. Verify zero banned dependencies
-cargo tree -p syncplay-codecs --edges no-dev
+cargo tree -p syncverse-codecs --edges no-dev
 ```
 
 Expected output: Color conversion tests for Reference Black $(16,128,128) \to (0,0,0)$ and Reference White $(235,128,128) \to (255,255,255)$ pass with zero warnings.

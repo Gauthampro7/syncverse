@@ -1,0 +1,25 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Syncverse
+GenericName=Synchronized Media Player
+Comment=Zero-dependency standalone synchronized watch-party media player
+Exec=syncverse %U
+Icon=syncverse
+Terminal=false
+Categories=AudioVideo;Player;Video;
+MimeType=video/x-matroska;video/mp4;video/webm;video/quicktime;
+Keywords=video;movie;player;sync;watchparty;terminal;
+Actions=HostParty;ConnectParty;Inspect;
+
+[Desktop Action HostParty]
+Name=Host Watch Party Room
+Exec=syncverse party host
+
+[Desktop Action ConnectParty]
+Name=Connect to Watch Party
+Exec=syncverse party connect 127.0.0.1:18242
+
+[Desktop Action Inspect]
+Name=Inspect Media Container
+Exec=syncverse inspect %U

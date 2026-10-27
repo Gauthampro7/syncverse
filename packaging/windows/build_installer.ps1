@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the Syncplay-Alt Windows release binary and packages the Inno Setup installer.
+    Builds the Syncverse Windows release binary and packages the Inno Setup installer.
 .DESCRIPTION
     Requires:
       - Rust (cargo)
@@ -16,16 +16,16 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Resolve-Path "$PSScriptRoot\..\.."
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host " Syncplay-Alt Windows Installer Build Script" -ForegroundColor Cyan
+Write-Host " Syncverse Windows Installer Build Script" -ForegroundColor Cyan
 Write-Host " Project root: $ProjectRoot" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Compile Release Binary
 if (-not $SkipBuild) {
-    Write-Host "[1/3] Compiling Syncplay-Alt in Release mode..." -ForegroundColor Yellow
+    Write-Host "[1/3] Compiling Syncverse in Release mode..." -ForegroundColor Yellow
     Push-Location $ProjectRoot
     try {
-        cargo build --release --bin syncplay-alt
+        cargo build --release --bin syncverse
     }
     finally {
         Pop-Location
@@ -34,7 +34,7 @@ if (-not $SkipBuild) {
     Write-Host "[1/3] Skipping Rust compilation as requested." -ForegroundColor DarkGray
 }
 
-$ExePath = "$ProjectRoot\target\release\syncplay-alt.exe"
+$ExePath = "$ProjectRoot\target\release\syncverse.exe"
 if (-not (Test-Path $ExePath)) {
     Write-Error "Release executable not found at: $ExePath. Ensure compilation succeeds."
     exit 1

@@ -3292,75 +3292,72 @@ dependencies = [
 ]
 
 [[package]]
-name = "syncplay-chat"
+name = "syncverse-chat"
 version = "0.1.1"
 dependencies = [
- "syncplay-common",
- "syncplay-sync",
+ "syncverse-common",
+ "syncverse-sync",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-clock"
+name = "syncverse-clock"
 version = "0.1.1"
 dependencies = [
- "syncplay-codecs",
- "syncplay-common",
+ "syncverse-codecs",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-codecs"
+name = "syncverse-codecs"
 version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
- "syncplay-common",
+ "syncverse-common",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-common"
+name = "syncverse-common"
 version = "0.1.1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-core"
+name = "syncverse-core"
 version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
  "serde_json",
- "syncplay-chat",
- "syncplay-clock",
- "syncplay-codecs",
- "syncplay-common",
- "syncplay-demux",
- "syncplay-sync",
- "syncplay-ui",
+ "syncverse-chat",
+ "syncverse-clock",
+ "syncverse-codecs",
+ "syncverse-common",
+ "syncverse-demux",
+ "syncverse-sync",
+ "syncverse-ui",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-demux"
+name = "syncverse-demux"
 version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
- "syncplay-common",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-sync"
+name = "syncverse-sync"
 version = "0.1.1"
 dependencies = [
- "syncplay-clock",
- "syncplay-common",
+ "syncverse-common",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "syncplay-ui"
+name = "syncverse-ui"
 version = "0.1.1"
 dependencies = [
  "eframe",
@@ -3369,10 +3366,9 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "syncplay-chat",
- "syncplay-clock",
- "syncplay-codecs",
- "syncplay-common",
+ "syncverse-chat",
+ "syncverse-clock",
+ "syncverse-codecs",
  "thiserror 2.0.21",
  "ureq",
 ]

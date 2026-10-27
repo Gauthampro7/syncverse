@@ -1,6 +1,6 @@
-# Capability Specification: Codecs & Pixel Pipeline (`syncplay-codecs`)
+# Capability Specification: Codecs & Pixel Pipeline (`syncverse-codecs`)
 
-**Component**: `syncplay-codecs`  
+**Component**: `syncverse-codecs`  
 **Standards Compliance**: ITU-R BT.601, ITU-R BT.709, YUV420p (I420), Packed RGBA32  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,7 +8,7 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-codecs` crate encapsulates baseline video/audio frame representations, zero-allocation memory buffers, and pure-Rust color space transformations. In adherence to the zero-external-codec invariant, the color space conversion pipeline does not link against `libswscale`, `image`, or hardware C-FFI libraries.
+The `syncverse-codecs` crate encapsulates baseline video/audio frame representations, zero-allocation memory buffers, and pure-Rust color space transformations. In adherence to the zero-external-codec invariant, the color space conversion pipeline does not link against `libswscale`, `image`, or hardware C-FFI libraries.
 
 Video presentation requires converting planar YUV420p ($Y'CbCr$ 4:2:0 chroma-subsampled) frames into packed 32-bit `RGBA` textures suitable for display rendering surfaces (Wayland `wl_shm`, X11 shared memory, or GPU framebuffer uploads). To ensure deterministic results across diverse CPU architectures and avoid floating-point rounding discrepancies or scalar FPU stalls, all color transformations are executed using 8-bit fractional fixed-point ($Q8$) integer arithmetic with branchless clamping.
 

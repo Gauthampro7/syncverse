@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Syncplay-Alt Phase 4 End-to-End Automated Verification Harness
+# Syncverse Phase 4 End-to-End Automated Verification Harness
 # Authority: ORIGINAL_REQUEST.md (Phase 4 2026-10-25T20:12:42Z) & AGENTS.md
 #
 # Validates:
@@ -45,7 +45,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 echo "=============================================================================="
-echo " Syncplay-Alt Phase 4 End-to-End Automated Verification Harness"
+echo " Syncverse Phase 4 End-to-End Automated Verification Harness"
 echo " Authority: ORIGINAL_REQUEST.md (Phase 4) & AGENTS.md"
 echo " Root directory: $ROOT_DIR"
 echo "=============================================================================="

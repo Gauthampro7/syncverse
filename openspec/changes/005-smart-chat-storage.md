@@ -17,7 +17,7 @@ Watch-party participants require rich in-player communication including timeline
 
 ```
 [001-demuxer-bitstream] ──┐
-                          ├─► [005-smart-chat-storage] (syncplay-chat)
+                          ├─► [005-smart-chat-storage] (syncverse-chat)
 [004-network-sync-protocol] ┘          │
                                        ▼
                              [006-ui-osd-renderer]
@@ -30,7 +30,7 @@ Watch-party participants require rich in-player communication including timeline
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-chat`**:
+- **`crates/syncverse-chat`**:
   - `src/storage/log.rs`: `syncplay_chat.bin` append-only binary log writer and header validator (`SPCH`).
   - `src/storage/record.rs`: Binary wire layout, `0xAA55` framing, dual timestamps, and CRC32 checks.
   - `src/storage/recovery.rs`: Torn-write detection and byte-by-byte forward-scanning resynchronization state machine treating oversized lengths as false sync words.
@@ -56,7 +56,7 @@ Watch-party participants require rich in-player communication including timeline
    - Spatial timeline queries over `BTreeMap` in $O(\log N + K)$ time for floating comments.
 3. **Slash-Command Parser & Media Triggers**:
    - Normalizing timecodes (`01:23:45`, `14:30`, `+15s`, `-10s`) into absolute milliseconds.
-   - Dispatching `/seek` and `/bookmark` events directly to `syncplay-sync`.
+   - Dispatching `/seek` and `/bookmark` events directly to `syncverse-sync`.
 4. **History Exporters**:
    - Machine-readable JSON array and human-readable Markdown transcript formats.
 
@@ -68,13 +68,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crate
-cargo check -p syncplay-chat
+cargo check -p syncverse-chat
 
 # 2. Run unit tests including binary log persistence, recovery, FTS, and command parsing
-cargo test -p syncplay-chat -- --nocapture
+cargo test -p syncverse-chat -- --nocapture
 
 # 3. Verify zero database or external search dependencies (no sqlite, tantivy, etc.)
-cargo tree -p syncplay-chat --edges no-dev
+cargo tree -p syncverse-chat --edges no-dev
 ```
 
 Expected output: All unit tests pass; recovery tests successfully salvage records after simulated torn writes at EOF; inverted index returns correct Boolean search results.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Empirical Adversarial Challenge Test Suite: ISOBMFF / MP4 Demuxer
-Adversarial Verification for openspec/specs/demuxer/spec.md & syncplay-demux.
+Adversarial Verification for openspec/specs/demuxer/spec.md & syncverse-demux.
 
 Verification Areas:
 1. 64-bit largesize box header bounds fuzzing and boundary conditions.

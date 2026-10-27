@@ -38,7 +38,7 @@ import subprocess
 import tempfile
 import sys
 
-BINARY_PATH = os.path.abspath("target/debug/syncplay-alt")
+BINARY_PATH = os.path.abspath("target/debug/syncverse")
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
@@ -65,7 +65,7 @@ def test_1_cli_banner_usage_version():
 
     # 1A. No arguments -> Banner + Usage, exit 0
     out, _ = run_cmd([], expect_exit=0)
-    assert "SYNCPLAY-ALT" in out
+    assert "SYNCVERSE" in out
     assert "USAGE:" in out
 
     # 1B. Help flags
@@ -76,7 +76,7 @@ def test_1_cli_banner_usage_version():
     # 1C. Version flags
     for flag in ["version", "--version", "-v"]:
         out, _ = run_cmd([flag], expect_exit=0)
-        assert "syncplay-alt v0.1.1" in out
+        assert "syncverse v0.1.1" in out
         assert "pure-Rust" in out
 
     # 1D. Unknown commands
@@ -258,7 +258,7 @@ def test_5_cli_chat_persistence_and_queries():
         assert f"Transcript exported to {tf.name}" in out
         with open(tf.name, "r", encoding="utf-8") as f:
             content = f.read()
-        assert "Syncplay-Alt Room Chat Transcript" in content
+        assert "Syncverse Room Chat Transcript" in content
         assert "First message introducing" in content
         assert "极佳的电影配乐" in content
 
@@ -283,10 +283,10 @@ def test_6_cli_verify_intent_harness():
 
 def main():
     print("==============================================================================")
-    print(" EMPIRICAL ADVERSARIAL CHALLENGE SUITE: syncplay-core (CLI & Coordinator) ")
+    print(" EMPIRICAL ADVERSARIAL CHALLENGE SUITE: syncverse-core (CLI & Coordinator) ")
     print("==============================================================================")
 
-    assert os.path.exists(BINARY_PATH), f"Binary {BINARY_PATH} does not exist. Run 'cargo build --bin syncplay-alt' first."
+    assert os.path.exists(BINARY_PATH), f"Binary {BINARY_PATH} does not exist. Run 'cargo build --bin syncverse' first."
 
     test_1_cli_banner_usage_version()
     test_2_cli_inspect_adversarial()
@@ -296,7 +296,7 @@ def main():
     test_6_cli_verify_intent_harness()
 
     print("\n==============================================================================")
-    print(" ALL EMPIRICAL CHALLENGES FOR syncplay-core PASSED CLEANLY (0 ERRORS). ")
+    print(" ALL EMPIRICAL CHALLENGES FOR syncverse-core PASSED CLEANLY (0 ERRORS). ")
     print("==============================================================================")
 
 

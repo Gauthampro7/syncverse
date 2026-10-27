@@ -31,7 +31,7 @@ def test_rust_milestone4_adversarial_suite():
         cargo_bin,
         "test",
         "-p",
-        "syncplay-core",
+        "syncverse-core",
         "--test",
         "adversarial_milestone4_interactive_stress",
         "--",

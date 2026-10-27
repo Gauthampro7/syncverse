@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Empirical Adversarial Challenge Test Harness for Matroska / EBML Demuxer
-Crate: crates/syncplay-demux/src/ebml.rs
+Crate: crates/syncverse-demux/src/ebml.rs
 
 Executes tests for:
 1. Frame lacing unpacking (Xiph, Fixed, EBML signed deltas, VINT overflows, and reserved ID defect).
@@ -13,7 +13,7 @@ import sys
 import subprocess
 
 def run_cargo_test(test_name: str = "") -> bool:
-    cmd = ["cargo", "test", "-p", "syncplay-demux", "--test", "ebml_adversarial_challenge"]
+    cmd = ["cargo", "test", "-p", "syncverse-demux", "--test", "ebml_adversarial_challenge"]
     if test_name:
         cmd.extend(["--", test_name, "--nocapture"])
     else:
@@ -33,7 +33,7 @@ def run_cargo_test(test_name: str = "") -> bool:
 def main():
     print("==============================================================================")
     print(" EMPIRICAL ADVERSARIAL CHALLENGE: MATROSKA / EBML DEMUXER")
-    print(" Target: crates/syncplay-demux/src/ebml.rs")
+    print(" Target: crates/syncverse-demux/src/ebml.rs")
     print("==============================================================================")
 
     print("\n>>> [1/3] Running Frame Lacing Adversarial Stress & Defect Tests...")

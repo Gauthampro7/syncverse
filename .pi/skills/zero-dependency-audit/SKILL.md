@@ -7,7 +7,7 @@ version: 1.0.0
 # Skill: Zero-Dependency Audit
 
 ## Overview
-This skill defines the procedures and scripts for auditing the Syncplay-Alt workspace to ensure strict adherence to the **Zero-External-Codec Invariant**. It prevents accidental introduction of forbidden multimedia frameworks, third-party codec bindings, or external database engines.
+This skill defines the procedures and scripts for auditing the Syncverse workspace to ensure strict adherence to the **Zero-External-Codec Invariant**. It prevents accidental introduction of forbidden multimedia frameworks, third-party codec bindings, or external database engines.
 
 ---
 
@@ -80,7 +80,7 @@ The workspace enforces this rule via `scripts/audit_dependencies.sh`:
 set -euo pipefail
 
 # ==============================================================================
-# Syncplay-Alt Zero-Dependency & Forbidden Framework Audit Script
+# Syncverse Zero-Dependency & Forbidden Framework Audit Script
 # Authoritative specification: AGENTS.md Section 2.1
 # ==============================================================================
 

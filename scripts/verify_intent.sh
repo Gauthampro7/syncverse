@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Syncplay-Alt Pi Framework Intent Verification Script
+# Syncverse Pi Framework Intent Verification Script
 # Authority: AGENTS.md & .pi/harness/intent_matrix.json
 # ==============================================================================
 set -euo pipefail

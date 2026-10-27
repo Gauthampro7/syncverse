@@ -96,7 +96,7 @@ def test_cargo_adversarial_suite():
         cargo_bin,
         "test",
         "-p",
-        "syncplay-core",
+        "syncverse-core",
         "--test",
         "adversarial_audio_pacer_sink_stress",
         "--",

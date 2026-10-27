@@ -17,7 +17,7 @@ To maintain smooth 60 FPS video presentation and avoid audio buffer underruns, m
 
 ```
 [001-demuxer-bitstream] ──┐
-                          ├─► [003-clock-pipeline] (syncplay-clock)
+                          ├─► [003-clock-pipeline] (syncverse-clock)
 [002-codecs-presentation] ┘          │
                                      ├─► [004-network-sync-protocol]
                                      └─► [006-ui-osd-renderer]
@@ -30,7 +30,7 @@ To maintain smooth 60 FPS video presentation and avoid audio buffer underruns, m
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-clock`**:
+- **`crates/syncverse-clock`**:
   - `src/clock/master.rs`: Monotonic clock time base, PTS tracking, continuous re-anchoring.
   - `src/clock/scheduler.rs`: Presentation decision window (early wait, on-time present, late drop).
   - `src/spsc/ring_buffer.rs`: 128-byte cache-aligned SPSC lock-free ring buffer.
@@ -68,13 +68,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crate
-cargo check -p syncplay-clock
+cargo check -p syncverse-clock
 
 # 2. Run unit and multi-threaded stress tests
-cargo test -p syncplay-clock -- --nocapture
+cargo test -p syncverse-clock -- --nocapture
 
 # 3. Verify zero banned dependencies
-cargo tree -p syncplay-clock --edges no-dev
+cargo tree -p syncverse-clock --edges no-dev
 ```
 
 Expected output: SPSC multi-threaded stress test passing 1,000,000 items across threads without deadlocks or data loss; clock continuity verified under rate adjustments.

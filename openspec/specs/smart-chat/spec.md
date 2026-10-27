@@ -1,6 +1,6 @@
-# Capability Specification: Smart In-Player Chat & Storage Engine (`syncplay-chat`)
+# Capability Specification: Smart In-Player Chat & Storage Engine (`syncverse-chat`)
 
-**Component**: `syncplay-chat`  
+**Component**: `syncverse-chat`  
 **Standards Compliance**: Custom Binary Framing (`SPCH`), IEEE 802.3 CRC32, Unicode Standard Case Folding  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,7 +8,7 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-chat` crate provides a zero-dependency, locally persisted in-player chat system, full-text search engine, and slash-command media control interface. Unlike external chat implementations that embed heavyweight SQL engines (`sqlite`, `rocksdb`) or separate daemon services, `syncplay-chat` is implemented natively in pure Rust.
+The `syncverse-chat` crate provides a zero-dependency, locally persisted in-player chat system, full-text search engine, and slash-command media control interface. Unlike external chat implementations that embed heavyweight SQL engines (`sqlite`, `rocksdb`) or separate daemon services, `syncverse-chat` is implemented natively in pure Rust.
 
 The engine features:
 1. **Dual-Temporal Coordinate Model**: Every record anchors to both physical UTC wall time ($t_{wall}$) and media playback presentation timestamp ($t_{media}$).
@@ -181,5 +181,5 @@ The chat engine SHALL support exporting stored conversation history in two stand
 #### Scenario: Export Room Transcript to Markdown
 - **Given** a session with two anchored messages
 - **When** `export_transcript(TranscriptFormat::Markdown)` is invoked
-- **Then** the generated string contains header `# Syncplay-Alt Room Chat Transcript`
+- **Then** the generated string contains header `# Syncverse Room Chat Transcript`
 - **And** each line includes the formatted media timestamp `[HH:MM:SS.mmm]` and sender handle `<Name>`.

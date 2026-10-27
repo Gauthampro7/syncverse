@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 def test_player_ui_snapshot_memory_layout():
     print("\n--- [CHALLENGE 1/4] PlayerUiSnapshot Memory Layout & Bitflags Oracle ---")
 
-    # In syncplay-ui/src/snapshot.rs:
+    # In syncverse-ui/src/snapshot.rs:
     # #[repr(C)]
     # pub struct PlayerUiSnapshot {
     #     pub monotonic_timestamp: u64,      // 8 bytes (offset 0..8)
@@ -304,7 +304,7 @@ def test_execute_rust_concurrency_stress_suite():
         cargo_bin,
         "test",
         "-p",
-        "syncplay-core",
+        "syncverse-core",
         "--test",
         "unpause_gate_and_peer_diagnostics_integration",
         "--",
@@ -323,7 +323,7 @@ def test_execute_rust_concurrency_stress_suite():
         cargo_bin,
         "test",
         "-p",
-        "syncplay-ui",
+        "syncverse-ui",
         "--test",
         "adversarial_challenge",
         "--",

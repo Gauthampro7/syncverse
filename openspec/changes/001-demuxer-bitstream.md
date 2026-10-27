@@ -9,14 +9,14 @@
 
 ## 1. Context & Motivation
 
-To fulfill the zero-external-codec architectural invariant, Syncplay-Alt cannot rely on FFmpeg or GStreamer to demux media containers. This change establishes the foundational container parsers for Matroska (EBML/MKV/WebM) and ISOBMFF (MP4/MOV) in pure, safe Rust.
+To fulfill the zero-external-codec architectural invariant, Syncverse cannot rely on FFmpeg or GStreamer to demux media containers. This change establishes the foundational container parsers for Matroska (EBML/MKV/WebM) and ISOBMFF (MP4/MOV) in pure, safe Rust.
 
 ---
 
 ## 2. Dependency Graph
 
 ```
-[001-demuxer-bitstream] (Roots: syncplay-common, syncplay-demux)
+[001-demuxer-bitstream] (Roots: syncverse-common, syncverse-demux)
          │
          ▼
 [002-codecs-presentation]
@@ -32,8 +32,8 @@ To fulfill the zero-external-codec architectural invariant, Syncplay-Alt cannot 
 
 ## 3. Affected Crates & Components
 
-- **`crates/syncplay-common`**: Byte reading utilities (`ByteReader`), `MediaTime` type, common error abstractions.
-- **`crates/syncplay-demux`**:
+- **`crates/syncverse-common`**: Byte reading utilities (`ByteReader`), `MediaTime` type, common error abstractions.
+- **`crates/syncverse-demux`**:
   - `src/ebml/vint.rs`: RFC 8794 Variable-Length Integer (VINT) parser.
   - `src/ebml/elements.rs`: Matroska Element ID definitions and Master element parser.
   - `src/ebml/simple_block.rs`: SimpleBlock binary wire parser (keyframe flag, relative timestamp, lacing).
@@ -69,13 +69,13 @@ Execute the following commands from the repository root:
 
 ```bash
 # 1. Type and borrow check affected crates
-cargo check -p syncplay-common -p syncplay-demux
+cargo check -p syncverse-common -p syncverse-demux
 
 # 2. Run unit tests including synthetic test vector parsing
-cargo test -p syncplay-demux -- --nocapture
+cargo test -p syncverse-demux -- --nocapture
 
 # 3. Verify zero external media dependencies in manifest
-cargo tree -p syncplay-demux --edges no-dev
+cargo tree -p syncverse-demux --edges no-dev
 ```
 
 Expected output: All unit tests pass with zero warnings, and the dependency tree contains only workspace crates and permitted utilities.

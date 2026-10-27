@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Syncplay-Alt Phase 4 Non-Root Dependency Provisioning Helper
+# Syncverse Phase 4 Non-Root Dependency Provisioning Helper
 # Target OS: Fedora Linux 44+ (x86_64)
 # Authority: AGENTS.md Section 2 & ORIGINAL_REQUEST.md (Phase 4 Realignment)
 #
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEPS_DIR="${SYNCPLAY_DEPS_DIR:-$ROOT_DIR/.deps}"
+DEPS_DIR="${SYNCVERSE_DEPS_DIR:-${SYNCPLAY_DEPS_DIR:-$ROOT_DIR/.deps}}"
 FORCE_REBUILD=0
 
 for arg in "$@"; do
@@ -36,7 +36,7 @@ for arg in "$@"; do
 done
 
 echo "=============================================================================="
-echo " Syncplay-Alt Phase 4 Dependency Provisioner"
+echo " Syncverse Phase 4 Dependency Provisioner"
 echo " Sysroot Target: $DEPS_DIR"
 echo "=============================================================================="
 
@@ -143,7 +143,7 @@ GCC_INC=$(gcc --print-file-name=include 2>/dev/null || echo "/usr/lib/gcc/x86_64
 # 1. Shell environment script (source .deps/env.sh)
 ENV_FILE="$DEPS_DIR/env.sh"
 cat << EOF > "$ENV_FILE"
-# Syncplay-Alt Phase 4 User-Space Dependency Environment
+# Syncverse Phase 4 User-Space Dependency Environment
 # Usage: source "$ENV_FILE"
 export DEPS_DIR="$DEPS_DIR"
 export LIBCLANG_PATH="$DEPS_DIR/usr/lib64"

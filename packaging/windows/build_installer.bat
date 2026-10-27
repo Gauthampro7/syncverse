@@ -1,6 +1,6 @@
 @echo off
 rem ==============================================================================
-rem Syncplay-Alt Windows Installer Build Batch Script
+rem Syncverse Windows Installer Build Batch Script
 rem ==============================================================================
 
 setlocal enabledelayedexpansion
@@ -8,11 +8,11 @@ pushd "%~dp0..\.."
 set "PROJECT_ROOT=%CD%"
 
 echo ==========================================================
-echo  Syncplay-Alt Windows Installer Builder
+echo  Syncverse Windows Installer Builder
 echo ==========================================================
 
-echo [1/3] Compiling syncplay-alt in release mode...
-cargo build --release --bin syncplay-alt
+echo [1/3] Compiling syncverse in release mode...
+cargo build --release --bin syncverse
 if errorlevel 1 (
     echo [ERROR] Cargo release build failed.
     popd

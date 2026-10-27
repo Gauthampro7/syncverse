@@ -1,0 +1,11 @@
+[package]
+name = "syncverse-chat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+syncverse-common = { path = "../syncverse-common" }
+syncverse-sync = { path = "../syncverse-sync" }
+thiserror.workspace = true

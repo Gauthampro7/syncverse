@@ -7,7 +7,7 @@ version: 1.0.0
 # Skill: Network Sync Simulation
 
 ## Overview
-This skill defines the procedures for building and running deterministic, in-memory simulations of the network synchronization protocol (`syncplay-sync`). It allows agents to verify the accuracy of the NTP clock filter, the stability and convergence of the discrete PI PLL speed controller, and the timing margins of the two-phase barrier unpause coordinator without live sockets or external network infrastructure.
+This skill defines the procedures for building and running deterministic, in-memory simulations of the network synchronization protocol (`syncverse-sync`). It allows agents to verify the accuracy of the NTP clock filter, the stability and convergence of the discrete PI PLL speed controller, and the timing margins of the two-phase barrier unpause coordinator without live sockets or external network infrastructure.
 
 ---
 
@@ -74,7 +74,7 @@ Verify the two-phase commit unpause sequence across simulated peers:
 
 Run the sync simulation harness:
 ```bash
-cargo test -p syncplay-sync -- --nocapture
+cargo test -p syncverse-sync -- --nocapture
 python3 tests/empirical_challenge/test_sync_engine.py
 ```
 Assert that all convergence, stability, and margin tests pass with 0 errors.

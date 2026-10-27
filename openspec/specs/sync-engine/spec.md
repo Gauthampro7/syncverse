@@ -1,6 +1,6 @@
-# Capability Specification: Network Synchronization Protocol (`syncplay-sync`)
+# Capability Specification: Network Synchronization Protocol (`syncverse-sync`)
 
-**Component**: `syncplay-sync`  
+**Component**: `syncverse-sync`  
 **Standards Compliance**: RFC 5905 (Network Time Protocol v4), Discrete Control Theory (Critically Damped PI Controller)  
 **Status**: Authoritative OpenSpec Specification  
 
@@ -8,9 +8,9 @@
 
 ## 1. Overview & Architectural Role
 
-The `syncplay-sync` crate implements long-distance, high-latency watch-party synchronization over wide-area networks. In transatlantic and transcontinental sessions, participants routinely experience 250–400ms RTT and $\pm 30\text{ms}$ packet jitter. Under such conditions, naive synchronization strategies that issue hard seeks or naive rate throttling cause unwatchable video stutter and jarring audio pitch warble.
+The `syncverse-sync` crate implements long-distance, high-latency watch-party synchronization over wide-area networks. In transatlantic and transcontinental sessions, participants routinely experience 250–400ms RTT and $\pm 30\text{ms}$ packet jitter. Under such conditions, naive synchronization strategies that issue hard seeks or naive rate throttling cause unwatchable video stutter and jarring audio pitch warble.
 
-`syncplay-sync` provides:
+`syncverse-sync` provides:
 1. **NTP 4-Timestamp Probe Exchange**: Symmetric offset estimation with RFC 5905 sliding-window minimum RTT filtering to bypass asymmetric queueing noise.
 2. **Deterministic Reference Timeline Equation**: Exact mapping between room master state and local presentation time.
 3. **Tri-Zone Phase-Locked Loop (PLL) Micro-Speed Drift Controller**: A discrete Proportional-Integral (PI) controller operating within an imperceptible $\pm 4\%$ speed envelope ($r \in [0.96, 1.04]$) to steer phase error into a $< 15\text{ ms}$ deadband without hard seeks for drifts under $1.5\text{ seconds}$.

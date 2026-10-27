@@ -1,26 +1,26 @@
-# Project: Syncplay-Alt Phase 5 (Watch-Party Social & Auto-Update Polish)
+# Project: Syncverse (Standalone Media Player & Synchronized Watch-Party Engine)
 
 ## Architecture
-Syncplay-Alt is a standalone native desktop media player and synchronized watch-party platform in pure Rust. Phase 5 adds social polish, peer media matching diagnostics, peer readiness tracking with a strict playback unpause gate, room activity announcements, and automated GitHub release update checking.
+Syncverse is an open-source, ultra-efficient standalone native desktop media player and synchronized watch-party platform in pure Rust under the MIT License. It features social polish, peer media matching diagnostics, peer readiness tracking with a strict playback unpause gate, room activity announcements, and automated GitHub release update checking.
 
 ### Subsystem Interaction & Data Flow
-1. **Auto-Updater (`syncplay-ui/src/gui/updater.rs`)**:
+1. **Auto-Updater (`syncverse-ui/src/gui/updater.rs`)**:
    - Asynchronous worker queries GitHub Releases API on startup and via Help menu.
    - Normalizes semver tags and compares with `CARGO_PKG_VERSION`.
    - Dispatches `UiEvent::UpdateAvailable` to egui.
    - Renders top banner with download/release link and dismiss button.
 
-2. **Wire Protocol & Peer State (`syncplay-sync/src/wire.rs`, `syncplay-sync/src/transport.rs`)**:
+2. **Wire Protocol & Peer State (`syncverse-sync/src/wire.rs`, `syncverse-sync/src/transport.rs`)**:
    - New wire packet `PeerStatus` (opcode `0x09`) encapsulates peer media metadata (filename, duration_ms, file_size_bytes) and persistent user readiness (`is_ready`).
    - `ClientSession` tracks persistent `is_user_ready`, distinct from transient `barrier_preroll_ready`.
    - Host broadcasts peer status updates to all room members over UDP.
 
-3. **Room Announcements & Chat Persistence (`syncplay-chat`, `syncplay-core`)**:
+3. **Room Announcements & Chat Persistence (`syncverse-chat`, `syncverse-core`)**:
    - Key room events (media loaded, ready/unready, pause, resume, seek, gate waiting) format standardized chat announcements with emojis.
    - Broadcast via `ChatMessage` (`0x08`) over UDP.
    - Stored in `syncplay_chat.bin` with `0xAA55` framing and CRC32; indexed in in-memory inverted index FTS.
 
-4. **UI Sidebar, Diagnostics & Unpause Gate (`syncplay-ui`, `syncplay-core`)**:
+4. **UI Sidebar, Diagnostics & Unpause Gate (`syncverse-ui`, `syncverse-core`)**:
    - `RoomMember` holds peer media info, duration, and readiness.
    - Sidebar displays `[✓ Ready]` / `[⏳ Not Ready]`, peer duration `HH:MM:SS` (or `[⏳ No file loaded]`), and `[Match ✔]` / `[⚠️ Mismatch]` badges.
    - Unpause gate in `playback_runtime.rs` intercepts unpause commands: halts if any peer is unready/unloaded unless Host "Force Play" bypass is active.
@@ -33,7 +33,7 @@ Every feature from the Survey phase and user request:
 
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | GitHub Releases API Querying | Query `https://api.github.com/repos/Gauthampro7/syncplay-desktop-preview/releases/latest` asynchronously with timeouts & rate limit handling | M1 | ORIGINAL_REQUEST §R1 |
+| 1 | GitHub Releases API Querying | Query `https://api.github.com/repos/Gauthampro7/syncverse/releases/latest` asynchronously with timeouts & rate limit handling | M1 | ORIGINAL_REQUEST §R1 |
 | 2 | Semver Parsing & Comparison | Normalize `vX.Y.Z` and compare against `CARGO_PKG_VERSION` | M1 | ORIGINAL_REQUEST §R1 |
 | 3 | Auto-Update UI Banner & Actions | Top notification banner with 1-click download/release page link and Dismiss button | M1 | ORIGINAL_REQUEST §R1 |
 | 4 | Help Menu "Check for Updates" | Manual menu trigger under Help menu | M1 | ORIGINAL_REQUEST §R1 |
@@ -70,7 +70,7 @@ Every feature from the Survey phase and user request:
 
 ## Interface Contracts
 
-### 1. `syncplay-sync` Wire Protocol (`crates/syncplay-sync/src/wire.rs`)
+### 1. `syncverse-sync` Wire Protocol (`crates/syncverse-sync/src/wire.rs`)
 ```rust
 pub const PACKET_TYPE_PEER_STATUS: u8 = 0x09;
 
@@ -86,9 +86,9 @@ pub struct PeerStatusPayload {
 }
 ```
 
-### 2. `syncplay-ui` Events & Commands (`crates/syncplay-ui/src/`)
+### 2. `syncverse-ui` Events & Commands (`crates/syncverse-ui/src/`)
 ```rust
-// In crates/syncplay-ui/src/event.rs
+// In crates/syncverse-ui/src/event.rs
 pub enum UiEvent {
     NewChatRecord(ChatRecord),
     RoomMembersUpdated(Vec<RoomMember>),
@@ -97,16 +97,15 @@ pub enum UiEvent {
     UpdateChecked { is_latest: bool, current_version: String },
 }
 
-// In crates/syncplay-ui/src/command.rs
+// In crates/syncverse-ui/src/command.rs
 pub enum PlayerCommand {
-    // Existing...
     SetReady(bool),
     SetForcePlay(bool),
     ForcePlay,
     CheckForUpdates,
 }
 
-// In crates/syncplay-ui/src/gui/sidebar.rs
+// In crates/syncverse-ui/src/gui/sidebar.rs
 pub struct RoomMember {
     pub username: String,
     pub is_local: bool,
@@ -119,7 +118,7 @@ pub struct RoomMember {
 }
 ```
 
-### 3. `syncplay-chat` Room Announcements (`crates/syncplay-chat/src/announcements.rs`)
+### 3. `syncverse-chat` Room Announcements (`crates/syncverse-chat/src/announcements.rs`)
 ```rust
 pub struct RoomAnnouncement;
 impl RoomAnnouncement {
@@ -136,13 +135,13 @@ impl RoomAnnouncement {
 ---
 
 ## Code Layout
-- `crates/syncplay-sync/src/wire.rs`: Wire packet definitions, `PeerStatusPayload`, (de)serialization.
-- `crates/syncplay-sync/src/transport.rs`: `ClientSession` state, `HostServer` and `ClientNode` peer status handling.
-- `crates/syncplay-sync/tests/`: Integration tests, updated negative opcode assertions.
-- `crates/syncplay-ui/src/gui/updater.rs`: Asynchronous GitHub releases checker, semver comparison, browser launcher.
-- `crates/syncplay-ui/src/gui/sidebar.rs`: Room members rendering, media info, match badges, readiness checkbox.
-- `crates/syncplay-ui/src/gui/app.rs`: Top update banner, Help menu item, event draining.
-- `crates/syncplay-ui/src/snapshot.rs`: 72-byte `PlayerUiSnapshot` layout and bitflag helpers.
-- `crates/syncplay-chat/src/announcements.rs`: Standardized announcement formatting.
-- `crates/syncplay-core/src/playback_runtime.rs`: Unpause gate logic, force play bypass, room event hooks.
-- `tests/e2e/`: Opaque-box E2E test suite.
+- `crates/syncverse-sync/src/wire.rs`: Wire packet definitions, `PeerStatusPayload`, (de)serialization.
+- `crates/syncverse-sync/src/transport.rs`: `ClientSession` state, `HostServer` and `ClientNode` peer status handling.
+- `crates/syncverse-sync/tests/`: Integration tests, updated negative opcode assertions.
+- `crates/syncverse-ui/src/gui/updater.rs`: Asynchronous GitHub releases checker, semver comparison, browser launcher.
+- `crates/syncverse-ui/src/gui/sidebar.rs`: Room members rendering, media info, match badges, readiness checkbox.
+- `crates/syncverse-ui/src/gui/app.rs`: Top update banner, Help menu item, event draining.
+- `crates/syncverse-ui/src/snapshot.rs`: 72-byte `PlayerUiSnapshot` layout and bitflag helpers.
+- `crates/syncverse-chat/src/announcements.rs`: Standardized announcement formatting.
+- `crates/syncverse-core/src/playback_runtime.rs`: Unpause gate logic, force play bypass, room event hooks.
+- `tests/e2e_phase5/`: Opaque-box E2E test suite.

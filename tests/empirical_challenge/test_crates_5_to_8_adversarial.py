@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Empirical Challenge & Boundary Stress Test Suite for Crates 5 to 8:
-- syncplay-sync (NTP filter, discrete PI PLL micro-speed, two-phase barrier unpause)
-- syncplay-chat (binary log crash recovery, false-sync resilience, CJK inverted index FTS, slash commands)
-- syncplay-ui (120Hz scrubber debouncer, 5-bubble memory bound, Alpha8 atlas footprint, SPSC triple buffer)
-- syncplay-core (telemetry aggregator, runtime coordinator)
+- syncverse-sync (NTP filter, discrete PI PLL micro-speed, two-phase barrier unpause)
+- syncverse-chat (binary log crash recovery, false-sync resilience, CJK inverted index FTS, slash commands)
+- syncverse-ui (120Hz scrubber debouncer, 5-bubble memory bound, Alpha8 atlas footprint, SPSC triple buffer)
+- syncverse-core (telemetry aggregator, runtime coordinator)
 """
 
 import sys

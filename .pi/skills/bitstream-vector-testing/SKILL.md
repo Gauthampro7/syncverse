@@ -7,7 +7,7 @@ version: 1.0.0
 # Skill: Bitstream Vector Testing
 
 ## Overview
-This skill provides the methodologies, bit-level vector definitions, and verification procedures for testing zero-dependency container demuxers (`syncplay-demux`) using synthetic, in-tree test vectors. Large multimedia files are prohibited; all container headers and stream packets must be generated deterministically in memory.
+This skill provides the methodologies, bit-level vector definitions, and verification procedures for testing zero-dependency container demuxers (`syncverse-demux`) using synthetic, in-tree test vectors. Large multimedia files are prohibited; all container headers and stream packets must be generated deterministically in memory.
 
 ---
 
@@ -92,7 +92,7 @@ $$\text{PTS}_{\text{ms}} = \left\lfloor \frac{(\text{ClusterTimecode} + \text{Bl
 
 Run the test suite:
 ```bash
-cargo test -p syncplay-demux -- --nocapture
+cargo test -p syncverse-demux -- --nocapture
 python3 tests/empirical_challenge/test_demux_codecs_clock.py
 ```
 Assert all tests pass cleanly.

@@ -1,4 +1,4 @@
-# E2E Test Infra: Syncplay-Alt Phase 5 (Watch-Party Social & Auto-Update Polish)
+# E2E Test Infra: Syncverse Phase 5 (Watch-Party Social & Auto-Update Polish)
 
 ## Test Philosophy
 - Opaque-box, requirement-driven. Derived from `ORIGINAL_REQUEST.md` and user-facing specifications, not internal private structures.

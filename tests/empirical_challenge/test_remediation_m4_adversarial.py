@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-USER_BIN = Path.home() / ".local" / "bin" / "syncplay-alt"
+USER_BIN = Path.home() / ".local" / "bin" / "syncverse"
 
 SYNTHETIC_EBML_VECTOR = bytes([
     0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01, 0x42, 0xF7, 0x81, 0x01,
@@ -44,13 +44,13 @@ SYNTHETIC_EBML_VECTOR = bytes([
 def get_binary_path() -> Path:
     if USER_BIN.exists() and os.access(USER_BIN, os.X_OK):
         return USER_BIN
-    target_rel = ROOT / "target" / "release" / "syncplay-alt"
+    target_rel = ROOT / "target" / "release" / "syncverse"
     if target_rel.exists() and os.access(target_rel, os.X_OK):
         return target_rel
-    target_dbg = ROOT / "target" / "debug" / "syncplay-alt"
+    target_dbg = ROOT / "target" / "debug" / "syncverse"
     if target_dbg.exists() and os.access(target_dbg, os.X_OK):
         return target_dbg
-    raise RuntimeError("No executable syncplay-alt binary found!")
+    raise RuntimeError("No executable syncverse binary found!")
 
 
 def run_pty_interactive(cols: int, rows: int, target: str, wait_secs: float = 0.5) -> tuple[int, bytes]:
@@ -67,7 +67,7 @@ def run_pty_interactive(cols: int, rows: int, target: str, wait_secs: float = 0.
         os.dup2(slave, 1)
         os.dup2(slave, 2)
         os.close(slave)
-        os.execl(bin_path, "syncplay-alt", "play", target)
+        os.execl(bin_path, "syncverse", "play", target)
         sys.exit(1)
 
     os.close(slave)
@@ -229,7 +229,7 @@ def test_party_mode_uri_integration():
 
 def test_packaging_and_xdg():
     print("--- [4/4] Desktop Packaging & System Invariants ---")
-    desktop_file = Path.home() / ".local" / "share" / "applications" / "syncplay-alt.desktop"
+    desktop_file = Path.home() / ".local" / "share" / "applications" / "syncverse.desktop"
     assert desktop_file.exists(), f"Desktop file missing at {desktop_file}"
 
     if shutil.which("desktop-file-validate"):
@@ -242,7 +242,7 @@ def test_packaging_and_xdg():
         for mime in ["video/x-matroska", "video/mp4", "video/webm", "video/quicktime"]:
             res = subprocess.run(["gio", "mime", mime], capture_output=True, text=True)
             assert res.returncode == 0, f"gio mime {mime} failed: {res.stderr}"
-            assert "syncplay-alt.desktop" in res.stdout, f"syncplay-alt.desktop not registered for {mime}"
+            assert "syncverse.desktop" in res.stdout, f"syncverse.desktop not registered for {mime}"
         print("  [PASS] All 4 required MIME associations verified in GIO.")
 
     # GTK4 Icon
@@ -251,8 +251,8 @@ def test_packaging_and_xdg():
         gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk
         theme = Gtk.IconTheme.new()
-        assert theme.has_icon("syncplay-alt"), "GTK4 IconTheme failed to find syncplay-alt icon"
-        print("  [PASS] GTK4 IconTheme discovered syncplay-alt scalable vector icon.")
+        assert theme.has_icon("syncverse"), "GTK4 IconTheme failed to find syncverse icon"
+        print("  [PASS] GTK4 IconTheme discovered syncverse scalable vector icon.")
     except Exception as e:
         print(f"  [WARN] GTK4 check skipped: {e}")
 

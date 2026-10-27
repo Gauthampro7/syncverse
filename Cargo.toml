@@ -1,22 +1,25 @@
 [workspace]
 members = [
-    "crates/syncplay-common",
-    "crates/syncplay-demux",
-    "crates/syncplay-codecs",
-    "crates/syncplay-clock",
-    "crates/syncplay-sync",
-    "crates/syncplay-chat",
-    "crates/syncplay-ui",
-    "crates/syncplay-core",
+    "crates/syncverse-common",
+    "crates/syncverse-demux",
+    "crates/syncverse-codecs",
+    "crates/syncverse-clock",
+    "crates/syncverse-sync",
+    "crates/syncverse-chat",
+    "crates/syncverse-ui",
+    "crates/syncverse-core",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-authors = ["Gautham <gautham@syncplay-alt.internal>"]
-license = "MIT OR Apache-2.0"
+authors = ["Gautham <gautham@syncverse.internal>"]
+license = "MIT"
+repository = "https://github.com/Gauthampro7/syncverse"
+description = "Ultra-efficient standalone desktop media player and long-distance synchronized watch-party platform in pure Rust"
 
 [workspace.dependencies]
 thiserror = "2.0"
 ffmpeg-next = "9.0.0"
+

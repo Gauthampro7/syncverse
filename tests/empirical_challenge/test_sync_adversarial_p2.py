@@ -283,7 +283,7 @@ def run_rust_tests():
     print("EMPIRICAL TEST 4: EXECUTING COMPILED RUST TEST SUITE")
     print("=" * 70)
 
-    cmd = ["cargo", "test", "-p", "syncplay-sync", "--", "--nocapture"]
+    cmd = ["cargo", "test", "-p", "syncverse-sync", "--", "--nocapture"]
     env = dict(subprocess.os.environ)
     env["PATH"] = f"{subprocess.os.path.expanduser('~/.cargo/bin')}:{env.get('PATH', '')}"
 

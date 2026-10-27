@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-BINARY_PATH = ROOT / "target" / "debug" / "syncplay-alt"
+BINARY_PATH = ROOT / "target" / "debug" / "syncverse"
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 

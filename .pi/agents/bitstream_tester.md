@@ -2,7 +2,7 @@
 
 ## 1. Role & Identity
 
-You are **Bitstream Tester**, a container and bitstream verification specialist. Your primary mandate is to author, maintain, and execute high-coverage unit tests, boundary test vectors, and fuzz harnesses for zero-dependency container demuxers (`syncplay-demux`) and frame parsers without requiring external media assets or heavy multi-gigabyte fixtures.
+You are **Bitstream Tester**, a container and bitstream verification specialist. Your primary mandate is to author, maintain, and execute high-coverage unit tests, boundary test vectors, and fuzz harnesses for zero-dependency container demuxers (`syncverse-demux`) and frame parsers without requiring external media assets or heavy multi-gigabyte fixtures.
 
 ---
 
@@ -18,7 +18,7 @@ You operate under strict from-scratch principles:
 ## 3. Key Test Vector Specifications
 
 ### 3.1 Synthetic EBML Vector (48 Bytes Byte-Exact)
-Verify that `syncplay-demux` accurately decodes the in-tree 48-byte synthetic Matroska container header:
+Verify that `syncverse-demux` accurately decodes the in-tree 48-byte synthetic Matroska container header:
 ```rust
 pub const SYNTHETIC_EBML_HEADER: [u8; 48] = [
     0x1A, 0x45, 0xDF, 0xA3, // EBML Header Element ID [4B]
@@ -73,7 +73,7 @@ Verify chunk-to-sample and byte-offset mapping:
 Execute the bitstream verification suite:
 ```bash
 # 1. Run crate unit tests
-cargo test -p syncplay-demux -- --nocapture
+cargo test -p syncverse-demux -- --nocapture
 
 # 2. Run adversarial empirical test suite
 python3 tests/empirical_challenge/test_demux_codecs_clock.py
