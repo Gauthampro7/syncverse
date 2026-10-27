@@ -71,7 +71,7 @@ def simulate_audit_cargo_toml(cargo_toml_content: str, banned_patterns: List[str
         with open(toml_path, "w") as f:
             f.write(cargo_toml_content)
         
-        script_path = "/home/gautham/syncplay-alt/scripts/audit_dependencies.sh"
+        script_path = "/home/gautham/syncverse/scripts/audit_dependencies.sh"
         if os.path.exists(script_path):
             res = subprocess.run([script_path], cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return res.returncode != 0
@@ -94,7 +94,7 @@ def simulate_audit_cargo_lock(cargo_lock_content: str, banned_patterns: List[str
         with open(lock_path, "w") as f:
             f.write(cargo_lock_content)
         
-        script_path = "/home/gautham/syncplay-alt/scripts/audit_dependencies.sh"
+        script_path = "/home/gautham/syncverse/scripts/audit_dependencies.sh"
         if os.path.exists(script_path):
             res = subprocess.run([script_path], cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return res.returncode != 0
@@ -183,11 +183,11 @@ def test_storage_auditor_framing_ambiguity():
     print("=" * 60)
     
     # Import authoritative recovery scanner and header generator from test_smart_chat
-    sys.path.insert(0, "/home/gautham/syncplay-alt/tests/empirical_challenge")
+    sys.path.insert(0, "/home/gautham/syncverse/tests/empirical_challenge")
     from test_smart_chat import make_header, ChatRecoveryScanner, SYNC_WORD
     
     findings = []
-    prompt_path = "/home/gautham/syncplay-alt/.pi/agents/storage_auditor.md"
+    prompt_path = "/home/gautham/syncverse/.pi/agents/storage_auditor.md"
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
             prompt_content = f.read()
@@ -312,7 +312,7 @@ def test_skill_reproducibility():
         print(f"  [PASS] bitstream-vector-testing/SKILL.md MP4 vector executes cleanly (132B, 3 nested boxes).")
 
     # 3.2 Verify OpenSpec Change Proposal Dependency Graph DAG
-    changes_dir = "/home/gautham/syncplay-alt/openspec/changes"
+    changes_dir = "/home/gautham/syncverse/openspec/changes"
     change_files = sorted([f for f in os.listdir(changes_dir) if f.endswith(".md")])
     
     import re

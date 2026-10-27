@@ -5,8 +5,8 @@ Author: challenger_p3_m5_integration (critic / specialist)
 
 Verification targets:
 1. Multi-Peer Watch-Party CLI Integration:
-   - Spawns host: syncplay-alt party host --port 19999 --file synthetic-full-mkv
-   - Spawns client: syncplay-alt party connect 127.0.0.1:19999 --file synthetic-full-mkv
+   - Spawns host: syncverse party host --port 19999 --file synthetic-full-mkv
+   - Spawns client: syncverse party connect 127.0.0.1:19999 --file synthetic-full-mkv
    - Concurrent host-client execution & port contention handling
    - Verification of bidirectional packet transmission, NTP clock exchange, and barrier unpause agreement
 2. CLI Stress and Edge Cases:
@@ -53,7 +53,7 @@ def test_watch_party_cli_integration():
     print("\n--- [PART 1/2] Multi-Peer Watch-Party CLI Integration ---")
 
     # 1. Spawn Host on port 19999 with synthetic-full-mkv
-    print(">>> [1.1] Executing: syncplay-alt party host --port 19999 --file synthetic-full-mkv")
+    print(">>> [1.1] Executing: syncverse party host --port 19999 --file synthetic-full-mkv")
     stdout, stderr = run_cmd(["party", "host", "--port", "19999", "--file", "synthetic-full-mkv"], expect_exit=0)
     assert "Starting host server on UDP port 19999..." in stdout, f"Unexpected stdout: {stdout}"
     assert "Media file: synthetic-full-mkv" in stdout
@@ -64,7 +64,7 @@ def test_watch_party_cli_integration():
     print("  [PASS] Host CLI command succeeded with complete NTP exchange, barrier unpause, and WAN convergence.")
 
     # 2. Spawn Client on 127.0.0.1:19999 with synthetic-full-mkv
-    print(">>> [1.2] Executing: syncplay-alt party connect 127.0.0.1:19999 --file synthetic-full-mkv")
+    print(">>> [1.2] Executing: syncverse party connect 127.0.0.1:19999 --file synthetic-full-mkv")
     stdout, stderr = run_cmd(["party", "connect", "127.0.0.1:19999", "--file", "synthetic-full-mkv"], expect_exit=0)
     assert "Connecting to watch-party host at 127.0.0.1:19999..." in stdout
     assert "Media file: synthetic-full-mkv" in stdout

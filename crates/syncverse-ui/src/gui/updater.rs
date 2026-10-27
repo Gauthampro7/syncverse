@@ -409,12 +409,12 @@ mod tests {
             "body": "Bugfixes and performance improvements.",
             "assets": [
                 {
-                    "name": "syncplay-alt-linux-x86_64.tar.gz",
-                    "browser_download_url": "https://github.com/downloads/syncplay-alt-linux.tar.gz"
+                    "name": "syncverse-linux-x86_64.tar.gz",
+                    "browser_download_url": "https://github.com/downloads/syncverse-linux.tar.gz"
                 },
                 {
-                    "name": "syncplay-alt-windows-x64.exe",
-                    "browser_download_url": "https://github.com/downloads/syncplay-alt-windows.exe"
+                    "name": "syncverse-windows-x64.exe",
+                    "browser_download_url": "https://github.com/downloads/syncverse-windows.exe"
                 }
             ]
         });
@@ -473,15 +473,15 @@ mod tests {
     fn test_select_asset_for_os() {
         let assets = vec![
             (
-                "syncplay-alt-linux-x86_64.tar.gz".to_string(),
+                "syncverse-linux-x86_64.tar.gz".to_string(),
                 "https://example.com/linux.tar.gz".to_string(),
             ),
             (
-                "syncplay-alt-setup.exe".to_string(),
+                "syncverse-setup.exe".to_string(),
                 "https://example.com/windows.exe".to_string(),
             ),
             (
-                "syncplay-alt.dmg".to_string(),
+                "syncverse.dmg".to_string(),
                 "https://example.com/macos.dmg".to_string(),
             ),
         ];
@@ -595,8 +595,8 @@ mod tests {
                     "html_url": "https://github.com/test/repo/releases/v0.2.0",
                     "assets": [
                         {
-                            "name": "syncplay-alt-linux.tar.gz",
-                            "browser_download_url": "https://github.com/test/download/syncplay-alt-linux.tar.gz"
+                            "name": "syncverse-linux.tar.gz",
+                            "browser_download_url": "https://github.com/test/download/syncverse-linux.tar.gz"
                         }
                     ]
                 }"#;

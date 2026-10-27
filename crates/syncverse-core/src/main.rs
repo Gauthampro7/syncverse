@@ -339,8 +339,8 @@ pub struct PartyCliOptions {
 /// Parses CLI arguments for the `party` subcommand.
 ///
 /// Supports:
-/// - `syncplay-alt party host --port <PORT> --file <MEDIA>`
-/// - `syncplay-alt party connect <HOST:PORT> --file <MEDIA>`
+/// - `syncverse party host --port <PORT> --file <MEDIA>`
+/// - `syncverse party connect <HOST:PORT> --file <MEDIA>`
 /// - Backward-compatible fallback for positional arguments (`party host [PORT]` and `party connect [ADDR]`).
 pub fn parse_party_cli_options(args: &[String]) -> PartyCliOptions {
     let mut mode = "demo".to_string();
@@ -550,7 +550,7 @@ fn run_chat_command(subcmd: &str, extra_args: &[String]) {
         "log" => {
             if extra_args.is_empty() {
                 eprintln!("\x1b[1;31m[ERROR] Please provide a message to log.\x1b[0m");
-                eprintln!("Usage: syncplay-alt chat log <message>");
+                eprintln!("Usage: syncverse chat log <message>");
                 std::process::exit(1);
             }
             let message = extra_args.join(" ");
@@ -592,7 +592,7 @@ fn run_chat_command(subcmd: &str, extra_args: &[String]) {
         "query" => {
             if extra_args.is_empty() {
                 eprintln!("\x1b[1;31m[ERROR] Please provide a search query.\x1b[0m");
-                eprintln!("Usage: syncplay-alt chat query <search_term>");
+                eprintln!("Usage: syncverse chat query <search_term>");
                 std::process::exit(1);
             }
             let query = extra_args.join(" ");
