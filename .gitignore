@@ -24,3 +24,7 @@ Thumbs.db
 .deps/usr/
 .deps/.rpm_cache/
 
+
+# Python bytecode
+__pycache__/
+*.pyc
