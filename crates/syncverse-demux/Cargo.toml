@@ -6,5 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+syncverse-common = { path = "../syncverse-common" }
 thiserror.workspace = true
 ffmpeg-next.workspace = true

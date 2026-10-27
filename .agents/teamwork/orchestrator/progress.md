@@ -1,23 +1,34 @@
 # Progress Tracking — Orchestrator
 
 ## Current Status
-Last visited: 2026-10-27T17:13:00Z
+Last visited: 2026-10-27T20:16:00Z
+- [x] Phase 1: Feature Audit and Discovery (Single subagent survey) [DONE]
+- [x] Phase 2: Parallel Implementation & Verification Panel (Iteration 1) [COMPLETED]
+- [x] Phase 3: Gate Evaluation (Iteration 1) [FAIL - VICTORY REJECTED by Forensic/Victory Auditor]
+- [x] Phase 4 (Iteration 2): Remediation of End-to-End Subtitle Wiring, Demuxing, Scanning, Manual Loading & Hotkey Presentation [DONE - PASS]
+  - [x] explorer_remediation: Architectural mapping and blueprint completed [DONE]
+  - [x] worker_e2e_remediation: All 6 points implemented and verified [DONE]
+  - [x] reviewer_remediation: Independent code review and workspace verification [APPROVE]
+  - [x] challenger_remediation: Adversarial edge cases and stress testing [APPROVE / VERIFIED]
+  - [x] auditor_remediation: Forensic integrity audit of all 6 points [CLEAN]
+- [x] Phase 5: Final Gate Evaluation & Milestone Completion [DONE - ALL PASS]
 
 ## Iteration Status
-Current iteration: 1 / 32
+Current iteration: 2 / 32 (Passed on Iteration 2)
 
 ## Milestones
-- [x] Milestone 1: Survey & Mapping (Explorer triage across crates, Cargo.toml, scripts, tests, git remotes) [DONE]
-- [x] Milestone 2: Workspace Renaming, Manifests, Refactoring, MIT Licensing & Documentation (`syncplay-*` -> `syncverse-*`) [DONE]
-- [x] Milestone 3: GitHub repository setup & git push to Gauthampro7/syncverse [DONE]
-- [x] Milestone 4: Comprehensive Multi-Agent Verification & Forensic Audit Gate [DONE - PASS]
+- [x] Milestone 1: Baseline Architecture & Parallel Module Implementation [DONE]
+- [x] Milestone 2: Remediation of End-to-End Subtitle Detection, Manual Loading, and Cycling Wiring [DONE]
+- [x] Milestone 3: Full-Spectrum Gate Verification & Forensic Audit [DONE - PASS]
 
 ## Active Spawns
-- None. All subagents completed and retired.
+- None. All 16 subagents completed and retired.
 
 ## Retrospective Notes
-- Deploying three specialized Explorers in Milestone 1 provided complete, multi-angle visibility into code symbols, test assertions, manifest paths, desktop files, and GitHub auth, preventing surprises during migration.
-- Performing the crate directory move (`git mv`), root manifest, crate manifests, and source imports atomically within Milestone 2 preserved git commit history and ensured the workspace remained compilable with zero warnings at all times.
-- Staging and committing all files before creating and pushing to `Gauthampro7/syncverse` ensured a clean commit history on the new repository.
-- The parallel verification panel (2 Reviewers, 2 Challengers, 1 Forensic Auditor) independently proved zero compiler warnings, zero clippy lints, zero banned dependencies, 100% test pass rate, authentic MIT licensing, and verified live remote repository tracking.
-- Fault tolerance protocol effectively handled a hung background loop by terminating and replacing the stalled subagent without project degradation.
+- Iteration 2 successfully resolved all 6 defects raised by `victory_auditor_7`:
+  1. `playback_runtime.rs`: `subtitle_tracks: Vec::new()` was eliminated and replaced with genuine discovered subtitle track labels and cue structures.
+  2. `PlaybackSession::open`: discovers container embedded tracks and scans external files with `scan_external_subtitles`.
+  3. `app.rs`: `load_file` synchronously scans external subtitles; `SubtitleConfigAction::LoadExternal` genuinely parses `.srt`, `.vtt`, `.ass`.
+  4. `V`/`C` cycling hotkey sequentially advances through all tracks and Off state, updating `active_subtitle_cues` and OSD notifications.
+  5. Replaced mock closure test with authentic integration test `test_end_to_end_media_playback_with_subtitles` and edge-case stress tests.
+- All 16 subagents across both iterations have delivered comprehensive evidence with zero warnings under `#![deny(warnings)]`, zero clippy warnings, zero banned dependencies, and a clean audit verdict.

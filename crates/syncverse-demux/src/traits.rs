@@ -27,6 +27,10 @@ pub struct TrackInfo {
     pub track_type: TrackType,
     /// Codec identifier string (e.g., "V_VP9", "A_OPUS", "avc1").
     pub codec_id: String,
+    /// Track language code (e.g., "eng", "en", "jpn"), if specified in container metadata.
+    pub language: Option<String>,
+    /// Track title or description, if specified in container metadata.
+    pub title: Option<String>,
     /// Video width in pixels.
     pub width: Option<u32>,
     /// Video height in pixels.
@@ -59,6 +63,8 @@ pub struct DemuxPacket {
     pub pts_ms: u64,
     /// Decode timestamp in milliseconds, if distinct from PTS.
     pub dts_ms: Option<u64>,
+    /// Packet presentation duration in milliseconds, if known.
+    pub duration_ms: Option<u64>,
     /// Whether this packet is an independent random-access keyframe.
     pub is_keyframe: bool,
     /// Raw compressed bitstream payload.

@@ -118,10 +118,28 @@ impl UniversalDemuxer {
 
 
 
+            let mut language = None;
+            let mut title = None;
+            let metadata = s.metadata();
+            if let Some(lang) = metadata.get("language").or_else(|| metadata.get("lang")) {
+                let trimmed = lang.trim();
+                if !trimmed.is_empty() {
+                    language = Some(trimmed.to_string());
+                }
+            }
+            if let Some(t) = metadata.get("title").or_else(|| metadata.get("handler_name")) {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    title = Some(trimmed.to_string());
+                }
+            }
+
             tracks.push(TrackInfo {
                 track_id: s_idx as u64,
                 track_type,
                 codec_id,
+                language,
+                title,
                 width,
                 height,
                 sample_rate,
@@ -213,6 +231,13 @@ impl UniversalDemuxer {
             (norm_dts_us / 1000) as u64
         });
 
+        let duration_ms = if packet.duration() > 0 {
+            let dur_us = (packet.duration() as i128 * num * 1_000_000) / den;
+            Some((dur_us / 1000) as u64)
+        } else {
+            None
+        };
+
         let is_keyframe = packet.is_key();
         let data = packet.data().unwrap_or(&[]).to_vec();
 
@@ -220,6 +245,7 @@ impl UniversalDemuxer {
             track_id: s_idx as u64,
             pts_ms,
             dts_ms,
+            duration_ms,
             is_keyframe,
             data,
         }

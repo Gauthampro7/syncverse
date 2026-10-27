@@ -1,6 +1,196 @@
-//! On-Screen Display (OSD) HUD formatting, tight sync health evaluations, and floating comments.
+//! On-Screen Display (OSD) HUD formatting, tight sync health evaluations, and floating notification overlay.
+
+use std::time::{Duration, Instant};
 
 pub use crate::overlay::{evaluate_sync_health, format_timecode_hud, ChatBubble, SyncBadgeColor};
+
+/// On-Screen Display (OSD) HUD notification banner overlay.
+///
+/// Features a floating translucent pill / banner positioned at the top-left or top-center
+/// of the video viewport, with a 1.5s dwell period (alpha 1.0) followed by a 0.5s smooth
+/// linear alpha fade-out (total 2.0s duration).
+#[derive(Debug, Clone)]
+pub struct OsdOverlay {
+    /// Active notification text.
+    active_text: Option<String>,
+    /// Instant when current notification was triggered.
+    trigger_time: Option<Instant>,
+    /// Visible dwell period duration (1.5s).
+    dwell_duration: Duration,
+    /// Linear alpha fade duration (0.5s).
+    fade_duration: Duration,
+}
+
+impl Default for OsdOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OsdOverlay {
+    /// Constructs a new `OsdOverlay` with standard 1.5s dwell and 0.5s fade durations (total 2.0s).
+    pub fn new() -> Self {
+        Self {
+            active_text: None,
+            trigger_time: None,
+            dwell_duration: Duration::from_millis(1500),
+            fade_duration: Duration::from_millis(500),
+        }
+    }
+
+    /// Triggers a new OSD HUD notification banner with the provided text at the given instant.
+    pub fn show_notification(&mut self, text: impl Into<String>, timestamp: Instant) {
+        self.active_text = Some(text.into());
+        self.trigger_time = Some(timestamp);
+    }
+
+    /// Calculates current opacity factor in range [0.0, 1.0].
+    ///
+    /// - `dt <= 1.5s`: 1.0 (full opacity)
+    /// - `1.5s < dt <= 2.0s`: smooth linear fade from 1.0 down to 0.0
+    /// - `dt > 2.0s`: 0.0 (expired)
+    pub fn opacity(&self, now: Instant) -> f32 {
+        let trigger = match self.trigger_time {
+            Some(t) => t,
+            None => return 0.0,
+        };
+
+        if now < trigger {
+            return 1.0;
+        }
+
+        let elapsed = now.duration_since(trigger);
+        let total_duration = self.dwell_duration + self.fade_duration;
+
+        if elapsed >= total_duration {
+            0.0
+        } else if elapsed <= self.dwell_duration {
+            1.0
+        } else {
+            let fade_elapsed = elapsed - self.dwell_duration;
+            let fade_progress = fade_elapsed.as_secs_f32() / self.fade_duration.as_secs_f32();
+            (1.0 - fade_progress).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Returns the active notification text and current alpha factor if not expired.
+    pub fn active_notification(&self, now: Instant) -> Option<(&str, f32)> {
+        let alpha = self.opacity(now);
+        if alpha > 0.0 {
+            self.active_text.as_deref().map(|t| (t, alpha))
+        } else {
+            None
+        }
+    }
+
+    /// Clears any active notification immediately.
+    pub fn clear(&mut self) {
+        self.active_text = None;
+        self.trigger_time = None;
+    }
+
+    /// Renders the floating translucent pill banner directly inside the video viewport rect.
+    pub fn render(&self, ui: &mut egui::Ui, viewport_rect: egui::Rect, now: Instant) {
+        let (text, alpha) = match self.active_notification(now) {
+            Some((t, a)) => (t, a),
+            None => return,
+        };
+
+        let font_id = egui::FontId::proportional(15.0);
+        let text_color = egui::Color32::from_rgba_premultiplied(
+            (255.0 * alpha).round() as u8,
+            (255.0 * alpha).round() as u8,
+            (255.0 * alpha).round() as u8,
+            (255.0 * alpha).round() as u8,
+        );
+        let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+
+        let padding = egui::vec2(14.0, 8.0);
+        let pill_size = galley.size() + padding * 2.0;
+
+        // Position at top-left of viewport_rect with 24pt inset margin
+        let top_left = viewport_rect.min + egui::vec2(24.0, 24.0);
+        let pill_rect = egui::Rect::from_min_size(top_left, pill_size);
+
+        // Dark semi-transparent background: #0f172a with ~85% opacity
+        let bg_color = egui::Color32::from_rgba_premultiplied(
+            (15.0 * 0.85 * alpha).round() as u8,
+            (23.0 * 0.85 * alpha).round() as u8,
+            (42.0 * 0.85 * alpha).round() as u8,
+            (217.0 * alpha).round() as u8,
+        );
+
+        let border_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_premultiplied(
+                (56.0 * 0.5 * alpha).round() as u8,
+                (189.0 * 0.5 * alpha).round() as u8,
+                (248.0 * 0.5 * alpha).round() as u8,
+                (128.0 * alpha).round() as u8,
+            ),
+        );
+
+        ui.painter().rect(
+            pill_rect,
+            egui::CornerRadius::same(6),
+            bg_color,
+            border_stroke,
+            egui::StrokeKind::Outside,
+        );
+        let text_pos = top_left + padding;
+        ui.painter().galley(text_pos, galley, egui::Color32::TRANSPARENT);
+    }
+
+    /// Renders the floating translucent pill banner using an `egui::Area` anchored at top-left.
+    pub fn show(&self, ctx: &egui::Context, now: Instant) {
+        let (text, alpha) = match self.active_notification(now) {
+            Some((t, a)) => (t, a),
+            None => return,
+        };
+
+        egui::Area::new(egui::Id::unique("osd_overlay_pill_area"))
+            .anchor(egui::Align2::LEFT_TOP, [24.0, 48.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let bg_color = egui::Color32::from_rgba_premultiplied(
+                    (15.0 * 0.88 * alpha).round() as u8,
+                    (23.0 * 0.88 * alpha).round() as u8,
+                    (42.0 * 0.88 * alpha).round() as u8,
+                    (225.0 * alpha).round() as u8,
+                );
+                let border_stroke = egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_premultiplied(
+                        (56.0 * 0.6 * alpha).round() as u8,
+                        (189.0 * 0.6 * alpha).round() as u8,
+                        (248.0 * 0.6 * alpha).round() as u8,
+                        (150.0 * alpha).round() as u8,
+                    ),
+                );
+                let text_color = egui::Color32::from_rgba_premultiplied(
+                    (255.0 * alpha).round() as u8,
+                    (255.0 * alpha).round() as u8,
+                    (255.0 * alpha).round() as u8,
+                    (255.0 * alpha).round() as u8,
+                );
+
+                egui::Frame::popup(ui.style())
+                    .fill(bg_color)
+                    .stroke(border_stroke)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(text)
+                                .font(egui::FontId::proportional(15.0))
+                                .strong()
+                                .color(text_color),
+                        );
+                    });
+            });
+    }
+}
 
 /// Tri-color tight sync health badge evaluation for interactive player HUD.
 ///
@@ -178,5 +368,49 @@ mod tests {
 
         let res_expired = render_faded_chat_comment(&bubble, 16.0, bg, fg);
         assert!(res_expired.is_none());
+    }
+
+    #[test]
+    fn test_osd_overlay_lifecycle() {
+        let mut osd = OsdOverlay::new();
+        let t0 = Instant::now();
+
+        // Initially no active notification
+        assert_eq!(osd.opacity(t0), 0.0);
+        assert!(osd.active_notification(t0).is_none());
+
+        // Trigger notification
+        osd.show_notification("Audio: Track 2/3 - Japanese (AAC 2ch)", t0);
+
+        // Within dwell period (1.5s): opacity = 1.0
+        assert_eq!(osd.opacity(t0), 1.0);
+        assert_eq!(osd.opacity(t0 + Duration::from_millis(500)), 1.0);
+        assert_eq!(osd.opacity(t0 + Duration::from_millis(1500)), 1.0);
+
+        let active = osd.active_notification(t0 + Duration::from_millis(1000));
+        assert!(active.is_some());
+        let (text, alpha) = active.unwrap();
+        assert_eq!(text, "Audio: Track 2/3 - Japanese (AAC 2ch)");
+        assert_eq!(alpha, 1.0);
+
+        // Mid-fade at 1.75s: opacity ≈ 0.5
+        let mid_alpha = osd.opacity(t0 + Duration::from_millis(1750));
+        assert!((mid_alpha - 0.5).abs() < 1e-3);
+
+        // At exactly 2.0s: opacity = 0.0, notification expired
+        let end_alpha = osd.opacity(t0 + Duration::from_millis(2000));
+        assert_eq!(end_alpha, 0.0);
+        assert!(osd.active_notification(t0 + Duration::from_millis(2000)).is_none());
+
+        // Beyond 2.0s: strictly expired
+        assert_eq!(osd.opacity(t0 + Duration::from_millis(2500)), 0.0);
+        assert!(osd.active_notification(t0 + Duration::from_millis(2500)).is_none());
+
+        // Test clear
+        osd.show_notification("Aspect Ratio: 16:9", t0);
+        assert_eq!(osd.opacity(t0), 1.0);
+        osd.clear();
+        assert_eq!(osd.opacity(t0), 0.0);
+        assert!(osd.active_notification(t0).is_none());
     }
 }

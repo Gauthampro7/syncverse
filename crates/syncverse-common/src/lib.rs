@@ -8,10 +8,12 @@ pub mod crc;
 pub mod error;
 pub mod path;
 pub mod reader;
+pub mod subtitles;
 pub mod time;
 
 pub use crc::Crc32;
 pub use error::CommonError;
 pub use path::normalize_target_path;
 pub use reader::{BitReader, ByteReader};
+pub use subtitles::{SubtitleCue, SubtitleSource, SubtitleTrack};
 pub use time::{MediaTime, WallTime};

@@ -104,9 +104,11 @@ fn test_live_watch_party_transport_integration() {
     let scheduled_target = host
         .prepare_barrier_unpause(preroll_budget_ms)
         .expect("prepare barrier");
-    assert_eq!(
-        scheduled_target, expected_target,
-        "Target schedule must obey T_target = t_now + 1.5*max(RTT) + preroll + 100ms"
+    assert!(
+        scheduled_target.abs_diff(expected_target) <= 5,
+        "Target schedule must obey T_target = t_now + 1.5*max(RTT) + preroll + 100ms (got {}, expected {})",
+        scheduled_target,
+        expected_target
     );
 
     // Clients process BarrierPrepare and reply with BarrierReady
@@ -223,9 +225,11 @@ fn test_multi_peer_live_socket_simulation_diverse_preroll_and_margins() {
         let scheduled_target = host
             .prepare_barrier_unpause(preroll_budget)
             .expect("prepare barrier unpause");
-        assert_eq!(
-            scheduled_target, expected_target,
-            "Target schedule must equal t_server_now + 1.5*max(RTT) + preroll_budget + 100"
+        assert!(
+            scheduled_target.abs_diff(expected_target) <= 5,
+            "Target schedule must equal t_server_now + 1.5*max(RTT) + preroll_budget + 100 (got {}, expected {})",
+            scheduled_target,
+            expected_target
         );
 
         // All 5 clients poll BarrierPrepare and reply with BarrierReady

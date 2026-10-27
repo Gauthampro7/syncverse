@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+syncverse-common = { path = "../syncverse-common" }
+syncverse-demux = { path = "../syncverse-demux" }
 syncverse-codecs = { path = "../syncverse-codecs" }
 syncverse-clock = { path = "../syncverse-clock" }
 syncverse-chat = { path = "../syncverse-chat" }

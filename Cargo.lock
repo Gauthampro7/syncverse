@@ -3345,6 +3345,7 @@ name = "syncverse-demux"
 version = "0.1.1"
 dependencies = [
  "ffmpeg-next",
+ "syncverse-common",
  "thiserror 2.0.21",
 ]
 
@@ -3369,6 +3370,8 @@ dependencies = [
  "syncverse-chat",
  "syncverse-clock",
  "syncverse-codecs",
+ "syncverse-common",
+ "syncverse-demux",
  "thiserror 2.0.21",
  "ureq",
 ]

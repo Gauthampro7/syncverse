@@ -441,6 +441,8 @@ impl EbmlDemuxer {
                 let mut track_id = 1u64;
                 let mut track_type = TrackType::Video;
                 let mut codec_id = String::new();
+                let mut language = None;
+                let mut title = None;
                 let mut codec_private = None;
                 let mut width = None;
                 let mut height = None;
@@ -473,6 +475,8 @@ impl EbmlDemuxer {
                             };
                         }
                         0x86 => codec_id = parse_ebml_string(val),
+                        0x22B59C | 0x22B59D => language = Some(parse_ebml_string(val)),
+                        0x536E => title = Some(parse_ebml_string(val)),
                         0x63A2 => codec_private = Some(val.to_vec()),
                         0xE0 => {
                             let mut v_off = 0;
@@ -524,6 +528,8 @@ impl EbmlDemuxer {
                     track_id,
                     track_type,
                     codec_id,
+                    language,
+                    title,
                     width,
                     height,
                     sample_rate,
@@ -832,6 +838,8 @@ impl Demuxer for EbmlDemuxer {
                 track_id: 1,
                 track_type: TrackType::Video,
                 codec_id: "V_VP9".into(),
+                language: None,
+                title: None,
                 width: Some(1920),
                 height: Some(1080),
                 sample_rate: None,
@@ -931,6 +939,7 @@ impl Demuxer for EbmlDemuxer {
                             track_id,
                             pts_ms,
                             dts_ms: None,
+                            duration_ms: None,
                             is_keyframe: if i == 0 { is_keyframe } else { false },
                             data: frame,
                         });
@@ -1002,6 +1011,7 @@ impl Demuxer for EbmlDemuxer {
                                         track_id,
                                         pts_ms,
                                         dts_ms: None,
+                                        duration_ms: None,
                                         is_keyframe: if i == 0 { is_keyframe } else { false },
                                         data: frame,
                                     });

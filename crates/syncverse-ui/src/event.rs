@@ -1,5 +1,6 @@
 //! Events delivered from the background runtime engine to the graphical UI presentation thread.
 
+use std::time::Instant;
 use syncverse_chat::ChatRecord;
 use crate::gui::RoomMember;
 
@@ -38,4 +39,102 @@ pub enum UiEvent {
         /// Error description message.
         error: String,
     },
+    /// Transient HUD / OSD notification banner to display on the video viewport.
+    HudNotification {
+        /// Banner notification text to present.
+        text: String,
+        /// Instant when the notification was triggered.
+        timestamp: Instant,
+    },
+    /// Notification that active audio track was selected or switched.
+    AudioTrackSelected {
+        /// Selected stream track identifier.
+        track_id: u64,
+        /// Human-readable track display name or metadata description.
+        name: String,
+    },
+    /// Notification that active subtitle track was selected or switched.
+    SubtitleTrackSelected {
+        /// Selected subtitle track index (`None` when subtitles are disabled).
+        track_index: Option<usize>,
+        /// Human-readable track display name or "Off".
+        name: String,
+    },
+    /// Notification that audio presentation delay was updated.
+    AudioDelayChanged(i64),
+    /// Notification that subtitle presentation delay was updated.
+    SubtitleDelayChanged(i64),
+    /// Discovered audio and subtitle track inventories for loaded media.
+    TracksDiscovered {
+        /// List of discovered audio track descriptions.
+        audio_tracks: Vec<String>,
+        /// List of discovered subtitle track descriptions.
+        subtitle_tracks: Vec<String>,
+    },
+    /// Discovered subtitle track data with full parsed cues.
+    SubtitleDataDiscovered(Vec<crate::gui::subtitle_overlay::SubtitleTrack>),
+    /// Streaming subtitle cue dynamically demuxed from container bitstream.
+    SubtitleCueDemuxed(crate::gui::subtitle_overlay::SubtitleCue),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ui_event_hud_and_tracks() {
+        let now = Instant::now();
+        let hud_ev = UiEvent::HudNotification {
+            text: "Audio: Track 1/2".to_string(),
+            timestamp: now,
+        };
+        if let UiEvent::HudNotification { text, timestamp } = hud_ev.clone() {
+            assert_eq!(text, "Audio: Track 1/2");
+            assert_eq!(timestamp, now);
+        } else {
+            panic!("Expected HudNotification");
+        }
+
+        let audio_ev = UiEvent::AudioTrackSelected {
+            track_id: 1,
+            name: "English (AAC 2ch)".to_string(),
+        };
+        let sub_ev = UiEvent::SubtitleTrackSelected {
+            track_index: Some(0),
+            name: "English (.srt)".to_string(),
+        };
+        let sub_off = UiEvent::SubtitleTrackSelected {
+            track_index: None,
+            name: "Off".to_string(),
+        };
+        let audio_delay = UiEvent::AudioDelayChanged(-50);
+        let sub_delay = UiEvent::SubtitleDelayChanged(50);
+        let tracks_disc = UiEvent::TracksDiscovered {
+            audio_tracks: vec!["English (AAC)".to_string()],
+            subtitle_tracks: vec!["English (.srt)".to_string()],
+        };
+
+        let sub_data = UiEvent::SubtitleDataDiscovered(vec![
+            crate::gui::subtitle_overlay::SubtitleTrack::new(
+                0,
+                "English",
+                Some("en".to_string()),
+                vec![crate::gui::subtitle_overlay::SubtitleCue::new(100, 500, "Test")],
+            ),
+        ]);
+        let sub_cue = UiEvent::SubtitleCueDemuxed(crate::gui::subtitle_overlay::SubtitleCue::new(
+            600,
+            1200,
+            "Streamed",
+        ));
+
+        assert!(matches!(audio_ev, UiEvent::AudioTrackSelected { track_id: 1, .. }));
+        assert!(matches!(sub_ev, UiEvent::SubtitleTrackSelected { track_index: Some(0), .. }));
+        assert!(matches!(sub_off, UiEvent::SubtitleTrackSelected { track_index: None, .. }));
+        assert!(matches!(audio_delay, UiEvent::AudioDelayChanged(-50)));
+        assert!(matches!(sub_delay, UiEvent::SubtitleDelayChanged(50)));
+        assert!(matches!(tracks_disc, UiEvent::TracksDiscovered { .. }));
+        assert!(matches!(sub_data, UiEvent::SubtitleDataDiscovered(..)));
+        assert!(matches!(sub_cue, UiEvent::SubtitleCueDemuxed(..)));
+    }
 }

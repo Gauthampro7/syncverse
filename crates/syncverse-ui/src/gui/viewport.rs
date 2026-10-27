@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, Context, Rect, TextureHandle, TextureOptions, Ui, Vec2};
 use syncverse_clock::{MasterClock, PresentationAction, SpscRingBuffer};
 use syncverse_codecs::VideoFrameRGBA;
+use crate::gui::aspect_ratio::{AspectRatioOverride, IntoDimension};
 
 /// Geometric display mode for the video viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,49 @@ impl ViewportGeometry {
         video_w: f32,
         video_h: f32,
     ) -> Self {
-        if available_w <= 0.0 || available_h <= 0.0 || video_w <= 0.0 || video_h <= 0.0 {
+        Self::compute_with_aspect(
+            available_w,
+            available_h,
+            video_w,
+            video_h,
+            AspectRatioOverride::Original,
+        )
+    }
+
+    /// Computes display rectangle centered in available space using concrete `f32` dimensions and an aspect override.
+    pub fn compute_with_aspect_f32(
+        available_w: f32,
+        available_h: f32,
+        video_w: f32,
+        video_h: f32,
+        aspect_override: AspectRatioOverride,
+    ) -> Self {
+        Self::compute_with_aspect(available_w, available_h, video_w, video_h, aspect_override)
+    }
+
+    /// Computes display rectangle centered in available space using concrete `u32` dimensions and an aspect override.
+    pub fn compute_with_aspect_u32(
+        available_w: f32,
+        available_h: f32,
+        video_w: u32,
+        video_h: u32,
+        aspect_override: AspectRatioOverride,
+    ) -> Self {
+        Self::compute_with_aspect(available_w, available_h, video_w, video_h, aspect_override)
+    }
+
+    /// Computes display rectangle centered in available space taking into account an aspect ratio override.
+    pub fn compute_with_aspect<W: IntoDimension, H: IntoDimension>(
+        available_w: f32,
+        available_h: f32,
+        video_w: W,
+        video_h: H,
+        aspect_override: AspectRatioOverride,
+    ) -> Self {
+        let vw = video_w.into_dimension();
+        let vh = video_h.into_dimension();
+
+        if available_w <= 0.0 || available_h <= 0.0 || vw <= 0.0 || vh <= 0.0 {
             return Self {
                 render_width: 0.0,
                 render_height: 0.0,
@@ -51,13 +94,31 @@ impl ViewportGeometry {
             };
         }
 
-        let aspect_video = video_w / video_h;
+        if aspect_override == AspectRatioOverride::FillStretch {
+            return Self {
+                render_width: available_w,
+                render_height: available_h,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                mode: ViewportDisplayMode::Exact,
+            };
+        }
+
+        let effective_aspect = match aspect_override {
+            AspectRatioOverride::Original => vw / vh,
+            AspectRatioOverride::Ratio16_9 => 16.0 / 9.0,
+            AspectRatioOverride::Ratio4_3 => 4.0 / 3.0,
+            AspectRatioOverride::Ratio21_9 => 21.0 / 9.0,
+            AspectRatioOverride::Ratio1_1 => 1.0,
+            AspectRatioOverride::FillStretch => unreachable!(),
+        };
+
         let aspect_avail = available_w / available_h;
-        let diff = aspect_avail - aspect_video;
+        let diff = aspect_avail - effective_aspect;
 
         if diff > 1e-5 {
-            // Viewport wider than video -> Pillarboxing
-            let render_w = available_h * aspect_video;
+            // Viewport wider than target aspect ratio -> Pillarboxing
+            let render_w = available_h * effective_aspect;
             let render_h = available_h;
             let offset_x = (available_w - render_w) / 2.0;
             let offset_y = 0.0;
@@ -69,9 +130,9 @@ impl ViewportGeometry {
                 mode: ViewportDisplayMode::Pillarbox,
             }
         } else if diff < -1e-5 {
-            // Viewport taller than video -> Letterboxing
+            // Viewport taller than target aspect ratio -> Letterboxing
             let render_w = available_w;
-            let render_h = available_w / aspect_video;
+            let render_h = available_w / effective_aspect;
             let offset_x = 0.0;
             let offset_y = (available_h - render_h) / 2.0;
             Self {
@@ -150,6 +211,8 @@ pub struct VideoViewport {
     video_width: u32,
     video_height: u32,
     pending_frame: Option<VideoFrameRGBA>,
+    aspect_override: AspectRatioOverride,
+    last_video_rect: Option<Rect>,
 }
 
 impl Default for VideoViewport {
@@ -168,6 +231,8 @@ impl VideoViewport {
             video_width: 0,
             video_height: 0,
             pending_frame: None,
+            aspect_override: AspectRatioOverride::Original,
+            last_video_rect: None,
         }
     }
 
@@ -236,6 +301,7 @@ impl VideoViewport {
         self.current_pts_ms = None;
         self.video_width = 0;
         self.video_height = 0;
+        self.last_video_rect = None;
     }
 
     /// Uploads frame RGBA data to the `egui::TextureHandle`.
@@ -269,6 +335,49 @@ impl VideoViewport {
         (self.video_width, self.video_height)
     }
 
+    /// Returns the currently active aspect ratio override.
+    pub fn aspect_override(&self) -> AspectRatioOverride {
+        self.aspect_override
+    }
+
+    /// Sets the active aspect ratio override.
+    pub fn set_aspect_override(&mut self, aspect_override: AspectRatioOverride) {
+        self.aspect_override = aspect_override;
+    }
+
+    /// Cycles sequentially to the next aspect ratio preset and returns the new preset.
+    pub fn cycle_aspect_override(&mut self) -> AspectRatioOverride {
+        self.aspect_override = self.aspect_override.cycle_next();
+        self.aspect_override
+    }
+
+    /// Returns the active video frame rectangle computed during the last frame presentation, if any.
+    pub fn last_video_rect(&self) -> Option<Rect> {
+        self.last_video_rect
+    }
+
+    /// Computes the active video rectangle for a given available bounding rectangle and current video dimensions.
+    pub fn compute_video_rect(&self, available_rect: Rect) -> Option<Rect> {
+        if self.video_width == 0 || self.video_height == 0 {
+            return None;
+        }
+        let geom = ViewportGeometry::compute_with_aspect(
+            available_rect.width(),
+            available_rect.height(),
+            self.video_width,
+            self.video_height,
+            self.aspect_override,
+        );
+        if geom.mode == ViewportDisplayMode::Empty {
+            None
+        } else {
+            Some(Rect::from_min_size(
+                available_rect.min + egui::vec2(geom.offset_x, geom.offset_y),
+                Vec2::new(geom.render_width, geom.render_height),
+            ))
+        }
+    }
+
     /// Renders the video viewport widget into egui with automatic pillarbox/letterbox fill.
     pub fn show(&mut self, ui: &mut Ui) -> ViewportAction {
         let mut action = ViewportAction::default();
@@ -283,23 +392,30 @@ impl VideoViewport {
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
         // 3. Aspect ratio calculation
-        let geom = ViewportGeometry::compute(
+        let geom = ViewportGeometry::compute_with_aspect(
             available_w,
             available_h,
-            self.video_width as f32,
-            self.video_height as f32,
+            self.video_width,
+            self.video_height,
+            self.aspect_override,
         );
+
+        let video_rect = if geom.mode != ViewportDisplayMode::Empty {
+            let video_min = rect.min + egui::vec2(geom.offset_x, geom.offset_y);
+            Some(Rect::from_min_size(
+                video_min,
+                Vec2::new(geom.render_width, geom.render_height),
+            ))
+        } else {
+            None
+        };
+        self.last_video_rect = video_rect;
 
         // 4. Render video frame texture if available
         if let Some(ref texture) = self.texture {
-            if geom.mode != ViewportDisplayMode::Empty {
-                let video_min = rect.min + egui::vec2(geom.offset_x, geom.offset_y);
-                let video_rect = Rect::from_min_size(
-                    video_min,
-                    Vec2::new(geom.render_width, geom.render_height),
-                );
+            if let Some(v_rect) = video_rect {
                 let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                ui.painter().image(texture.id(), video_rect, uv, Color32::WHITE);
+                ui.painter().image(texture.id(), v_rect, uv, Color32::WHITE);
             }
         } else {
             // Sleek centered placeholder when no media is playing
@@ -364,5 +480,128 @@ mod tests {
         assert_eq!(geom.mode, ViewportDisplayMode::Empty);
         assert_eq!(geom.render_width, 0.0);
         assert_eq!(geom.render_height, 0.0);
+    }
+
+    #[test]
+    fn test_compute_with_aspect_all_presets() {
+        // 1. Original (16:9 in 1280x960 4:3 viewport -> Letterbox)
+        let geom_orig = ViewportGeometry::compute_with_aspect(
+            1280.0,
+            960.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::Original,
+        );
+        assert_eq!(geom_orig.mode, ViewportDisplayMode::Letterbox);
+        assert_eq!(geom_orig.render_width, 1280.0);
+        assert_eq!(geom_orig.render_height, 720.0);
+        assert_eq!(geom_orig.offset_x, 0.0);
+        assert_eq!(geom_orig.offset_y, 120.0);
+
+        // 2. Force 16:9 on 4:3 natural video (1440x1080) in 1920x1080 viewport -> Exact 16:9
+        let geom_16_9 = ViewportGeometry::compute_with_aspect(
+            1920.0,
+            1080.0,
+            1440u32,
+            1080u32,
+            AspectRatioOverride::Ratio16_9,
+        );
+        assert_eq!(geom_16_9.mode, ViewportDisplayMode::Exact);
+        assert_eq!(geom_16_9.render_width, 1920.0);
+        assert_eq!(geom_16_9.render_height, 1080.0);
+        assert_eq!(geom_16_9.offset_x, 0.0);
+        assert_eq!(geom_16_9.offset_y, 0.0);
+
+        // 3. Force 4:3 on 16:9 natural video (1920x1080) in 1920x1080 viewport -> Pillarbox
+        let geom_4_3 = ViewportGeometry::compute_with_aspect(
+            1920.0,
+            1080.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::Ratio4_3,
+        );
+        assert_eq!(geom_4_3.mode, ViewportDisplayMode::Pillarbox);
+        assert_eq!(geom_4_3.render_width, 1440.0);
+        assert_eq!(geom_4_3.render_height, 1080.0);
+        assert_eq!(geom_4_3.offset_x, 240.0);
+        assert_eq!(geom_4_3.offset_y, 0.0);
+
+        // 4. Force 21:9 on 16:9 natural video (1920x1080) in 1920x1080 viewport -> Letterbox
+        let geom_21_9 = ViewportGeometry::compute_with_aspect(
+            1920.0,
+            1080.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::Ratio21_9,
+        );
+        assert_eq!(geom_21_9.mode, ViewportDisplayMode::Letterbox);
+        assert_eq!(geom_21_9.render_width, 1920.0);
+        let expected_h = 1920.0 / (21.0 / 9.0);
+        assert!((geom_21_9.render_height - expected_h).abs() < 1e-4);
+        assert_eq!(geom_21_9.offset_x, 0.0);
+        let expected_oy = (1080.0 - expected_h) / 2.0;
+        assert!((geom_21_9.offset_y - expected_oy).abs() < 1e-4);
+
+        // 5. Force 1:1 square on 16:9 video in 1920x1080 viewport -> Pillarbox
+        let geom_1_1 = ViewportGeometry::compute_with_aspect(
+            1920.0,
+            1080.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::Ratio1_1,
+        );
+        assert_eq!(geom_1_1.mode, ViewportDisplayMode::Pillarbox);
+        assert_eq!(geom_1_1.render_width, 1080.0);
+        assert_eq!(geom_1_1.render_height, 1080.0);
+        assert_eq!(geom_1_1.offset_x, 420.0);
+        assert_eq!(geom_1_1.offset_y, 0.0);
+
+        // 6. FillStretch mode -> Exact full viewport fill without black bars
+        let geom_stretch = ViewportGeometry::compute_with_aspect(
+            1920.0,
+            1200.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::FillStretch,
+        );
+        assert_eq!(geom_stretch.mode, ViewportDisplayMode::Exact);
+        assert_eq!(geom_stretch.render_width, 1920.0);
+        assert_eq!(geom_stretch.render_height, 1200.0);
+        assert_eq!(geom_stretch.offset_x, 0.0);
+        assert_eq!(geom_stretch.offset_y, 0.0);
+    }
+
+    #[test]
+    fn test_compute_with_aspect_concrete_helpers() {
+        let geom_f32 = ViewportGeometry::compute_with_aspect_f32(
+            1920.0,
+            1080.0,
+            1440.0,
+            1080.0,
+            AspectRatioOverride::Ratio4_3,
+        );
+        let geom_u32 = ViewportGeometry::compute_with_aspect_u32(
+            1920.0,
+            1080.0,
+            1440,
+            1080,
+            AspectRatioOverride::Ratio4_3,
+        );
+        assert_eq!(geom_f32, geom_u32);
+        assert_eq!(geom_f32.mode, ViewportDisplayMode::Pillarbox);
+        assert_eq!(geom_f32.render_width, 1440.0);
+    }
+
+    #[test]
+    fn test_video_viewport_aspect_ratio_state_and_cycling() {
+        let mut viewport = VideoViewport::new();
+        assert_eq!(viewport.aspect_override(), AspectRatioOverride::Original);
+
+        viewport.set_aspect_override(AspectRatioOverride::Ratio16_9);
+        assert_eq!(viewport.aspect_override(), AspectRatioOverride::Ratio16_9);
+
+        let cycled = viewport.cycle_aspect_override();
+        assert_eq!(cycled, AspectRatioOverride::Ratio4_3);
+        assert_eq!(viewport.aspect_override(), AspectRatioOverride::Ratio4_3);
     }
 }

@@ -127,8 +127,8 @@ PKG_DIR="$DEPS_DIR/usr/lib64/pkgconfig"
 if [ -d "$PKG_DIR" ]; then
   for pc in "$PKG_DIR"/*.pc; do
     [ -f "$pc" ] || continue
-    sed -i "s|^prefix=/usr|prefix=${DEPS_DIR}/usr|g" "$pc"
-    sed -i "s|includedir=/usr/include|includedir=${DEPS_DIR}/usr/include|g" "$pc"
+    sed -i -E "s|^prefix=.*|prefix=${DEPS_DIR}/usr|g" "$pc"
+    sed -i -E "s|^includedir=.*|includedir=${DEPS_DIR}/usr/include/ffmpeg|g" "$pc"
   done
   echo "  [OK] Adjusted includedir and prefix paths in $PKG_DIR/*.pc"
 fi

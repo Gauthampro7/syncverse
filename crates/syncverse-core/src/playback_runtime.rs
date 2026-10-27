@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use syncverse_chat::{ChatRecord, RoomAnnouncement};
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncverse_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
-use syncverse_demux::{Demuxer, TrackType, UniversalDemuxer};
+use syncverse_demux::{Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::{ClientNode, HostServer, PeerStatusPayload};
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
@@ -62,6 +62,35 @@ fn run_audio_sink_worker(rx: Receiver<AudioWorkerCommand>, running: Arc<AtomicBo
     }
 }
 
+/// Formats track info into a human-readable display string.
+fn format_track_info(track: &TrackInfo) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref title) = track.title {
+        if !title.is_empty() {
+            parts.push(title.clone());
+        }
+    }
+    if let Some(ref lang) = track.language {
+        if !lang.is_empty() {
+            parts.push(lang.to_uppercase());
+        }
+    }
+    if parts.is_empty() {
+        parts.push(format!("Track {}", track.track_id));
+    }
+    if !track.codec_id.is_empty() {
+        parts.push(track.codec_id.clone());
+    }
+    if let Some(ch) = track.channels {
+        match ch {
+            1 => parts.push("Mono".to_string()),
+            2 => parts.push("Stereo".to_string()),
+            n => parts.push(format!("{n}ch")),
+        }
+    }
+    parts.join(" - ")
+}
+
 /// Active media playback session managing demuxer and decoders.
 struct PlaybackSession {
     demuxer: UniversalDemuxer,
@@ -69,6 +98,10 @@ struct PlaybackSession {
     audio_decoder: Option<UniversalAudioDecoder>,
     video_track_id: Option<u64>,
     audio_track_id: Option<u64>,
+    available_audio_tracks: Vec<TrackInfo>,
+    available_subtitle_tracks: Vec<syncverse_common::subtitles::SubtitleTrack>,
+    selected_subtitle_track_index: Option<usize>,
+    subtitle_track_id: Option<u64>,
     duration_ms: u64,
     eof_reached: bool,
 }
@@ -89,16 +122,48 @@ impl PlaybackSession {
 
         let duration_ms = info.duration_ms.unwrap_or(0);
 
+        let available_audio_tracks: Vec<TrackInfo> = info
+            .tracks
+            .iter()
+            .filter(|t| t.track_type == TrackType::Audio)
+            .cloned()
+            .collect();
+
+        let embedded_subtitle_tracks: Vec<TrackInfo> = info
+            .tracks
+            .iter()
+            .filter(|t| t.track_type == TrackType::Subtitle)
+            .cloned()
+            .collect();
+
+        let mut available_subtitle_tracks = Vec::new();
+        for t in embedded_subtitle_tracks {
+            let title = t.title.clone().unwrap_or_else(|| {
+                if let Some(ref lang) = t.language {
+                    format!("Embedded Subtitle [{}]", lang.to_uppercase())
+                } else {
+                    format!("Embedded Subtitle (Track {})", t.track_id)
+                }
+            });
+            available_subtitle_tracks.push(syncverse_common::subtitles::SubtitleTrack::new(
+                t.track_id as usize,
+                syncverse_common::subtitles::SubtitleSource::Embedded,
+                t.codec_id.clone(),
+                t.language.clone(),
+                title,
+                Vec::new(),
+            ));
+        }
+
+        let external_tracks = syncverse_demux::subtitles::scan_external_subtitles(path);
+        available_subtitle_tracks.extend(external_tracks);
+
         let vt = info
             .tracks
             .iter()
             .find(|t| t.track_type == TrackType::Video)
             .cloned();
-        let at = info
-            .tracks
-            .iter()
-            .find(|t| t.track_type == TrackType::Audio)
-            .cloned();
+        let at = available_audio_tracks.first().cloned();
 
         let video_track_id = vt.as_ref().map(|t| t.track_id);
         let audio_track_id = at.as_ref().map(|t| t.track_id);
@@ -140,9 +205,106 @@ impl PlaybackSession {
             audio_decoder,
             video_track_id,
             audio_track_id,
+            available_audio_tracks,
+            available_subtitle_tracks,
+            selected_subtitle_track_index: None,
+            subtitle_track_id: None,
             duration_ms,
             eof_reached: false,
         })
+    }
+
+    /// Switches the active subtitle track to the specified index (`None` = Off/Disabled).
+    /// Returns the human-readable description of the selected track or "Off".
+    fn select_subtitle_track(&mut self, track_idx: Option<usize>) -> (Option<usize>, String) {
+        match track_idx {
+            Some(idx) if idx < self.available_subtitle_tracks.len() => {
+                self.selected_subtitle_track_index = Some(idx);
+                let track = &self.available_subtitle_tracks[idx];
+                self.subtitle_track_id = if track.source == syncverse_common::subtitles::SubtitleSource::Embedded {
+                    Some(track.id as u64)
+                } else {
+                    None
+                };
+                (Some(idx), track.display_label())
+            }
+            _ => {
+                self.selected_subtitle_track_index = None;
+                self.subtitle_track_id = None;
+                (None, "Off".to_string())
+            }
+        }
+    }
+
+    /// Cycles sequentially to the next available subtitle track (including Off).
+    /// Sequence: None -> Some(0) -> Some(1) -> ... -> Some(N-1) -> None.
+    fn cycle_subtitle_track(&mut self) -> (Option<usize>, String) {
+        if self.available_subtitle_tracks.is_empty() {
+            return (None, "Off".to_string());
+        }
+        let next_idx = match self.selected_subtitle_track_index {
+            None => Some(0),
+            Some(idx) if idx + 1 < self.available_subtitle_tracks.len() => Some(idx + 1),
+            Some(_) => None,
+        };
+        self.select_subtitle_track(next_idx)
+    }
+
+    /// Switches the active audio track to the specified `track_id`.
+    ///
+    /// Constructs a new `UniversalAudioDecoder` for the selected stream.
+    /// Returns the human-readable description of the selected track on success.
+    fn select_audio_track(&mut self, track_id: u64) -> Result<String, String> {
+        let track = self
+            .available_audio_tracks
+            .iter()
+            .find(|t| t.track_id == track_id)
+            .cloned()
+            .ok_or_else(|| format!("Audio track ID {} not found", track_id))?;
+
+        let new_decoder = if let Some(params) = self.demuxer.stream_parameters(track.track_id as usize) {
+            UniversalAudioDecoder::from_parameters(params, None)
+                .map_err(|e| format!("Failed to create audio decoder: {e}"))?
+        } else {
+            UniversalAudioDecoder::from_codec_name(
+                &track.codec_id,
+                None,
+                track.codec_private.as_deref(),
+            )
+            .map_err(|e| format!("Failed to create audio decoder: {e}"))?
+        };
+
+        self.audio_decoder = Some(new_decoder);
+        self.audio_track_id = Some(track_id);
+
+        let desc = format_track_info(&track);
+        Ok(desc)
+    }
+
+    /// Cycles sequentially to the next available audio track, wrapping around to 0.
+    ///
+    /// Returns the newly selected track ID and description on success, or None if no audio tracks exist.
+    fn cycle_audio_track(&mut self) -> Option<(u64, String)> {
+        if self.available_audio_tracks.is_empty() {
+            return None;
+        }
+
+        let current_idx = self
+            .available_audio_tracks
+            .iter()
+            .position(|t| Some(t.track_id) == self.audio_track_id)
+            .unwrap_or(0);
+
+        let next_idx = (current_idx + 1) % self.available_audio_tracks.len();
+        let next_track_id = self.available_audio_tracks[next_idx].track_id;
+
+        match self.select_audio_track(next_track_id) {
+            Ok(desc) => Some((next_track_id, desc)),
+            Err(e) => {
+                eprintln!("[WARN] Failed to switch to audio track {next_track_id}: {e}");
+                None
+            }
+        }
     }
 
     /// Performs random-access seek and flushes internal decoder buffers.
@@ -281,6 +443,8 @@ pub fn run_playback_worker(
     let mut gate_blocked: bool = false;
     let mut volume: f32 = 1.0;
     let mut is_muted: bool = false;
+    let mut audio_delay_ms: i64 = 0;
+    let mut subtitle_delay_ms: i64 = 0;
     let mut speed: f64 = 1.0;
     let mut overflow_frame: Option<VideoFrameRGBA> = None;
     let mut last_snapshot_instant = Instant::now();
@@ -305,6 +469,48 @@ pub fn run_playback_worker(
                             current_file_size = file_size;
                             local_ready = true;
                             gate_blocked = false;
+
+                            // Broadcast discovered audio and subtitle tracks to UI presentation thread
+                            let audio_tracks_info: Vec<String> = new_session
+                                .available_audio_tracks
+                                .iter()
+                                .map(format_track_info)
+                                .collect();
+                            let subtitle_tracks_info: Vec<String> = new_session
+                                .available_subtitle_tracks
+                                .iter()
+                                .map(|t| t.display_label())
+                                .collect();
+
+                            let ui_subtitle_tracks: Vec<syncverse_ui::gui::subtitle_overlay::SubtitleTrack> = new_session
+                                .available_subtitle_tracks
+                                .iter()
+                                .map(|t| {
+                                    let cues = t.cues.iter().map(|c| syncverse_ui::gui::subtitle_overlay::SubtitleCue {
+                                        start_ms: c.start.as_millis() as i64,
+                                        end_ms: c.end.as_millis() as i64,
+                                        text: c.text.clone(),
+                                    }).collect();
+                                    syncverse_ui::gui::subtitle_overlay::SubtitleTrack::new(
+                                        t.id,
+                                        t.display_label(),
+                                        t.language.clone(),
+                                        cues,
+                                    )
+                                })
+                                .collect();
+
+                            let _ = event_tx.send(UiEvent::TracksDiscovered {
+                                audio_tracks: audio_tracks_info,
+                                subtitle_tracks: subtitle_tracks_info,
+                            });
+                            let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_subtitle_tracks));
+                            if let Some(at) = new_session.available_audio_tracks.first() {
+                                let _ = event_tx.send(UiEvent::AudioTrackSelected {
+                                    track_id: at.track_id,
+                                    name: format_track_info(at),
+                                });
+                            }
 
                             session = Some(new_session);
                             overflow_frame = None;
@@ -572,9 +778,131 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::SetVolume(vol) => {
                     volume = vol.clamp(0.0, 1.0);
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Volume: {}%", (volume * 100.0).round() as u32),
+                        timestamp: Instant::now(),
+                    });
                 }
                 PlayerCommand::ToggleMute => {
                     is_muted = !is_muted;
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: if is_muted {
+                            "Audio: Muted".to_string()
+                        } else {
+                            format!("Volume: {}%", (volume * 100.0).round() as u32)
+                        },
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::SelectAudioTrack(track_id) => {
+                    if let Some(ref mut sess) = session {
+                        match sess.select_audio_track(track_id) {
+                            Ok(name) => {
+                                let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                                let _ = event_tx.send(UiEvent::AudioTrackSelected {
+                                    track_id,
+                                    name: name.clone(),
+                                });
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: format!("Audio: {name}"),
+                                    timestamp: Instant::now(),
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("[WARN] SelectAudioTrack({track_id}) failed: {e}");
+                            }
+                        }
+                    }
+                }
+                PlayerCommand::CycleAudioTrack => {
+                    if let Some(ref mut sess) = session {
+                        if let Some((next_id, name)) = sess.cycle_audio_track() {
+                            let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                            let _ = event_tx.send(UiEvent::AudioTrackSelected {
+                                track_id: next_id,
+                                name: name.clone(),
+                            });
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Audio: {name}"),
+                                timestamp: Instant::now(),
+                            });
+                        }
+                    }
+                }
+                PlayerCommand::SetAudioDelay(delay_ms) => {
+                    audio_delay_ms = delay_ms;
+                    let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Audio Delay: {audio_delay_ms} ms"),
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::AdjustAudioDelay(delta_ms) => {
+                    audio_delay_ms = audio_delay_ms.saturating_add(delta_ms);
+                    let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Audio Delay: {audio_delay_ms} ms"),
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::SelectSubtitleTrack(track_index) => {
+                    if let Some(ref mut sess) = session {
+                        let (idx, name) = sess.select_subtitle_track(track_index);
+                        let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
+                            track_index: idx,
+                            name: name.clone(),
+                        });
+                        let notif = if idx.is_some() {
+                            format!("Subtitles: {name}")
+                        } else {
+                            "Subtitles: Off".to_string()
+                        };
+                        let _ = event_tx.send(UiEvent::HudNotification {
+                            text: notif,
+                            timestamp: Instant::now(),
+                        });
+                    }
+                }
+                PlayerCommand::CycleSubtitleTrack => {
+                    if let Some(ref mut sess) = session {
+                        let (next_idx, name) = sess.cycle_subtitle_track();
+                        let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
+                            track_index: next_idx,
+                            name: name.clone(),
+                        });
+                        let notif = match next_idx {
+                            Some(idx) => format!(
+                                "Subtitles: [{}/{}] {}",
+                                idx + 1,
+                                sess.available_subtitle_tracks.len(),
+                                name
+                            ),
+                            None => "Subtitles: Off".to_string(),
+                        };
+                        let _ = event_tx.send(UiEvent::HudNotification {
+                            text: notif,
+                            timestamp: Instant::now(),
+                        });
+                    }
+                }
+                PlayerCommand::SetSubtitleDelay(delay_ms) => {
+                    subtitle_delay_ms = delay_ms;
+                    let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Subtitle Delay: {:+} ms", subtitle_delay_ms),
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::AdjustSubtitleDelay(delta_ms) => {
+                    subtitle_delay_ms = subtitle_delay_ms.saturating_add(delta_ms);
+                    let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Subtitle Delay: {:+} ms", subtitle_delay_ms),
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::CycleAspectRatio => {
+                    // Handled by UI presentation layer / video viewport
                 }
                 PlayerCommand::SendChatMessage(text) | PlayerCommand::ExecuteSlashCommand(text) => {
                     let now = Instant::now();
@@ -852,8 +1180,9 @@ pub fn run_playback_worker(
                                 // Audio packet decoding & asynchronous output
                                 else if Some(packet.track_id) == sess.audio_track_id {
                                     if let Some(ref mut adec) = sess.audio_decoder {
+                                        let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                                         if let Ok(pcm_frames) =
-                                            adec.decode_packet(&packet.data, packet.pts_ms)
+                                            adec.decode_packet(&packet.data, delayed_pts)
                                         {
                                             let effective_vol =
                                                 if is_muted { 0.0 } else { volume };
@@ -865,14 +1194,19 @@ pub fn run_playback_worker(
                                                         AudioWorkerCommand::Samples(silence),
                                                     );
                                                 } else if (effective_vol - 1.0).abs() < 1e-3 {
+                                                    let clamped: Vec<f32> = pcm
+                                                        .samples
+                                                        .iter()
+                                                        .map(|s| s.clamp(-1.0, 1.0))
+                                                        .collect();
                                                     let _ = audio_tx.send(
-                                                        AudioWorkerCommand::Samples(pcm.samples),
+                                                        AudioWorkerCommand::Samples(clamped),
                                                     );
                                                 } else {
                                                     let scaled: Vec<f32> = pcm
                                                         .samples
                                                         .iter()
-                                                        .map(|s| s * effective_vol)
+                                                        .map(|s| (s * effective_vol).clamp(-1.0, 1.0))
                                                         .collect();
                                                     let _ = audio_tx.send(
                                                         AudioWorkerCommand::Samples(scaled),
@@ -880,6 +1214,22 @@ pub fn run_playback_worker(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                else if Some(packet.track_id) == sess.subtitle_track_id {
+                                    let text = if let Ok(s) = std::str::from_utf8(&packet.data) {
+                                        syncverse_demux::subtitles::clean_srt_text(s)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if !text.is_empty() {
+                                        let dur = packet.duration_ms.unwrap_or(3000);
+                                        let cue = syncverse_ui::gui::subtitle_overlay::SubtitleCue {
+                                            start_ms: packet.pts_ms as i64,
+                                            end_ms: (packet.pts_ms + dur) as i64,
+                                            text,
+                                        };
+                                        let _ = event_tx.send(UiEvent::SubtitleCueDemuxed(cue));
                                     }
                                 }
 
@@ -1367,4 +1717,166 @@ pub fn launch_desktop_player_app(
     let _ = audio_handle.join();
 
     gui_res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_track_info() {
+        let t1 = TrackInfo {
+            track_id: 1,
+            track_type: TrackType::Audio,
+            codec_id: "aac".to_string(),
+            language: Some("eng".to_string()),
+            title: Some("English Commentary".to_string()),
+            width: None,
+            height: None,
+            sample_rate: Some(48000.0),
+            channels: Some(2),
+            codec_private: None,
+        };
+        let desc1 = format_track_info(&t1);
+        assert_eq!(desc1, "English Commentary - ENG - aac - Stereo");
+
+        let t2 = TrackInfo {
+            track_id: 2,
+            track_type: TrackType::Audio,
+            codec_id: "opus".to_string(),
+            language: None,
+            title: None,
+            width: None,
+            height: None,
+            sample_rate: Some(48000.0),
+            channels: Some(6),
+            codec_private: None,
+        };
+        let desc2 = format_track_info(&t2);
+        assert_eq!(desc2, "Track 2 - opus - 6ch");
+
+        let t3 = TrackInfo {
+            track_id: 3,
+            track_type: TrackType::Audio,
+            codec_id: "pcm_s16le".to_string(),
+            language: Some("jpn".to_string()),
+            title: None,
+            width: None,
+            height: None,
+            sample_rate: Some(44100.0),
+            channels: Some(1),
+            codec_private: None,
+        };
+        let desc3 = format_track_info(&t3);
+        assert_eq!(desc3, "JPN - pcm_s16le - Mono");
+    }
+
+    #[test]
+    fn test_audio_track_cycling_and_selection_logic() {
+        let tracks = [
+            TrackInfo {
+                track_id: 1,
+                track_type: TrackType::Audio,
+                codec_id: "aac".to_string(),
+                language: Some("eng".to_string()),
+                title: Some("English Stereo".to_string()),
+                width: None,
+                height: None,
+                sample_rate: Some(48000.0),
+                channels: Some(2),
+                codec_private: None,
+            },
+            TrackInfo {
+                track_id: 2,
+                track_type: TrackType::Audio,
+                codec_id: "opus".to_string(),
+                language: Some("jpn".to_string()),
+                title: Some("Japanese 5.1 Surround".to_string()),
+                width: None,
+                height: None,
+                sample_rate: Some(48000.0),
+                channels: Some(6),
+                codec_private: None,
+            },
+            TrackInfo {
+                track_id: 5,
+                track_type: TrackType::Audio,
+                codec_id: "flac".to_string(),
+                language: Some("fre".to_string()),
+                title: None,
+                width: None,
+                height: None,
+                sample_rate: Some(48000.0),
+                channels: Some(2),
+                codec_private: None,
+            },
+        ];
+
+        // Simulate cycling index math
+        let mut current_id = Some(1u64);
+
+        // Cycle 1 -> 2
+        let cur_idx = tracks.iter().position(|t| Some(t.track_id) == current_id).unwrap();
+        let next_idx = (cur_idx + 1) % tracks.len();
+        current_id = Some(tracks[next_idx].track_id);
+        assert_eq!(current_id, Some(2));
+        assert_eq!(format_track_info(&tracks[next_idx]), "Japanese 5.1 Surround - JPN - opus - 6ch");
+
+        // Cycle 2 -> 5
+        let cur_idx = tracks.iter().position(|t| Some(t.track_id) == current_id).unwrap();
+        let next_idx = (cur_idx + 1) % tracks.len();
+        current_id = Some(tracks[next_idx].track_id);
+        assert_eq!(current_id, Some(5));
+        assert_eq!(format_track_info(&tracks[next_idx]), "FRE - flac - Stereo");
+
+        // Cycle 5 -> 1 (wraps around)
+        let cur_idx = tracks.iter().position(|t| Some(t.track_id) == current_id).unwrap();
+        let next_idx = (cur_idx + 1) % tracks.len();
+        current_id = Some(tracks[next_idx].track_id);
+        assert_eq!(current_id, Some(1));
+        assert_eq!(format_track_info(&tracks[next_idx]), "English Stereo - ENG - aac - Stereo");
+    }
+
+    #[test]
+    fn test_audio_delay_and_volume_math() {
+        let mut audio_delay_ms: i64 = 0;
+        assert_eq!(audio_delay_ms, 0);
+
+        // Set delay
+        audio_delay_ms = 120;
+        assert_eq!(audio_delay_ms, 120);
+
+        // Adjust delay positive
+        audio_delay_ms = audio_delay_ms.saturating_add(50);
+        assert_eq!(audio_delay_ms, 170);
+
+        // Adjust delay negative
+        audio_delay_ms = audio_delay_ms.saturating_add(-200);
+        assert_eq!(audio_delay_ms, -30);
+
+        // Delayed PTS calculation
+        let packet_pts: u64 = 1000;
+        let delayed_pts = (packet_pts as i64 + audio_delay_ms).max(0) as u64;
+        assert_eq!(delayed_pts, 970);
+
+        let early_pts: u64 = 20;
+        let delayed_early = (early_pts as i64 + audio_delay_ms).max(0) as u64;
+        assert_eq!(delayed_early, 0); // clamped to 0
+
+        // Volume clamping and scaling
+        let vol = 1.2f32.clamp(0.0, 1.0);
+        assert_eq!(vol, 1.0);
+
+        let vol_low = (-0.5f32).clamp(0.0, 1.0);
+        assert_eq!(vol_low, 0.0);
+
+        let sample = 0.8f32;
+        let scaled = (sample * 0.5f32).clamp(-1.0, 1.0);
+        assert!((scaled - 0.4f32).abs() < 1e-6);
+
+        // Overscaled sample clamped
+        let hot_sample = 1.5f32;
+        let clamped = (hot_sample * 1.0).clamp(-1.0, 1.0);
+        assert_eq!(clamped, 1.0);
+    }
 }

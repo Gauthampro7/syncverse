@@ -5,7 +5,7 @@
 
 #![deny(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use syncverse_codecs::AudioFramePCM;
@@ -54,6 +54,7 @@ pub struct AudioPacer {
     silence_injected_count: AtomicUsize,
     last_pts_ms: AtomicU64,
     in_underrun: AtomicBool,
+    audio_delay_ms: AtomicI64,
 }
 
 impl AudioPacer {
@@ -84,6 +85,7 @@ impl AudioPacer {
             silence_injected_count: AtomicUsize::new(0),
             last_pts_ms: AtomicU64::new(0),
             in_underrun: AtomicBool::new(false),
+            audio_delay_ms: AtomicI64::new(0),
         })
     }
 
@@ -155,7 +157,29 @@ impl AudioPacer {
         self.last_pts_ms.load(Ordering::Relaxed)
     }
 
+    /// Sets the user-configured audio sync presentation delay in milliseconds.
+    ///
+    /// A positive delay causes audio to be presented later relative to the master presentation clock.
+    #[inline]
+    pub fn set_audio_delay_ms(&self, delay_ms: i64) {
+        self.audio_delay_ms.store(delay_ms, Ordering::Release);
+    }
+
+    /// Returns the current user-configured audio sync presentation delay in milliseconds.
+    #[inline]
+    pub fn audio_delay_ms(&self) -> i64 {
+        self.audio_delay_ms.load(Ordering::Acquire)
+    }
+
+    /// Adjusts the audio sync presentation delay by a relative offset in milliseconds and returns the new value.
+    #[inline]
+    pub fn adjust_audio_delay_ms(&self, delta_ms: i64) -> i64 {
+        self.audio_delay_ms.fetch_add(delta_ms, Ordering::AcqRel) + delta_ms
+    }
+
     /// Evaluates the timing action for an audio frame against the `MasterClock`.
+    ///
+    /// Incorporates the user-configured audio sync delay (`audio_delay_ms`), shifting effective PTS.
     ///
     /// Decision Windows:
     /// - Delta > +20ms: Wait(delta - 20ms)
@@ -168,7 +192,9 @@ impl AudioPacer {
         now: Instant,
     ) -> AudioTimingAction {
         let master_pts = master_clock.current_pts(now);
-        let delta_ms = (frame_pts_ms as f64) - master_pts;
+        let delay_ms = self.audio_delay_ms();
+        let effective_pts = (frame_pts_ms as i64 + delay_ms) as f64;
+        let delta_ms = effective_pts - master_pts;
 
         if delta_ms > 20.0 {
             let wait_ms = delta_ms - 20.0;
@@ -396,5 +422,61 @@ mod tests {
         let popped = spsc.try_pop().unwrap();
         assert_eq!(popped.pts_ms, 1234);
         assert!(popped.samples.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn test_audio_pacer_delay_setting_and_adjustment() {
+        let pacer = AudioPacer::default_48k_stereo().unwrap();
+        assert_eq!(pacer.audio_delay_ms(), 0);
+
+        pacer.set_audio_delay_ms(150);
+        assert_eq!(pacer.audio_delay_ms(), 150);
+
+        let new_delay = pacer.adjust_audio_delay_ms(-50);
+        assert_eq!(new_delay, 100);
+        assert_eq!(pacer.audio_delay_ms(), 100);
+
+        let negative_delay = pacer.adjust_audio_delay_ms(-250);
+        assert_eq!(negative_delay, -150);
+        assert_eq!(pacer.audio_delay_ms(), -150);
+    }
+
+    #[test]
+    fn test_audio_pacer_delay_timing_evaluation() {
+        let pacer = AudioPacer::default_48k_stereo().unwrap();
+        let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Playing);
+        let now = Instant::now();
+
+        // Baseline: frame 1000ms, delay 0 -> delta 0 -> PlayNow
+        assert_eq!(
+            pacer.evaluate_timing(1000, &clock, now),
+            AudioTimingAction::PlayNow
+        );
+
+        // Frame 1000ms, delay +50ms -> effective PTS 1050ms -> delta +50ms -> Wait(30ms)
+        pacer.set_audio_delay_ms(50);
+        match pacer.evaluate_timing(1000, &clock, now) {
+            AudioTimingAction::Wait(d) => {
+                let ms = d.as_secs_f64() * 1000.0;
+                assert!((ms - 30.0).abs() < 1e-2);
+            }
+            other => panic!("Expected Wait, got {:?}", other),
+        }
+
+        // Frame 1000ms, delay -50ms -> effective PTS 950ms -> delta -50ms -> Late(50ms)
+        pacer.set_audio_delay_ms(-50);
+        match pacer.evaluate_timing(1000, &clock, now) {
+            AudioTimingAction::Late(d) => {
+                let ms = d.as_secs_f64() * 1000.0;
+                assert!((ms - 50.0).abs() < 1e-2);
+            }
+            other => panic!("Expected Late, got {:?}", other),
+        }
+
+        // Frame 1050ms, with -50ms delay -> effective PTS 1000ms -> delta 0ms -> PlayNow
+        assert_eq!(
+            pacer.evaluate_timing(1050, &clock, now),
+            AudioTimingAction::PlayNow
+        );
     }
 }

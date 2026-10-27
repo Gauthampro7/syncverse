@@ -195,7 +195,16 @@ impl PlayerCoordinator {
             | PlayerCommand::DisconnectParty
             | PlayerCommand::SetReady(_)
             | PlayerCommand::SetForcePlay(_)
-            | PlayerCommand::ForcePlay => {
+            | PlayerCommand::ForcePlay
+            | PlayerCommand::SelectAudioTrack(_)
+            | PlayerCommand::CycleAudioTrack
+            | PlayerCommand::SetAudioDelay(_)
+            | PlayerCommand::AdjustAudioDelay(_)
+            | PlayerCommand::SelectSubtitleTrack(_)
+            | PlayerCommand::CycleSubtitleTrack
+            | PlayerCommand::SetSubtitleDelay(_)
+            | PlayerCommand::AdjustSubtitleDelay(_)
+            | PlayerCommand::CycleAspectRatio => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }

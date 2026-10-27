@@ -3,11 +3,13 @@
 use std::time::Instant;
 use egui::{Color32, Context, FontId, Layout, RichText, Stroke, Ui, Vec2};
 use crate::debouncer::SeekDebouncer;
+use crate::gui::aspect_ratio::AspectRatioOverride;
+use crate::gui::dialogs::{AudioConfigDialog, SubtitleConfigDialog, VideoConfigDialog};
 use crate::overlay::format_timecode_hud;
 use crate::snapshot::PlayerUiSnapshot;
 
 /// Supported playback speeds in the speed selector.
-pub const SUPPORTED_SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+pub const SUPPORTED_SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
 /// State of audio volume and mute controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +102,8 @@ pub struct ControlsBarState {
     pub volume: VolumeControlState,
     /// Currently selected playback speed multiplier.
     pub speed: f64,
+    /// Active aspect ratio override preset.
+    pub aspect_ratio: AspectRatioOverride,
     /// Active drag scrub position in milliseconds (if user is actively dragging the seekbar).
     pub drag_pts_ms: Option<u64>,
     /// Hover preview timestamp in milliseconds (if mouse is hovering over seekbar).
@@ -110,6 +114,12 @@ pub struct ControlsBarState {
     pub is_fullscreen: bool,
     /// Auto-hide timeout duration (default 2.5s).
     pub autohide_delay_secs: f64,
+    /// Audio configuration modal dialog.
+    pub audio_dialog: AudioConfigDialog,
+    /// Subtitle configuration modal dialog.
+    pub subtitle_dialog: SubtitleConfigDialog,
+    /// Video configuration modal dialog.
+    pub video_dialog: VideoConfigDialog,
 }
 
 impl Default for ControlsBarState {
@@ -118,11 +128,15 @@ impl Default for ControlsBarState {
             debouncer: SeekDebouncer::default(),
             volume: VolumeControlState::default(),
             speed: 1.0,
+            aspect_ratio: AspectRatioOverride::Original,
             drag_pts_ms: None,
             hover_pts_ms: None,
             last_mouse_activity: Instant::now(),
             is_fullscreen: false,
             autohide_delay_secs: 2.5,
+            audio_dialog: AudioConfigDialog::default(),
+            subtitle_dialog: SubtitleConfigDialog::default(),
+            video_dialog: VideoConfigDialog::default(),
         }
     }
 }
@@ -158,6 +172,32 @@ impl ControlsBarState {
         let s = sec % 60;
         format!("{:02}:{:02}:{:02}", h, m, s)
     }
+
+    /// Opens the audio configuration dialog, synchronizing volume and mute state.
+    pub fn open_audio_dialog(&mut self) {
+        self.audio_dialog.volume = self.volume.volume;
+        self.audio_dialog.is_muted = self.volume.is_muted;
+        self.audio_dialog.open();
+    }
+
+    /// Opens the subtitle configuration dialog.
+    pub fn open_subtitle_dialog(&mut self) {
+        self.subtitle_dialog.open();
+    }
+
+    /// Opens the video configuration dialog, synchronizing aspect ratio and speed.
+    pub fn open_video_dialog(&mut self) {
+        self.video_dialog.speed = self.speed;
+        self.video_dialog.aspect_ratio = self.aspect_ratio;
+        self.video_dialog.open();
+    }
+
+    /// Renders any active modal dialogs (Audio, Video, Subtitle) to the UI context.
+    pub fn show_dialogs(&mut self, ctx: &Context) {
+        self.audio_dialog.show(ctx);
+        self.subtitle_dialog.show(ctx);
+        self.video_dialog.show(ctx);
+    }
 }
 
 /// Actions emitted by the playback controls bar to the application coordinator.
@@ -175,10 +215,20 @@ pub enum ControlsBarAction {
     ToggleMute,
     /// Set playback speed ratio.
     SetSpeed(f64),
+    /// Set aspect ratio override.
+    SetAspectRatio(AspectRatioOverride),
+    /// Cycle to next aspect ratio preset.
+    CycleAspectRatio,
     /// Toggle watch-party sidebar open/closed.
     ToggleSidebar,
     /// Toggle fullscreen mode (F11).
     ToggleFullscreen,
+    /// Open audio configuration modal dialog.
+    OpenAudioSettings,
+    /// Open subtitle configuration modal dialog.
+    OpenSubtitleSettings,
+    /// Open video configuration modal dialog.
+    OpenVideoSettings,
 }
 
 /// Modern sleek dark aesthetics palette for player controls bar.
@@ -464,7 +514,96 @@ impl PlaybackControlsBar {
 
                 ui.separator();
 
-                // Playback Speed Selector (0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 2.0x)
+                // Video Configuration Quick-Access Button
+                let video_active = state.video_dialog.is_open;
+                let video_btn = egui::Button::new(
+                    RichText::new("🎬")
+                        .size(13.0)
+                        .color(if video_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
+                )
+                .min_size(Vec2::new(28.0, 28.0))
+                .fill(if video_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
+
+                if ui
+                    .add(video_btn)
+                    .on_hover_text("Video Settings (Aspect Ratio, Playback Speed, Stream Info)")
+                    .clicked()
+                {
+                    state.video_dialog.is_open = !state.video_dialog.is_open;
+                    if state.video_dialog.is_open {
+                        state.video_dialog.speed = state.speed;
+                        state.video_dialog.aspect_ratio = state.aspect_ratio;
+                    }
+                    actions.push(ControlsBarAction::OpenVideoSettings);
+                }
+
+                // Subtitle Configuration Quick-Access Button
+                let sub_active = state.subtitle_dialog.is_open;
+                let sub_btn = egui::Button::new(
+                    RichText::new("CC")
+                        .strong()
+                        .size(12.0)
+                        .color(if sub_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
+                )
+                .min_size(Vec2::new(28.0, 28.0))
+                .fill(if sub_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
+
+                if ui
+                    .add(sub_btn)
+                    .on_hover_text("Subtitle Settings (Tracks, External Subtitles, Sync Offset)")
+                    .clicked()
+                {
+                    state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
+                    actions.push(ControlsBarAction::OpenSubtitleSettings);
+                }
+
+                // Audio Configuration Quick-Access Button
+                let audio_active = state.audio_dialog.is_open;
+                let audio_btn = egui::Button::new(
+                    RichText::new("🎚")
+                        .size(13.0)
+                        .color(if audio_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
+                )
+                .min_size(Vec2::new(28.0, 28.0))
+                .fill(if audio_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
+
+                if ui
+                    .add(audio_btn)
+                    .on_hover_text("Audio Settings (Track Selection, Volume, Sync Delay)")
+                    .clicked()
+                {
+                    state.audio_dialog.is_open = !state.audio_dialog.is_open;
+                    if state.audio_dialog.is_open {
+                        state.audio_dialog.volume = state.volume.volume;
+                        state.audio_dialog.is_muted = state.volume.is_muted;
+                    }
+                    actions.push(ControlsBarAction::OpenAudioSettings);
+                }
+
+                ui.separator();
+
+                // Aspect Ratio Selector (Original, 16:9, 4:3, 21:9, 1:1, Fill/Stretch)
+                let aspect_label = format!("📐 {}", state.aspect_ratio.display_name());
+                egui::ComboBox::from_id_salt("aspect_ratio_selector")
+                    .selected_text(
+                        RichText::new(aspect_label)
+                            .size(12.0)
+                            .color(style::TEXT_PRIMARY),
+                    )
+                    .width(88.0)
+                    .show_ui(ui, |ui| {
+                        for &ar in &AspectRatioOverride::ALL {
+                            let is_selected = state.aspect_ratio == ar;
+                            if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                                state.aspect_ratio = ar;
+                                actions.push(ControlsBarAction::SetAspectRatio(ar));
+                            }
+                        }
+                    });
+
+                ui.separator();
+
+                // Playback Speed Selector (0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 1.75x, 2.0x)
                 let speed_label = format!("{:.2}x", state.speed);
                 egui::ComboBox::from_id_salt("playback_speed_selector")
                     .selected_text(
@@ -606,5 +745,49 @@ mod tests {
         // User activity revives visibility
         state.on_user_activity(t0 + Duration::from_millis(3000));
         assert!(state.is_visible(t0 + Duration::from_millis(3100)));
+    }
+
+    #[test]
+    fn test_supported_speeds_inventory() {
+        assert_eq!(SUPPORTED_SPEEDS.len(), 8);
+        assert_eq!(
+            SUPPORTED_SPEEDS,
+            [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        );
+        for window in SUPPORTED_SPEEDS.windows(2) {
+            assert!(window[0] < window[1], "Speeds must be in strictly ascending order");
+        }
+    }
+
+    #[test]
+    fn test_controls_bar_aspect_ratio_state() {
+        let mut state = ControlsBarState::new();
+        assert_eq!(state.aspect_ratio, AspectRatioOverride::Original);
+
+        state.aspect_ratio = AspectRatioOverride::Ratio16_9;
+        assert_eq!(state.aspect_ratio, AspectRatioOverride::Ratio16_9);
+
+        state.aspect_ratio = AspectRatioOverride::FillStretch;
+        assert_eq!(state.aspect_ratio, AspectRatioOverride::FillStretch);
+    }
+
+    #[test]
+    fn test_controls_bar_dialog_interactions() {
+        let mut state = ControlsBarState::new();
+        assert!(!state.audio_dialog.is_open);
+        assert!(!state.subtitle_dialog.is_open);
+        assert!(!state.video_dialog.is_open);
+
+        state.open_audio_dialog();
+        assert!(state.audio_dialog.is_open);
+        assert_eq!(state.audio_dialog.volume, state.volume.volume);
+
+        state.open_subtitle_dialog();
+        assert!(state.subtitle_dialog.is_open);
+
+        state.open_video_dialog();
+        assert!(state.video_dialog.is_open);
+        assert_eq!(state.video_dialog.speed, state.speed);
+        assert_eq!(state.video_dialog.aspect_ratio, state.aspect_ratio);
     }
 }

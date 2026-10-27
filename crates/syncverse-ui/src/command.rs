@@ -49,4 +49,55 @@ pub enum PlayerCommand {
     SetForcePlay(bool),
     /// Host trigger to bypass unpause gate immediately.
     ForcePlay,
+    /// Select audio track by track ID.
+    SelectAudioTrack(u64),
+    /// Cycle to the next discovered audio track.
+    CycleAudioTrack,
+    /// Set presentation audio delay in milliseconds.
+    SetAudioDelay(i64),
+    /// Adjust presentation audio delay by delta milliseconds.
+    AdjustAudioDelay(i64),
+    /// Select active subtitle track by index (`None` disables subtitles).
+    SelectSubtitleTrack(Option<usize>),
+    /// Cycle to the next discovered subtitle track (including Off).
+    CycleSubtitleTrack,
+    /// Set presentation subtitle delay in milliseconds.
+    SetSubtitleDelay(i64),
+    /// Adjust presentation subtitle delay by delta milliseconds.
+    AdjustSubtitleDelay(i64),
+    /// Cycle video aspect ratio to the next preset mode.
+    CycleAspectRatio,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_player_command_variants() {
+        let cmd_audio = PlayerCommand::SelectAudioTrack(1);
+        let cmd_cycle_audio = PlayerCommand::CycleAudioTrack;
+        let cmd_audio_delay = PlayerCommand::SetAudioDelay(-50);
+        let cmd_adj_audio = PlayerCommand::AdjustAudioDelay(50);
+        let cmd_sub = PlayerCommand::SelectSubtitleTrack(Some(0));
+        let cmd_sub_off = PlayerCommand::SelectSubtitleTrack(None);
+        let cmd_cycle_sub = PlayerCommand::CycleSubtitleTrack;
+        let cmd_sub_delay = PlayerCommand::SetSubtitleDelay(100);
+        let cmd_adj_sub = PlayerCommand::AdjustSubtitleDelay(-100);
+        let cmd_aspect = PlayerCommand::CycleAspectRatio;
+
+        assert_eq!(cmd_audio, PlayerCommand::SelectAudioTrack(1));
+        assert_eq!(cmd_cycle_audio, PlayerCommand::CycleAudioTrack);
+        assert_eq!(cmd_audio_delay, PlayerCommand::SetAudioDelay(-50));
+        assert_eq!(cmd_adj_audio, PlayerCommand::AdjustAudioDelay(50));
+        assert_eq!(cmd_sub, PlayerCommand::SelectSubtitleTrack(Some(0)));
+        assert_eq!(cmd_sub_off, PlayerCommand::SelectSubtitleTrack(None));
+        assert_eq!(cmd_cycle_sub, PlayerCommand::CycleSubtitleTrack);
+        assert_eq!(cmd_sub_delay, PlayerCommand::SetSubtitleDelay(100));
+        assert_eq!(cmd_adj_sub, PlayerCommand::AdjustSubtitleDelay(-100));
+        assert_eq!(cmd_aspect, PlayerCommand::CycleAspectRatio);
+
+        assert_ne!(cmd_audio, cmd_cycle_audio);
+        assert_ne!(cmd_sub, cmd_sub_off);
+    }
 }
