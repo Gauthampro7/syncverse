@@ -79,7 +79,7 @@ jobs:
       - name: Compile Release Binary
         shell: powershell
         run: |
-          cargo build --release --bin syncplay-alt
+          cargo build --release --bin syncverse
 
       - name: Stage Runtime DLLs
         shell: powershell
