@@ -213,16 +213,29 @@ impl UniversalAudioDecoder {
         Ok(output_frames)
     }
 
-    /// Flushes residual buffered frames from the decoder and the resampler delay line.
+    /// Resets internal decoder buffers and resampler state (for random-access seek).
+    pub fn flush_buffers(&mut self) {
+        self.decoder.flush();
+        self.resampler = None;
+        self.last_in_format = None;
+        self.last_in_layout = None;
+        self.last_in_rate = None;
+        self.current_packet_pts_ms = 0;
+        self.cumulative_samples_since_pts = 0;
+    }
+
+    /// Flushes residual buffered frames from the decoder and the resampler delay line,
+    /// and resets the decoder state for subsequent playback.
     pub fn flush(&mut self) -> Result<Vec<AudioFramePCM>, UniversalAudioError> {
-        self.decoder.send_eof()?;
+        let _ = self.decoder.send_eof();
 
         let mut output_frames = Vec::new();
         let mut raw_frame = AudioFrame::empty();
 
         while self.decoder.receive_frame(&mut raw_frame).is_ok() {
-            let pcm_frame = self.process_and_resample(&mut raw_frame)?;
-            output_frames.push(pcm_frame);
+            if let Ok(pcm_frame) = self.process_and_resample(&mut raw_frame) {
+                output_frames.push(pcm_frame);
+            }
         }
 
         // Flush resampler internal delay buffer if active
@@ -242,17 +255,21 @@ impl UniversalAudioDecoder {
                             + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64);
                         self.cumulative_samples_since_pts += flush_frame.samples() as u64;
 
-                        let pcm_frame = AudioFramePCM::new(
+                        if let Ok(pcm_frame) = AudioFramePCM::new(
                             TARGET_AUDIO_SAMPLE_RATE,
                             TARGET_AUDIO_CHANNELS,
                             pts,
                             samples,
-                        )?;
-                        output_frames.push(pcm_frame);
+                        ) {
+                            output_frames.push(pcm_frame);
+                        }
                     }
                 }
             }
         }
+
+        // Reset the codec context buffers and EOF state so future packets can be decoded!
+        self.flush_buffers();
 
         Ok(output_frames)
     }

@@ -661,3 +661,62 @@ fn test_audio_resampler_dynamic_reconfiguration() {
         }
     }
 }
+
+// ============================================================================
+// 9. AUDIO DECODER POST-SEEK AND POST-FLUSH RESUMPTION TEST
+// ============================================================================
+
+#[test]
+fn test_audio_decoder_post_seek_and_post_flush_resumption() {
+    init_ffmpeg();
+
+    let p = generate_audio_fixture("seek_resume.aac", "aac", "adts", 44100, 2, &[]);
+    let mut ictx = ffmpeg::format::input(&p).expect("open aac");
+    let stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .expect("audio stream");
+
+    let mut dec = UniversalAudioDecoder::from_parameters(
+        stream.parameters(),
+        Some((stream.time_base().0, stream.time_base().1)),
+    )
+    .expect("create audio decoder");
+
+    let packets: Vec<(usize, Vec<u8>)> = ictx
+        .packets()
+        .filter(|(s, _)| s.index() == 0)
+        .map(|(s, pkt)| (s.index(), pkt.data().unwrap_or(&[]).to_vec()))
+        .collect();
+
+    assert!(packets.len() >= 5, "Need at least 5 packets to test seek resumption");
+
+    // 1. Decode first 2 packets
+    let f1 = dec.decode_packet(&packets[0].1, 0).expect("decode packet 0");
+    let f2 = dec.decode_packet(&packets[1].1, 23).expect("decode packet 1");
+    let initial_count = f1.len() + f2.len();
+    assert!(initial_count > 0, "Initial decode must yield frames");
+
+    // 2. Perform seek: flush_buffers()
+    dec.flush_buffers();
+
+    // 3. Decode packet 2 post-seek: must NOT error with EOF or broken state!
+    let f3 = dec.decode_packet(&packets[2].1, 600000).expect("decode packet 2 after flush_buffers");
+    assert!(!f3.is_empty(), "Packet 2 after flush_buffers must yield frames");
+    for f in &f3 {
+        assert_eq!(f.sample_rate, 48000);
+        assert_eq!(f.channels, 2);
+    }
+
+    // 4. Test calling flush() (drains and resets)
+    let _ = dec.flush().expect("flush must succeed");
+
+    // 5. Decode packet 3 post-flush: must NOT error with EOF!
+    let f4 = dec.decode_packet(&packets[3].1, 600023).expect("decode packet 3 after flush");
+    assert!(!f4.is_empty(), "Packet 3 after flush must yield frames");
+    for f in &f4 {
+        assert_eq!(f.sample_rate, 48000);
+        assert_eq!(f.channels, 2);
+    }
+}
+

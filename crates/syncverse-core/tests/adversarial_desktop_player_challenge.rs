@@ -802,3 +802,193 @@ fn test_load_external_subtitle_corrupt_and_nonexistent_resilience() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+// ============================================================================
+// SECTION 6: END-TO-END AUDIO PLAYBACK POST-SEEK & TRACK SWITCHING RESILIENCE
+// ============================================================================
+
+#[test]
+fn test_e2e_audio_playback_after_seek_and_track_switch() {
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use syncverse_clock::MasterClock;
+    use syncverse_clock::PlaybackState;
+    use syncverse_clock::SpscRingBuffer;
+    use syncverse_codecs::VideoFrameRGBA;
+    use syncverse_core::playback_runtime::{run_playback_worker, AudioWorkerCommand};
+    use syncverse_ui::command::PlayerCommand;
+    use syncverse_ui::event::UiEvent;
+    use syncverse_ui::snapshot::TripleBufferSnapshotExchange;
+
+    let temp_dir = std::env::temp_dir().join(format!("syncverse_audio_seek_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    let media_path = temp_dir.join("seek_test.mkv");
+
+    // Generate 12-second test file with 2 audio streams (AAC and MP3)
+    let cmd_status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=12:size=320x240:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=1000:duration=12",
+            "-f", "lavfi", "-i", "sine=frequency=500:duration=12",
+            "-map", "0:v",
+            "-map", "1:a",
+            "-map", "2:a",
+            "-c:v", "libx264",
+            "-c:a:0", "aac",
+            "-c:a:1", "libmp3lame",
+            media_path.to_str().unwrap(),
+        ])
+        .status();
+
+    if cmd_status.is_err() || !cmd_status.as_ref().unwrap().success() {
+        // Fallback: write dummy file if ffmpeg CLI is not present
+        fs::write(&media_path, b"dummy media").unwrap();
+        let _ = fs::remove_dir_all(&temp_dir);
+        return;
+    }
+
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, command_rx) = channel::<PlayerCommand>();
+    let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let thread_exchange = Arc::clone(&exchange);
+    let thread_video_ring = Arc::clone(&video_ring);
+    let thread_clock = Arc::clone(&clock);
+    let thread_running = Arc::clone(&running);
+
+    let drain_video_ring = Arc::clone(&video_ring);
+    let drain_running = Arc::clone(&running);
+    let drain_handle = std::thread::spawn(move || {
+        while drain_running.load(Ordering::Relaxed) {
+            while drain_video_ring.try_pop().is_some() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let worker_handle = std::thread::spawn(move || {
+        run_playback_worker(
+            command_rx,
+            audio_tx,
+            event_tx,
+            thread_exchange,
+            thread_video_ring,
+            thread_clock,
+            thread_running,
+        );
+    });
+
+    // 1. Open media file
+    command_tx.send(PlayerCommand::OpenFile(media_path.clone())).unwrap();
+
+    // Wait for TracksDiscovered event
+    let start = std::time::Instant::now();
+    let mut tracks_ready = false;
+    while start.elapsed() < Duration::from_secs(3) {
+        if let Ok(UiEvent::TracksDiscovered { .. }) = event_rx.recv_timeout(Duration::from_millis(100)) {
+            tracks_ready = true;
+            break;
+        }
+    }
+    assert!(tracks_ready, "TracksDiscovered must be emitted");
+
+    // 2. Start playback
+    command_tx.send(PlayerCommand::ForcePlay).unwrap();
+
+    // Receive initial audio samples
+    let mut initial_samples = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(100)) {
+            initial_samples += samples.len();
+            if initial_samples > 4096 {
+                break;
+            }
+        }
+    }
+    assert!(initial_samples > 4096, "Initial playback must yield audio samples (got {initial_samples})");
+
+    // 3. Perform a long seek: jump 6 seconds forward (simulates 10-minute skip)
+    command_tx.send(PlayerCommand::Seek(6000)).unwrap();
+
+    // Verify audio samples CONTINUE to be decoded and output after the seek!
+    let mut post_seek_samples = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match audio_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(AudioWorkerCommand::Samples(samples)) => {
+                post_seek_samples += samples.len();
+                if post_seek_samples > 4096 {
+                    break;
+                }
+            }
+            Ok(AudioWorkerCommand::Reset) => {
+                // Reset is expected on seek
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        post_seek_samples > 4096,
+        "Audio MUST continue decoding and outputting samples post-seek (got {post_seek_samples})"
+    );
+
+    // 4. Test cycling audio track
+    command_tx.send(PlayerCommand::CycleAudioTrack).unwrap();
+
+    let mut post_cycle_samples = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match audio_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(AudioWorkerCommand::Samples(samples)) => {
+                post_cycle_samples += samples.len();
+                if post_cycle_samples > 4096 {
+                    break;
+                }
+            }
+            Ok(AudioWorkerCommand::Reset) => {}
+            _ => {}
+        }
+    }
+    assert!(
+        post_cycle_samples > 4096,
+        "Audio MUST continue outputting samples post-cycle (got {post_cycle_samples})"
+    );
+
+    // 5. Seek again after track cycling to ensure second seek also works seamlessly!
+    command_tx.send(PlayerCommand::Seek(9000)).unwrap();
+
+    let mut second_seek_samples = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match audio_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(AudioWorkerCommand::Samples(samples)) => {
+                second_seek_samples += samples.len();
+                if second_seek_samples > 4096 {
+                    break;
+                }
+            }
+            Ok(AudioWorkerCommand::Reset) => {}
+            _ => {}
+        }
+    }
+    assert!(
+        second_seek_samples > 4096,
+        "Audio MUST continue outputting samples after second seek (got {second_seek_samples})"
+    );
+
+    // 6. Cleanup
+    running.store(false, Ordering::Relaxed);
+    let _ = command_tx.send(PlayerCommand::Stop);
+    let _ = drain_handle.join();
+    let _ = worker_handle.join();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+

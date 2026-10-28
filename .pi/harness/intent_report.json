@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-28T11:27:33Z",
+  "timestamp": "2026-10-28T12:37:56Z",
   "total_intents": 8,
   "passed_intents": 8,
   "compliance_score_percent": 100.0,
@@ -10,7 +10,7 @@
       "name": "Universal Media Compatibility & Zero Monolithic Player / Database Wrappers",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.213,
+      "duration_s": 0.21,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -28,7 +28,7 @@
       "name": "Barrier-Synchronized Two-Phase Commit Unpause",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.02,
+      "duration_s": 0.016,
       "invariants_count": 3,
       "error_snippet": null
     },
@@ -37,7 +37,7 @@
       "name": "Crash-Resilient Dual-Temporal Local Smart Chat",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.019,
+      "duration_s": 0.021,
       "invariants_count": 6,
       "error_snippet": null
     },
@@ -46,7 +46,7 @@
       "name": "Desktop Graphical UI Architecture & Decoupled Lock-Free Responsiveness",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.724,
+      "duration_s": 0.723,
       "invariants_count": 7,
       "error_snippet": null
     },
@@ -55,7 +55,7 @@
       "name": "Zero-Allocation Fixed-Point Color Transformation",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.224,
+      "duration_s": 0.22,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -64,7 +64,7 @@
       "name": "Robust Container Demuxing & Timescale Integer Arithmetic",
       "success": true,
       "exit_code": 0,
-      "duration_s": 0.236,
+      "duration_s": 0.234,
       "invariants_count": 4,
       "error_snippet": null
     },
@@ -73,7 +73,7 @@
       "name": "OpenSpec Traceability & Anti-Drift Guarantee",
       "success": true,
       "exit_code": 0,
-      "duration_s": 12.619,
+      "duration_s": 13.038,
       "invariants_count": 4,
       "error_snippet": null
     }

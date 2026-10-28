@@ -55,7 +55,6 @@ fn run_audio_sink_worker(rx: Receiver<AudioWorkerCommand>, running: Arc<AtomicBo
                 let _ = sink.resume();
             }
             Ok(AudioWorkerCommand::Reset) => {
-                while rx.try_recv().is_ok() {}
                 sink = AutoAudioSink::new();
             }
             Err(_) => {}
@@ -317,7 +316,7 @@ impl PlaybackSession {
             vdec.flush();
         }
         if let Some(ref mut adec) = self.audio_decoder {
-            let _ = adec.flush();
+            adec.flush_buffers();
         }
         while video_ring.try_pop().is_some() {}
         self.seek_min_audio_pts = Some(target_ms);

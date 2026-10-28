@@ -36,7 +36,7 @@ fn main() {
             print_usage();
         }
         "version" | "--version" | "-v" => {
-            println!("syncverse v0.1.1 (pure-Rust standalone player, VLC-grade desktop UI)");
+            println!("syncverse v{} (pure-Rust standalone player, VLC-grade desktop UI)", env!("CARGO_PKG_VERSION"));
         }
         "verify" => {
             run_verify_command();
