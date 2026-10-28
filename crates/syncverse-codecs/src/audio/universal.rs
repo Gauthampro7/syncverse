@@ -199,7 +199,8 @@ impl UniversalAudioDecoder {
         self.current_packet_pts_ms = pts_ms;
         self.cumulative_samples_since_pts = 0;
 
-        let pkt = Packet::copy(packet_data);
+        let mut pkt = Packet::copy(packet_data);
+        pkt.set_pts(Some(pts_ms as i64));
         self.decoder.send_packet(&pkt)?;
 
         let mut output_frames = Vec::new();
@@ -324,18 +325,9 @@ impl UniversalAudioDecoder {
         let plane = out_frame.plane::<f32>(0);
         let samples: Vec<f32> = plane.iter().map(|&s| s.clamp(-1.0, 1.0)).collect();
 
-        // Calculate PTS with millisecond precision
-        let frame_pts_ms = if let (Some(pts), Some(tb)) = (raw_frame.pts(), self.time_base) {
-            if tb.0 > 0 && tb.1 > 0 {
-                (pts as f64 * (tb.0 as f64) * 1000.0 / (tb.1 as f64)) as u64
-            } else {
-                self.current_packet_pts_ms
-                    + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64)
-            }
-        } else {
-            self.current_packet_pts_ms
-                + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64)
-        };
+        // Calculate PTS with millisecond precision anchored to container packet timestamp
+        let frame_pts_ms = self.current_packet_pts_ms
+            + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64);
 
         self.cumulative_samples_since_pts += out_samples_count as u64;
 

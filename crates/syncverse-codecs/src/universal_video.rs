@@ -235,22 +235,25 @@ impl UniversalVideoDecoder {
         min_pts_ms: Option<u64>,
     ) -> Result<Option<VideoFrameRGBA>, CodecError> {
         let mut decoded = ffmpeg::util::frame::Video::empty();
-        match self.decoder.receive_frame(&mut decoded) {
-            Ok(()) => {
-                let pts_ms = decoded.pts().map(|p| p.max(0) as u64).unwrap_or(self.last_pts_ms);
-                if let Some(min_pts) = min_pts_ms {
-                    if pts_ms + 15 < min_pts {
-                        return Ok(None);
+        loop {
+            match self.decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    let pts_ms = decoded.pts().map(|p| p.max(0) as u64).unwrap_or(self.last_pts_ms);
+                    if let Some(min_pts) = min_pts_ms {
+                        if pts_ms + 15 < min_pts {
+                            // Frame is before seek target: skip expensive pixel scaling/color conversion and keep draining
+                            continue;
+                        }
                     }
+                    let yuv = self.map_frame_to_yuv420p(&decoded, pts_ms)?;
+                    let mut rgba = VideoFrameRGBA::new(yuv.width, yuv.height, yuv.pts_ms);
+                    convert_yuv420p_to_rgba(&yuv, &mut rgba, self.color_standard)?;
+                    return Ok(Some(rgba));
                 }
-                let yuv = self.map_frame_to_yuv420p(&decoded, pts_ms)?;
-                let mut rgba = VideoFrameRGBA::new(yuv.width, yuv.height, yuv.pts_ms);
-                convert_yuv420p_to_rgba(&yuv, &mut rgba, self.color_standard)?;
-                Ok(Some(rgba))
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::ffi::EAGAIN => return Ok(None),
+                Err(ffmpeg::Error::Eof) => return Ok(None),
+                Err(e) => return Err(CodecError::Decoder(format!("receive_frame error: {e}"))),
             }
-            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::ffi::EAGAIN => Ok(None),
-            Err(ffmpeg::Error::Eof) => Ok(None),
-            Err(e) => Err(CodecError::Decoder(format!("receive_frame error: {e}"))),
         }
     }
 

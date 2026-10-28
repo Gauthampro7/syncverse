@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use syncverse_chat::{ChatRecord, RoomAnnouncement};
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncverse_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
-use syncverse_demux::{Demuxer, TrackInfo, TrackType, UniversalDemuxer};
+use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::{ClientNode, HostServer, PeerStatusPayload};
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
@@ -49,6 +49,18 @@ pub enum AudioWorkerCommand {
     Reset,
 }
 
+/// Applies volume scaling and clamping to normalized audio samples.
+#[inline]
+fn scale_audio_samples(samples: &[f32], volume: f32) -> Vec<f32> {
+    if volume < 1e-4 {
+        vec![0.0f32; samples.len()]
+    } else if (volume - 1.0).abs() < 1e-3 {
+        samples.iter().map(|s| s.clamp(-1.0, 1.0)).collect()
+    } else {
+        samples.iter().map(|s| (s * volume).clamp(-1.0, 1.0)).collect()
+    }
+}
+
 /// Runs the dedicated audio sink output loop on an isolated OS thread with MasterClock pacing and closed-loop sync.
 fn run_audio_sink_worker(
     rx: Receiver<AudioWorkerCommand>,
@@ -57,7 +69,7 @@ fn run_audio_sink_worker(
 ) {
     let mut sink = AutoAudioSink::new();
     let mut local_generation: u64 = 0;
-    let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(64);
+    let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(128);
 
     while running.load(Ordering::Relaxed) {
         // 1. Drain incoming commands non-blockingly to catch Resets and queue fresh samples
@@ -148,17 +160,18 @@ fn run_audio_sink_worker(
         let master_pts = clock.current_pts(now);
         let delta = (pts_ms as f64) - master_pts;
 
-        if delta < -200.0 {
-            // Severely late frame (> 200ms behind master clock): drop it immediately to prevent audio lag!
+        if delta < -500.0 {
+            // Severely late frame (> 500ms behind master clock): drop to resynchronize
             pending_queue.pop_front();
             continue;
-        } else if delta > 60.0 {
-            // Frame is early (> 60ms in future): do not write to soundcard yet! Wait briefly.
-            let sleep_ms = (delta - 30.0).clamp(1.0, 10.0) as u64;
+        } else if delta > 80.0 {
+            // Frame is early (> 80ms ahead of master clock): soundcard buffer is well supplied.
+            // Wait briefly to maintain ~50-80ms lead buffer.
+            let sleep_ms = (delta - 50.0).clamp(1.0, 10.0) as u64;
             thread::sleep(Duration::from_millis(sleep_ms));
             continue;
         } else {
-            // Frame is on-time (-200ms <= delta <= 60ms): write to soundcard!
+            // Frame is within presentation window (-500ms <= delta <= 80ms): write to soundcard!
             let (_, samples, _) = pending_queue.pop_front().unwrap();
             if sink.write_samples(&samples).is_err() {
                 sink = AutoAudioSink::new();
@@ -210,8 +223,7 @@ struct PlaybackSession {
     subtitle_track_id: Option<u64>,
     duration_ms: u64,
     eof_reached: bool,
-    seek_min_audio_pts: Option<u64>,
-    seek_min_video_pts: Option<u64>,
+    pending_video_packets: VecDeque<DemuxPacket>,
 }
 
 impl PlaybackSession {
@@ -320,8 +332,7 @@ impl PlaybackSession {
             subtitle_track_id: None,
             duration_ms,
             eof_reached: false,
-            seek_min_audio_pts: None,
-            seek_min_video_pts: None,
+            pending_video_packets: VecDeque::with_capacity(64),
         })
     }
 
@@ -419,26 +430,14 @@ impl PlaybackSession {
         }
     }
 
-    /// Performs random-access seek, flushes internal decoder buffers, and drains presentation ring.
-    /// Returns the target presentation timestamp (in ms) where playback will resume.
-    fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
-        let _ = self.demuxer.seek_to(target_ms);
-        if let Some(ref mut vdec) = self.video_decoder {
-            vdec.flush();
-        }
-        if let Some(ref mut adec) = self.audio_decoder {
-            adec.flush_buffers();
-        }
-        while video_ring.try_pop().is_some() {}
-        self.seek_min_audio_pts = Some(target_ms);
-        self.seek_min_video_pts = Some(target_ms);
-        self.eof_reached = false;
-        target_ms
-    }
-
-    /// Performs seek while paused, decoding video preroll up to `target_ms` to present an immediate preview in the UI,
-    /// buffering any audio at `target_ms` for seamless resumption upon unpausing.
-    fn seek_paused(
+    /// Performs synchronous random-access seek and keyframe preroll forward to `target_ms`.
+    ///
+    /// Freezes playback timeline during preroll, decodes video reference pictures without RGBA
+    /// conversions until reaching `target_ms`, discards pre-target audio, and trims the boundary
+    /// audio frame to align sample-exact with the target millisecond.
+    ///
+    /// Returns the exact presentation timestamp where playback will resume.
+    fn seek_preroll(
         &mut self,
         target_ms: u64,
         video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>,
@@ -447,16 +446,31 @@ impl PlaybackSession {
         effective_vol: f32,
         audio_delay_ms: i64,
     ) -> u64 {
-        let _ = self.seek(target_ms, video_ring);
+        self.pending_video_packets.clear();
+        let _ = self.demuxer.seek_to(target_ms);
+        if let Some(ref mut vdec) = self.video_decoder {
+            vdec.flush();
+        }
+        if let Some(ref mut adec) = self.audio_decoder {
+            adec.flush_buffers();
+        }
+        while video_ring.try_pop().is_some() {}
+        self.eof_reached = false;
 
-        if self.video_track_id.is_some() {
-            let mut preview_frame: Option<VideoFrameRGBA> = None;
-            let mut packets_read = 0;
-            while packets_read < 160 {
-                match self.demuxer.read_packet() {
-                    Ok(Some(packet)) => {
-                        packets_read += 1;
-                        if Some(packet.track_id) == self.video_track_id {
+        let mut first_video_frame: Option<VideoFrameRGBA> = None;
+        let mut first_audio_sent = false;
+        let actual_landed_pts = target_ms;
+
+        let max_preroll_packets = 5000;
+        let mut packets_read = 0;
+
+        while packets_read < max_preroll_packets {
+            match self.demuxer.read_packet() {
+                Ok(Some(packet)) => {
+                    packets_read += 1;
+
+                    if Some(packet.track_id) == self.video_track_id {
+                        if first_video_frame.is_none() {
                             if let Some(ref mut vdec) = self.video_decoder {
                                 let _ = vdec.send_packet(
                                     &packet.data,
@@ -465,58 +479,68 @@ impl PlaybackSession {
                                     packet.is_keyframe,
                                 );
                                 if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba(Some(target_ms)) {
-                                    preview_frame = Some(rgba);
-                                    break;
+                                    first_video_frame = Some(rgba);
                                 }
                             }
-                        } else if Some(packet.track_id) == self.audio_track_id {
-                            let dur = packet.duration_ms.unwrap_or(25);
-                            if packet.pts_ms + dur >= target_ms {
-                                if let Some(ref mut adec) = self.audio_decoder {
-                                    let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
-                                    if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
-                                        for mut pcm in pcm_frames {
-                                            if pcm.pts_ms < target_ms {
-                                                let diff_ms = target_ms - pcm.pts_ms;
-                                                let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
-                                                let float_count = num_frames * pcm.channels as usize;
-                                                if float_count < pcm.samples.len() {
-                                                    pcm.samples.drain(0..float_count);
-                                                    pcm.pts_ms = target_ms;
-                                                } else {
-                                                    continue;
-                                                }
-                                            }
-                                            let samples = if effective_vol < 1e-4 {
-                                                vec![0.0f32; pcm.samples.len()]
-                                            } else if (effective_vol - 1.0).abs() < 1e-3 {
-                                                pcm.samples.iter().map(|s| s.clamp(-1.0, 1.0)).collect()
+                        } else {
+                            self.pending_video_packets.push_back(packet);
+                        }
+                    } else if Some(packet.track_id) == self.audio_track_id {
+                        let dur = packet.duration_ms.unwrap_or(25);
+                        if packet.pts_ms + dur >= target_ms {
+                            if let Some(ref mut adec) = self.audio_decoder {
+                                let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                                if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
+                                    for mut pcm in pcm_frames {
+                                        if pcm.pts_ms < target_ms {
+                                            let diff_ms = target_ms - pcm.pts_ms;
+                                            let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
+                                            let float_count = num_frames * pcm.channels as usize;
+                                            if float_count < pcm.samples.len() {
+                                                pcm.samples.drain(0..float_count);
+                                                pcm.pts_ms = target_ms;
                                             } else {
-                                                pcm.samples.iter().map(|s| (s * effective_vol).clamp(-1.0, 1.0)).collect()
-                                            };
-                                            let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
-                                                pts_ms: pcm.pts_ms,
-                                                samples,
-                                                generation: audio_generation,
-                                            });
+                                                continue;
+                                            }
                                         }
+                                        let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                        let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
+                                            pts_ms: pcm.pts_ms,
+                                            samples,
+                                            generation: audio_generation,
+                                        });
+                                        first_audio_sent = true;
                                     }
                                 }
-                                self.seek_min_audio_pts = None;
                             }
                         }
                     }
-                    _ => break,
-                }
-            }
 
-            if let Some(f) = preview_frame {
-                let _ = video_ring.try_push(f);
+                    let v_done = self.video_track_id.is_none() || first_video_frame.is_some();
+                    let a_done = self.audio_track_id.is_none() || first_audio_sent;
+                    if v_done && a_done {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    self.eof_reached = true;
+                    break;
+                }
+                Err(_) => break,
             }
-            self.seek_min_video_pts = None;
         }
 
-        target_ms
+        if let Some(frame) = first_video_frame {
+            let _ = video_ring.try_push(frame);
+        }
+
+        actual_landed_pts
+    }
+
+    /// Performs seek, flushes decoder buffers, and drains presentation ring.
+    fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
+        let (dummy_tx, _) = channel();
+        self.seek_preroll(target_ms, video_ring, &dummy_tx, 0, 1.0, 0)
     }
 }
 
@@ -949,30 +973,41 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::Seek(target_ms) => {
                     overflow_frame = None;
+                    let was_playing = clock.is_playing();
+                    let now = Instant::now();
+                    clock.set_state(now, PlaybackState::Seeking);
+                    clock.seek_to(target_ms as f64, now);
+
                     current_audio_generation = current_audio_generation.wrapping_add(1);
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
-                    let mut landed_pts = target_ms;
-                    if let Some(ref mut sess) = session {
-                        let is_playing = clock.is_playing();
-                        landed_pts = if is_playing {
-                            sess.seek(target_ms, &video_ring)
-                        } else {
-                            let effective_vol = if is_muted { 0.0 } else { volume };
-                            sess.seek_paused(
-                                target_ms,
-                                &video_ring,
-                                &audio_tx,
-                                current_audio_generation,
-                                effective_vol,
-                                audio_delay_ms,
-                            )
-                        };
-                        let now = Instant::now();
-                        clock.seek_to(landed_pts as f64, now);
+
+                    let landed_pts = if let Some(ref mut sess) = session {
+                        let effective_vol = if is_muted { 0.0 } else { volume };
+                        sess.seek_preroll(
+                            target_ms,
+                            &video_ring,
+                            &audio_tx,
+                            current_audio_generation,
+                            effective_vol,
+                            audio_delay_ms,
+                        )
+                    } else {
+                        target_ms
+                    };
+
+                    let resume_now = Instant::now();
+                    clock.seek_to(landed_pts as f64, resume_now);
+                    if was_playing {
+                        clock.set_state(resume_now, PlaybackState::Playing);
+                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    } else {
+                        clock.set_state(resume_now, PlaybackState::Paused);
+                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
                     }
+
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
-                            server.set_media_state(landed_pts, speed, !clock.is_playing());
+                            server.set_media_state(landed_pts, speed, !was_playing);
                             let _ = server.broadcast_room_state();
                         }
                         WatchPartyRole::Client { client, .. } => {
@@ -980,10 +1015,9 @@ pub fn run_playback_worker(
                         }
                         WatchPartyRole::None => {}
                     }
-                    let now = Instant::now();
                     let sender = get_sender_name(&party_role);
                     let msg = RoomAnnouncement::seeked_ms(&sender, landed_pts);
-                    broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
+                    broadcast_chat_announcement(&msg, resume_now, &clock, &mut party_role, &event_tx);
                 }
                 PlayerCommand::SetSpeed(spd) => {
                     speed = spd.clamp(0.2, 4.0);
@@ -1392,107 +1426,72 @@ pub fn run_playback_worker(
                     }
                 }
 
-                // If overflow is clear and video ring has capacity, demux & decode packets
-                if overflow_frame.is_none() {
+                // Decode pending video packets if video_ring has room
+                while overflow_frame.is_none() && !sess.pending_video_packets.is_empty() {
+                    if let Some(packet) = sess.pending_video_packets.pop_front() {
+                        if let Some(ref mut vdec) = sess.video_decoder {
+                            let _ = vdec.send_packet(
+                                &packet.data,
+                                packet.pts_ms,
+                                packet.dts_ms,
+                                packet.is_keyframe,
+                            );
+                            while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
+                                if let Err(err) = video_ring.try_push(rgba) {
+                                    overflow_frame = Some(err.item);
+                                    break;
+                                }
+                            }
+                        }
+                        did_work = true;
+                    }
+                }
+
+                // Demux new packets from container if pending_video_packets is not overfull (< 64 packets)
+                if sess.pending_video_packets.len() < 64 {
                     let mut packets_read = 0;
-                    let max_packets = if sess.seek_min_video_pts.is_some() || sess.seek_min_audio_pts.is_some() { 128 } else { 16 };
-                    while packets_read < max_packets {
+                    while packets_read < 32 {
                         match sess.demuxer.read_packet() {
                             Ok(Some(packet)) => {
                                 packets_read += 1;
                                 did_work = true;
+                                let pkt_pts_ms = packet.pts_ms;
 
-                                // Video packet decoding
                                 if Some(packet.track_id) == sess.video_track_id {
-                                    if let Some(ref mut vdec) = sess.video_decoder {
-                                        let _ = vdec.send_packet(
-                                            &packet.data,
-                                            packet.pts_ms,
-                                            packet.dts_ms,
-                                            packet.is_keyframe,
-                                        );
-                                        while let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba(sess.seek_min_video_pts) {
-                                            sess.seek_min_video_pts = None;
-                                            if let Err(err) = video_ring.try_push(rgba) {
-                                                overflow_frame = Some(err.item);
-                                                break;
+                                    if sess.pending_video_packets.is_empty() && overflow_frame.is_none() {
+                                        if let Some(ref mut vdec) = sess.video_decoder {
+                                            let _ = vdec.send_packet(
+                                                &packet.data,
+                                                packet.pts_ms,
+                                                packet.dts_ms,
+                                                packet.is_keyframe,
+                                            );
+                                            while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
+                                                if let Err(err) = video_ring.try_push(rgba) {
+                                                    overflow_frame = Some(err.item);
+                                                    break;
+                                                }
                                             }
                                         }
+                                    } else {
+                                        sess.pending_video_packets.push_back(packet);
                                     }
-                                }
-                                // Audio packet decoding & asynchronous output
-                                else if Some(packet.track_id) == sess.audio_track_id {
-                                    if let Some(min_pts) = sess.seek_min_audio_pts {
-                                        let dur = packet.duration_ms.unwrap_or(25);
-                                        if packet.pts_ms + dur < min_pts {
-                                            // Discard audio packets preceding seek target to prevent audio desync
-                                            continue;
-                                        }
-                                    }
+                                } else if Some(packet.track_id) == sess.audio_track_id {
                                     if let Some(ref mut adec) = sess.audio_decoder {
                                         let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
-                                        if let Ok(pcm_frames) =
-                                            adec.decode_packet(&packet.data, delayed_pts)
-                                        {
-                                            let effective_vol =
-                                                if is_muted { 0.0 } else { volume };
-                                            for mut pcm in pcm_frames {
-                                                if let Some(min_pts) = sess.seek_min_audio_pts {
-                                                    if pcm.pts_ms < min_pts {
-                                                        let diff_ms = min_pts - pcm.pts_ms;
-                                                        let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
-                                                        let float_count = num_frames * pcm.channels as usize;
-                                                        if float_count < pcm.samples.len() {
-                                                            pcm.samples.drain(0..float_count);
-                                                            pcm.pts_ms = min_pts;
-                                                        } else {
-                                                            continue;
-                                                        }
-                                                    }
-                                                    sess.seek_min_audio_pts = None;
-                                                }
-                                                if effective_vol < 1e-4 {
-                                                    let silence =
-                                                        vec![0.0f32; pcm.samples.len()];
-                                                    let _ = audio_tx.send(
-                                                        AudioWorkerCommand::TimestampedSamples {
-                                                            pts_ms: pcm.pts_ms,
-                                                            samples: silence,
-                                                            generation: current_audio_generation,
-                                                        },
-                                                    );
-                                                } else if (effective_vol - 1.0).abs() < 1e-3 {
-                                                    let clamped: Vec<f32> = pcm
-                                                        .samples
-                                                        .iter()
-                                                        .map(|s| s.clamp(-1.0, 1.0))
-                                                        .collect();
-                                                    let _ = audio_tx.send(
-                                                        AudioWorkerCommand::TimestampedSamples {
-                                                            pts_ms: pcm.pts_ms,
-                                                            samples: clamped,
-                                                            generation: current_audio_generation,
-                                                        },
-                                                    );
-                                                } else {
-                                                    let scaled: Vec<f32> = pcm
-                                                        .samples
-                                                        .iter()
-                                                        .map(|s| (s * effective_vol).clamp(-1.0, 1.0))
-                                                        .collect();
-                                                    let _ = audio_tx.send(
-                                                        AudioWorkerCommand::TimestampedSamples {
-                                                            pts_ms: pcm.pts_ms,
-                                                            samples: scaled,
-                                                            generation: current_audio_generation,
-                                                        },
-                                                    );
-                                                }
+                                        if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
+                                            let effective_vol = if is_muted { 0.0 } else { volume };
+                                            for pcm in pcm_frames {
+                                                let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                                let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
+                                                    pts_ms: pcm.pts_ms,
+                                                    samples,
+                                                    generation: current_audio_generation,
+                                                });
                                             }
                                         }
                                     }
-                                }
-                                else if Some(packet.track_id) == sess.subtitle_track_id {
+                                } else if Some(packet.track_id) == sess.subtitle_track_id {
                                     let text = if let Ok(s) = std::str::from_utf8(&packet.data) {
                                         syncverse_demux::subtitles::clean_srt_text(s)
                                     } else {
@@ -1509,15 +1508,14 @@ pub fn run_playback_worker(
                                     }
                                 }
 
-                                // Rate-limit demuxer for audio-only streams
                                 if sess.video_track_id.is_none() {
                                     let now_pts = clock.current_pts(Instant::now());
-                                    if (packet.pts_ms as f64) > now_pts + 500.0 {
+                                    if (pkt_pts_ms as f64) > now_pts + 500.0 {
                                         break;
                                     }
                                 }
 
-                                if overflow_frame.is_some() {
+                                if sess.pending_video_packets.len() >= 64 {
                                     break;
                                 }
                             }
@@ -1525,9 +1523,7 @@ pub fn run_playback_worker(
                                 sess.eof_reached = true;
                                 break;
                             }
-                            Err(_) => {
-                                break;
-                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1695,20 +1691,27 @@ pub fn run_playback_worker(
                         current_audio_generation = current_audio_generation.wrapping_add(1);
                         let _ = audio_tx.send(AudioWorkerCommand::Reset);
                         if let Some(ref mut sess) = session {
-                            let landed = if clock.is_playing() {
-                                sess.seek(target_pts_ms, &video_ring)
+                            let was_playing = clock.is_playing();
+                            clock.set_state(now, PlaybackState::Seeking);
+                            clock.seek_to(target_pts_ms as f64, now);
+                            let effective_vol = if is_muted { 0.0 } else { volume };
+                            let landed = sess.seek_preroll(
+                                target_pts_ms,
+                                &video_ring,
+                                &audio_tx,
+                                current_audio_generation,
+                                effective_vol,
+                                audio_delay_ms,
+                            );
+                            let resume_now = Instant::now();
+                            clock.seek_to(landed as f64, resume_now);
+                            if was_playing {
+                                clock.set_state(resume_now, PlaybackState::Playing);
+                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
                             } else {
-                                let effective_vol = if is_muted { 0.0 } else { volume };
-                                sess.seek_paused(
-                                    target_pts_ms,
-                                    &video_ring,
-                                    &audio_tx,
-                                    current_audio_generation,
-                                    effective_vol,
-                                    audio_delay_ms,
-                                )
-                            };
-                            clock.seek_to(landed as f64, now);
+                                clock.set_state(resume_now, PlaybackState::Paused);
+                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            }
                         }
                     } else if drift_ms > 15 && clock.is_playing() {
                         // Zone 2: Micro-speed steering
@@ -1941,13 +1944,9 @@ pub fn run_playback_worker(
         }
 
         // 5. Rate-limit thread execution
-        let is_prerolling = session
-            .as_ref()
-            .map(|s| s.seek_min_video_pts.is_some() || s.seek_min_audio_pts.is_some())
-            .unwrap_or(false);
         if !did_work {
             thread::sleep(Duration::from_millis(10));
-        } else if !is_prerolling {
+        } else {
             thread::sleep(Duration::from_millis(1));
         }
     }

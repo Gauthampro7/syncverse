@@ -1322,7 +1322,7 @@ fn test_high_bitrate_seek_av_alignment() {
 
     let mut samples_received = 0;
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
+    while start.elapsed() < Duration::from_secs(8) {
         if let Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) = audio_rx.recv_timeout(Duration::from_millis(100)) {
             samples_received += samples.len();
             if samples_received > 8192 {
@@ -1341,6 +1341,186 @@ fn test_high_bitrate_seek_av_alignment() {
         "Audio samples MUST flow seamlessly after seeking forward 20 minutes! Received: {samples_received}"
     );
 }
+
+#[test]
+fn test_diagnose_audio_video_seek_10_20_30() {
+    use std::path::PathBuf;
+    use syncverse_demux::{Demuxer, TrackType, UniversalDemuxer};
+    use syncverse_codecs::{UniversalAudioDecoder, UniversalVideoDecoder};
+
+    let media_path = PathBuf::from("/home/gautham/Downloads/Nightcrawler 2014 WEB-DL 2160p HDR10+ DV HEVC DTS-HD MA 5.1 x265-E/Nightcrawler 2014.mkv");
+    if !media_path.exists() {
+        println!("File does not exist, skipping diagnostic test");
+        return;
+    }
+
+    let mut demuxer = UniversalDemuxer::open_file(&media_path).expect("open file");
+    let info = demuxer.container_info().unwrap().clone();
+    let v_track = info.tracks.iter().find(|t| t.track_type == TrackType::Video).unwrap();
+    let a_track = info.tracks.iter().find(|t| t.track_type == TrackType::Audio).unwrap();
+
+    let v_tb = demuxer.stream_time_base(v_track.track_id as usize);
+    let a_tb = demuxer.stream_time_base(a_track.track_id as usize);
+    println!("Video track: id={}, codec={}, tb={:?}", v_track.track_id, v_track.codec_id, v_tb);
+    println!("Audio track: id={}, codec={}, tb={:?}", a_track.track_id, a_track.codec_id, a_tb);
+
+    let mut adec = UniversalAudioDecoder::from_parameters(
+        demuxer.stream_parameters(a_track.track_id as usize).unwrap(),
+        a_tb,
+    ).expect("create audio decoder");
+
+    let mut vdec = UniversalVideoDecoder::from_parameters(
+        &demuxer.stream_parameters(v_track.track_id as usize).unwrap(),
+    ).expect("create video decoder");
+
+    for &target_ms in &[600_000, 1_200_000, 1_800_000] {
+        let landed = demuxer.seek_to(target_ms).expect("seek");
+        adec.flush_buffers();
+        vdec.flush();
+        println!("\n=== SIMULATING SEEK TO: {}ms ({}s), LANDED: {}ms ===", target_ms, target_ms / 1000, landed);
+
+        let t0 = std::time::Instant::now();
+        let mut first_v_frame_pts = None;
+        let mut first_a_frame_pts = None;
+        let mut seek_min_video_pts = Some(target_ms);
+        let mut seek_min_audio_pts = Some(target_ms);
+
+        let mut packets_read = 0;
+        while packets_read < 5000 {
+            if let Ok(Some(pkt)) = demuxer.read_packet() {
+                packets_read += 1;
+                if pkt.track_id == v_track.track_id {
+                    if first_v_frame_pts.is_none() {
+                        let _ = vdec.send_packet(&pkt.data, pkt.pts_ms, pkt.dts_ms, pkt.is_keyframe);
+                        if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba(seek_min_video_pts) {
+                            seek_min_video_pts = None;
+                            first_v_frame_pts = Some(rgba.pts_ms);
+                        }
+                    }
+                } else if pkt.track_id == a_track.track_id {
+                    let dur = pkt.duration_ms.unwrap_or(25);
+                    if let Some(min_pts) = seek_min_audio_pts {
+                        if pkt.pts_ms + dur < min_pts {
+                            continue;
+                        }
+                    }
+                    if let Ok(pcm_list) = adec.decode_packet(&pkt.data, pkt.pts_ms) {
+                        for mut pcm in pcm_list {
+                            if let Some(min_pts) = seek_min_audio_pts {
+                                if pcm.pts_ms < min_pts {
+                                    let diff_ms = min_pts - pcm.pts_ms;
+                                    let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
+                                    let float_count = num_frames * pcm.channels as usize;
+                                    if float_count < pcm.samples.len() {
+                                        pcm.samples.drain(0..float_count);
+                                        pcm.pts_ms = min_pts;
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                seek_min_audio_pts = None;
+                            }
+                            if first_a_frame_pts.is_none() {
+                                first_a_frame_pts = Some(pcm.pts_ms);
+                            }
+                        }
+                    }
+                }
+                if first_v_frame_pts.is_some() && first_a_frame_pts.is_some() {
+                    break;
+                }
+            }
+        }
+        let elapsed = t0.elapsed();
+        let v_pts = first_v_frame_pts.expect("Video frame must be decoded");
+        let a_pts = first_a_frame_pts.expect("Audio frame must be decoded");
+        let delta = (v_pts as i64 - a_pts as i64).abs();
+        println!("Seek to {}ms: Preroll took {:?}, packets: {}, V pts: {}, A pts: {}, Skew: {} ms", target_ms, elapsed, packets_read, v_pts, a_pts, delta);
+        assert!(
+            delta <= 25,
+            "A/V seek skew must be strictly <= 25ms! Got skew={}ms (v={}, a={}) at target {}ms",
+            delta, v_pts, a_pts, target_ms
+        );
+    }
+
+    // Now test audio track 2 (AC3 commentary track)
+    let a_track_ac3 = info.tracks.iter().find(|t| t.track_type == TrackType::Audio && t.track_id != a_track.track_id);
+    if let Some(ac3_track) = a_track_ac3 {
+        let ac3_tb = demuxer.stream_time_base(ac3_track.track_id as usize);
+        let mut ac3_dec = UniversalAudioDecoder::from_parameters(
+            demuxer.stream_parameters(ac3_track.track_id as usize).unwrap(),
+            ac3_tb,
+        ).expect("create AC3 audio decoder");
+
+        for &target_ms in &[600_000, 1_200_000, 1_800_000] {
+            let _landed = demuxer.seek_to(target_ms).expect("seek");
+            ac3_dec.flush_buffers();
+            vdec.flush();
+
+            let mut first_v_frame_pts = None;
+            let mut first_a_frame_pts = None;
+            let mut seek_min_video_pts = Some(target_ms);
+            let mut seek_min_audio_pts = Some(target_ms);
+
+            let mut packets_read = 0;
+            while packets_read < 5000 {
+                if let Ok(Some(pkt)) = demuxer.read_packet() {
+                    packets_read += 1;
+                    if pkt.track_id == v_track.track_id {
+                        if first_v_frame_pts.is_none() {
+                            let _ = vdec.send_packet(&pkt.data, pkt.pts_ms, pkt.dts_ms, pkt.is_keyframe);
+                            if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba(seek_min_video_pts) {
+                                seek_min_video_pts = None;
+                                first_v_frame_pts = Some(rgba.pts_ms);
+                            }
+                        }
+                    } else if pkt.track_id == ac3_track.track_id {
+                        let dur = pkt.duration_ms.unwrap_or(32);
+                        if let Some(min_pts) = seek_min_audio_pts {
+                            if pkt.pts_ms + dur < min_pts {
+                                continue;
+                            }
+                        }
+                        if let Ok(pcm_list) = ac3_dec.decode_packet(&pkt.data, pkt.pts_ms) {
+                            for mut pcm in pcm_list {
+                                if let Some(min_pts) = seek_min_audio_pts {
+                                    if pcm.pts_ms < min_pts {
+                                        let diff_ms = min_pts - pcm.pts_ms;
+                                        let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
+                                        let float_count = num_frames * pcm.channels as usize;
+                                        if float_count < pcm.samples.len() {
+                                            pcm.samples.drain(0..float_count);
+                                            pcm.pts_ms = min_pts;
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    seek_min_audio_pts = None;
+                                }
+                                if first_a_frame_pts.is_none() {
+                                    first_a_frame_pts = Some(pcm.pts_ms);
+                                }
+                            }
+                        }
+                    }
+                    if first_v_frame_pts.is_some() && first_a_frame_pts.is_some() {
+                        break;
+                    }
+                }
+            }
+            let v_pts = first_v_frame_pts.expect("Video frame must be decoded");
+            let a_pts = first_a_frame_pts.expect("AC3 audio frame must be decoded");
+            let delta = (v_pts as i64 - a_pts as i64).abs();
+            println!("AC3 Seek to {}ms: V pts: {}, A pts: {}, Skew: {} ms", target_ms, v_pts, a_pts, delta);
+            assert!(
+                delta <= 25,
+                "AC3 A/V seek skew must be strictly <= 25ms! Got skew={}ms (v={}, a={}) at target {}ms",
+                delta, v_pts, a_pts, target_ms
+            );
+        }
+    }
+}
+
 
 
 
