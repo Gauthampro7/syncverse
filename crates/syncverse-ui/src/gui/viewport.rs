@@ -276,6 +276,11 @@ impl VideoViewport {
             let action = clock.evaluate_presentation_timing(frame.pts_ms, now);
             match action {
                 PresentationAction::Wait(duration) => {
+                    if duration > Duration::from_millis(1500) {
+                        // Frame timestamp is abnormally far in the future (e.g. stale frame from prior seek or discontinuity).
+                        // Discard it so the viewport does not freeze.
+                        continue;
+                    }
                     self.pending_frame = Some(frame);
                     ctx.request_repaint_after(duration);
                     break;

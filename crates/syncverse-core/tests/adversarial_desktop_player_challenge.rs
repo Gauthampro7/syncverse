@@ -1214,6 +1214,131 @@ fn test_real_user_video_paused_seek_and_unpause() {
     );
 }
 
+#[test]
+fn test_high_bitrate_seek_av_alignment() {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use syncverse_clock::MasterClock;
+    use syncverse_clock::PlaybackState;
+    use syncverse_clock::SpscRingBuffer;
+    use syncverse_codecs::VideoFrameRGBA;
+    use syncverse_core::playback_runtime::{run_playback_worker, AudioWorkerCommand};
+    use syncverse_demux::Demuxer;
+    use syncverse_ui::command::PlayerCommand;
+    use syncverse_ui::event::UiEvent;
+    use syncverse_ui::snapshot::TripleBufferSnapshotExchange;
 
+    let media_path = PathBuf::from("/home/gautham/Downloads/Nightcrawler 2014 WEB-DL 2160p HDR10+ DV HEVC DTS-HD MA 5.1 x265-E/Nightcrawler 2014.mkv");
+    if !media_path.exists() {
+        return;
+    }
 
+    // 1. Verify container-level demux alignment at distant seek points (10m and 20m)
+    let mut demuxer = syncverse_demux::UniversalDemuxer::open_file(&media_path).expect("Failed to open file");
+    let info = demuxer.container_info().expect("Missing container info").clone();
+    let v_track = info.tracks.iter().find(|t| t.track_type == syncverse_demux::TrackType::Video).unwrap().track_id;
+    let a_track = info.tracks.iter().find(|t| t.track_type == syncverse_demux::TrackType::Audio).unwrap().track_id;
+
+    for &target_ms in &[600_000, 1_200_000] {
+        let landed = demuxer.seek_to(target_ms).expect("Demuxer seek failed");
+        assert!(landed > 0, "Landed PTS must be positive");
+
+        let mut first_video_pts = None;
+        let mut first_audio_pts = None;
+
+        for _ in 0..100 {
+            if let Ok(Some(pkt)) = demuxer.read_packet() {
+                if pkt.track_id == v_track && first_video_pts.is_none() {
+                    first_video_pts = Some(pkt.pts_ms);
+                } else if pkt.track_id == a_track && first_audio_pts.is_none() {
+                    first_audio_pts = Some(pkt.pts_ms);
+                }
+                if first_video_pts.is_some() && first_audio_pts.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let v_pts = first_video_pts.expect("Video packet not found post-seek");
+        let a_pts = first_audio_pts.expect("Audio packet not found post-seek");
+        let av_delta = (v_pts as i64 - a_pts as i64).abs();
+        assert!(
+            av_delta < 50,
+            "Seek to {target_ms}ms produced unacceptable demux A/V skew of {av_delta}ms (V: {v_pts}, A: {a_pts})"
+        );
+    }
+
+    // 2. Verify end-to-end playback worker audio streaming resumption post-seek
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, command_rx) = channel::<PlayerCommand>();
+    let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let thread_exchange = Arc::clone(&exchange);
+    let thread_video_ring = Arc::clone(&video_ring);
+    let thread_clock = Arc::clone(&clock);
+    let thread_running = Arc::clone(&running);
+
+    let drain_video_ring = Arc::clone(&video_ring);
+    let drain_running = Arc::clone(&running);
+    let drain_handle = std::thread::spawn(move || {
+        while drain_running.load(Ordering::Relaxed) {
+            while drain_video_ring.try_pop().is_some() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let worker_handle = std::thread::spawn(move || {
+        run_playback_worker(
+            command_rx,
+            audio_tx,
+            event_tx,
+            thread_exchange,
+            thread_video_ring,
+            thread_clock,
+            thread_running,
+        );
+    });
+
+    command_tx.send(PlayerCommand::OpenFile(media_path.clone())).unwrap();
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Ok(UiEvent::TracksDiscovered { .. }) = event_rx.recv_timeout(Duration::from_millis(100)) {
+            break;
+        }
+    }
+
+    command_tx.send(PlayerCommand::ForcePlay).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Seek to 1,200,000 ms (20 min)
+    command_tx.send(PlayerCommand::Seek(1_200_000)).unwrap();
+
+    let mut samples_received = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        if let Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) = audio_rx.recv_timeout(Duration::from_millis(100)) {
+            samples_received += samples.len();
+            if samples_received > 8192 {
+                break;
+            }
+        }
+    }
+
+    running.store(false, Ordering::Relaxed);
+    let _ = command_tx.send(PlayerCommand::Stop);
+    let _ = drain_handle.join();
+    let _ = worker_handle.join();
+
+    assert!(
+        samples_received > 8192,
+        "Audio samples MUST flow seamlessly after seeking forward 20 minutes! Received: {samples_received}"
+    );
+}
 
