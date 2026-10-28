@@ -89,7 +89,13 @@ jobs:
       - name: Build Inno Setup Installer
         shell: powershell
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
+          $version = (Get-Content Cargo.toml | Select-String '^version = "(.*)"' | ForEach-Object { $_.Matches.Groups[1].Value })
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $tagVersion = $env:GITHUB_REF -replace '^refs/tags/v', ''
+            if ($tagVersion) { $version = $tagVersion }
+          }
+          Write-Host "Compiling Inno Setup installer for version: $version"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" packaging\windows\installer.iss
 
       - name: Compute SHA-256 Checksums
         shell: powershell

@@ -4,7 +4,9 @@
 ; ==============================================================================
 
 #define MyAppName "Syncverse"
-#define MyAppVersion "0.1.1"
+#ifndef MyAppVersion
+#define MyAppVersion "0.1.7"
+#endif
 #define MyAppPublisher "Syncverse Project"
 #define MyAppURL "https://github.com/Gauthampro7/syncverse"
 #define MyAppExeName "syncverse.exe"
