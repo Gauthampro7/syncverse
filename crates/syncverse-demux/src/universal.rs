@@ -262,6 +262,11 @@ impl UniversalDemuxer {
             ctx.streams().find(|s| s.index() == stream_index).map(|s| s.parameters())
         })
     }
+
+    /// Returns the rational time base (numerator, denominator) for a given stream index, if available.
+    pub fn stream_time_base(&self, stream_index: usize) -> Option<(i32, i32)> {
+        self.time_bases.get(stream_index).map(|tb| (tb.numerator(), tb.denominator()))
+    }
 }
 
 
