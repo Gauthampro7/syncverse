@@ -90,6 +90,8 @@ impl PipeAudioSink {
                 &chan_str,
                 "--format",
                 "f32",
+                "--latency",
+                "50ms",
                 "-",
             ])
             .stdin(Stdio::piped())
@@ -137,6 +139,7 @@ impl PipeAudioSink {
                 "FLOAT_LE",
                 "-t",
                 "raw",
+                "--buffer-time=50000",
                 "-",
             ])
             .stdin(Stdio::piped())

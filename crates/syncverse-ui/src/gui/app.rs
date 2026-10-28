@@ -654,6 +654,7 @@ impl eframe::App for SyncplayApp {
                 let offset_ms = if ctx.input(|i| i.modifiers.shift) { -30_000 } else { -5_000 };
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let target = (current_ms + offset_ms).max(0) as u64;
+                self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
@@ -661,6 +662,7 @@ impl eframe::App for SyncplayApp {
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
                 let target = ((current_ms + offset_ms).max(0) as u64).min(dur_ms);
+                self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
@@ -943,6 +945,7 @@ impl eframe::App for SyncplayApp {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let target = (current_ms - 5_000).max(0) as u64;
+                            self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target));
                         }
                         if ui.button("Seek +5s (→)").clicked() {
@@ -950,12 +953,14 @@ impl eframe::App for SyncplayApp {
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let dur_ms = snapshot.media_duration_pts / 1_000_000;
                             let target = (current_ms + 5_000).max(0) as u64;
+                            self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
                         }
                         if ui.button("Seek -30s (Shift+←)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let target = (current_ms - 30_000).max(0) as u64;
+                            self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target));
                         }
                         if ui.button("Seek +30s (Shift+→)").clicked() {
@@ -963,6 +968,7 @@ impl eframe::App for SyncplayApp {
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let dur_ms = snapshot.media_duration_pts / 1_000_000;
                             let target = (current_ms + 30_000).max(0) as u64;
+                            self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
                         }
 
@@ -1115,6 +1121,7 @@ impl eframe::App for SyncplayApp {
                             let _ = self.command_tx.send(PlayerCommand::Stop);
                         }
                         ControlsBarAction::Seek(target_pts) => {
+                            self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target_pts));
                         }
                         ControlsBarAction::SetVolume(vol) => {

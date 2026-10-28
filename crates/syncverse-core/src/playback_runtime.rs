@@ -5,7 +5,7 @@
 //! the SPSC ring buffer for GPU viewport rendering, streams normalized audio to `AutoAudioSink`
 //! over a decoupled asynchronous channel, and publishes atomic UI snapshots to `TripleBufferSnapshotExchange`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,9 +28,19 @@ use syncverse_ui::{
 use crate::audio_sink::{AudioSink, AutoAudioSink};
 
 /// Commands delivered to the asynchronous audio streaming thread.
+#[derive(Debug, Clone)]
 pub enum AudioWorkerCommand {
     /// Normalized interleaved f32 PCM samples ready for soundcard delivery.
     Samples(Vec<f32>),
+    /// Timestamped normalized interleaved f32 PCM samples with presentation timestamp and seek generation.
+    TimestampedSamples {
+        /// Media presentation timestamp of the first sample in milliseconds.
+        pts_ms: u64,
+        /// Normalized interleaved f32 audio samples.
+        samples: Vec<f32>,
+        /// Monotonically increasing seek generation epoch to instantly reject stale frames.
+        generation: u64,
+    },
     /// Pauses audio playback output.
     Pause,
     /// Resumes audio playback output.
@@ -39,29 +49,117 @@ pub enum AudioWorkerCommand {
     Reset,
 }
 
-/// Runs the dedicated audio sink output loop on an isolated OS thread.
-fn run_audio_sink_worker(rx: Receiver<AudioWorkerCommand>, running: Arc<AtomicBool>) {
+/// Runs the dedicated audio sink output loop on an isolated OS thread with MasterClock pacing.
+fn run_audio_sink_worker(
+    rx: Receiver<AudioWorkerCommand>,
+    clock: Arc<MasterClock>,
+    running: Arc<AtomicBool>,
+) {
     let mut sink = AutoAudioSink::new();
+    let mut local_generation: u64 = 0;
+    let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(64);
 
     while running.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(AudioWorkerCommand::Samples(samples)) => {
-                if sink.write_samples(&samples).is_err() {
-                    // Auto-heal broken pipe or crashed sound daemon immediately
+        // 1. Drain incoming commands non-blockingly
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                AudioWorkerCommand::Reset => {
+                    local_generation = local_generation.wrapping_add(1);
+                    pending_queue.clear();
                     sink = AutoAudioSink::new();
-                    let _ = sink.write_samples(&samples);
+                }
+                AudioWorkerCommand::Pause => {
+                    let _ = sink.pause();
+                }
+                AudioWorkerCommand::Resume => {
+                    let _ = sink.resume();
+                }
+                AudioWorkerCommand::TimestampedSamples {
+                    pts_ms,
+                    samples,
+                    generation,
+                } => {
+                    if generation >= local_generation && !samples.is_empty() {
+                        pending_queue.push_back((pts_ms, samples, generation));
+                    }
+                }
+                AudioWorkerCommand::Samples(samples) => {
+                    if !samples.is_empty() {
+                        let now_pts = clock.current_pts(Instant::now()).max(0.0) as u64;
+                        pending_queue.push_back((now_pts, samples, local_generation));
+                    }
                 }
             }
-            Ok(AudioWorkerCommand::Pause) => {
-                let _ = sink.pause();
+        }
+
+        // 2. If clock is not playing, sleep briefly and loop
+        if !clock.is_playing() {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        // 3. If queue is empty, wait briefly for new commands
+        if pending_queue.is_empty() {
+            if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(5)) {
+                match cmd {
+                    AudioWorkerCommand::Reset => {
+                        local_generation = local_generation.wrapping_add(1);
+                        pending_queue.clear();
+                        sink = AutoAudioSink::new();
+                    }
+                    AudioWorkerCommand::Pause => {
+                        let _ = sink.pause();
+                    }
+                    AudioWorkerCommand::Resume => {
+                        let _ = sink.resume();
+                    }
+                    AudioWorkerCommand::TimestampedSamples {
+                        pts_ms,
+                        samples,
+                        generation,
+                    } => {
+                        if generation >= local_generation && !samples.is_empty() {
+                            pending_queue.push_back((pts_ms, samples, generation));
+                        }
+                    }
+                    AudioWorkerCommand::Samples(samples) => {
+                        if !samples.is_empty() {
+                            let now_pts = clock.current_pts(Instant::now()).max(0.0) as u64;
+                            pending_queue.push_back((now_pts, samples, local_generation));
+                        }
+                    }
+                }
             }
-            Ok(AudioWorkerCommand::Resume) => {
-                let _ = sink.resume();
+            continue;
+        }
+
+        // 4. Process pending audio samples according to MasterClock presentation time
+        let now = Instant::now();
+        let master_pts = clock.current_pts(now);
+
+        if let Some(&(pts_ms, ref samples, generation)) = pending_queue.front() {
+            if generation < local_generation {
+                pending_queue.pop_front();
+                continue;
             }
-            Ok(AudioWorkerCommand::Reset) => {
-                sink = AutoAudioSink::new();
+
+            let delta_ms = (pts_ms as f64) - master_pts;
+
+            if delta_ms > 80.0 {
+                // Future frame: Too early to write to soundcard. Wait for clock to advance.
+                let wait_ms = ((delta_ms - 80.0) as u64).clamp(1, 8);
+                thread::sleep(Duration::from_millis(wait_ms));
+            } else if delta_ms < -150.0 {
+                // Severely late frame: Drop it to re-align audio phase with master clock!
+                pending_queue.pop_front();
+            } else {
+                // In active playback window (-150ms <= delta_ms <= 80ms): Submit to sound sink!
+                if sink.write_samples(samples).is_err() {
+                    sink = AutoAudioSink::new();
+                    let _ = sink.write_samples(samples);
+                }
+                pending_queue.pop_front();
             }
-            Err(_) => {}
         }
     }
 }
@@ -313,10 +411,10 @@ impl PlaybackSession {
         }
     }
 
-    /// Performs random-access seek and flushes internal decoder buffers.
-    /// Returns the actual landed keyframe presentation timestamp in milliseconds.
+    /// Performs random-access seek, keyframe pre-roll, and flushes internal decoder buffers.
+    /// Returns the exact presentation timestamp (in ms) where playback will resume.
     fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
-        let landed_pts = self.demuxer.seek_to(target_ms).unwrap_or(target_ms);
+        let keyframe_pts = self.demuxer.seek_to(target_ms).unwrap_or(target_ms);
         if let Some(ref mut vdec) = self.video_decoder {
             vdec.flush();
         }
@@ -324,8 +422,50 @@ impl PlaybackSession {
             adec.flush_buffers();
         }
         while video_ring.try_pop().is_some() {}
-        self.seek_min_audio_pts = Some(landed_pts);
         self.eof_reached = false;
+
+        let mut landed_pts = keyframe_pts;
+        if target_ms > keyframe_pts && self.video_track_id.is_some() {
+            let mut best_frame: Option<VideoFrameRGBA> = None;
+            let mut packets_read = 0;
+            // Decode forward up to target_ms to find the exact frame
+            while packets_read < 120 {
+                match self.demuxer.read_packet() {
+                    Ok(Some(packet)) => {
+                        packets_read += 1;
+                        if Some(packet.track_id) == self.video_track_id {
+                            if let Some(ref mut vdec) = self.video_decoder {
+                                let _ = vdec.send_packet(
+                                    &packet.data,
+                                    packet.pts_ms,
+                                    packet.dts_ms,
+                                    packet.is_keyframe,
+                                );
+                                while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
+                                    let reached = rgba.pts_ms >= target_ms;
+                                    landed_pts = rgba.pts_ms;
+                                    best_frame = Some(rgba);
+                                    if reached {
+                                        break;
+                                    }
+                                }
+                                if best_frame.as_ref().is_some_and(|f| f.pts_ms >= target_ms) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            if let Some(f) = best_frame {
+                landed_pts = f.pts_ms;
+                let _ = video_ring.try_push(f);
+            }
+        }
+
+        self.seek_min_audio_pts = Some(landed_pts);
         landed_pts
     }
 }
@@ -458,12 +598,14 @@ pub fn run_playback_worker(
     let mut overflow_frame: Option<VideoFrameRGBA> = None;
     let mut last_snapshot_instant = Instant::now();
     let mut party_role = WatchPartyRole::None;
+    let mut current_audio_generation: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
         // 1. Drain all pending UI commands
         while let Ok(cmd) = command_rx.try_recv() {
             match cmd {
                 PlayerCommand::OpenFile(path) => {
+                    current_audio_generation = current_audio_generation.wrapping_add(1);
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
                     match PlaybackSession::open(&path) {
                         Ok(new_session) => {
@@ -743,6 +885,7 @@ pub fn run_playback_worker(
                     gate_blocked = false;
                     overflow_frame = None;
                     while video_ring.try_pop().is_some() {}
+                    current_audio_generation = current_audio_generation.wrapping_add(1);
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
                     if let Some(ref mut sess) = session {
                         sess.seek(0, &video_ring);
@@ -754,57 +897,13 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::Seek(target_ms) => {
                     overflow_frame = None;
+                    current_audio_generation = current_audio_generation.wrapping_add(1);
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
                     let mut landed_pts = target_ms;
                     if let Some(ref mut sess) = session {
                         landed_pts = sess.seek(target_ms, &video_ring);
                         let now = Instant::now();
                         clock.seek_to(landed_pts as f64, now);
-
-                        // If currently paused, decode forward to immediately show target video frame
-                        if !clock.is_playing() && sess.video_track_id.is_some() {
-                            let mut packets_read = 0;
-                            let mut best_frame: Option<VideoFrameRGBA> = None;
-                            while packets_read < 30 {
-                                match sess.demuxer.read_packet() {
-                                    Ok(Some(packet)) => {
-                                        packets_read += 1;
-                                        if Some(packet.track_id) == sess.video_track_id {
-                                            if let Some(ref mut vdec) = sess.video_decoder {
-                                                let _ = vdec.send_packet(
-                                                    &packet.data,
-                                                    packet.pts_ms,
-                                                    packet.dts_ms,
-                                                    packet.is_keyframe,
-                                                );
-                                                while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
-                                                    let reached = rgba.pts_ms >= landed_pts;
-                                                    best_frame = Some(rgba);
-                                                    if reached {
-                                                        break;
-                                                    }
-                                                }
-                                                if best_frame.as_ref().is_some_and(|f| f.pts_ms >= landed_pts) {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            if let Some(f) = best_frame {
-                                let _ = video_ring.try_push(f);
-                            }
-                            // Re-seek to landed_pts so audio and video streams remain intact for unpausing
-                            let _ = sess.demuxer.seek_to(landed_pts);
-                            if let Some(ref mut vdec) = sess.video_decoder {
-                                vdec.flush();
-                            }
-                            if let Some(ref mut adec) = sess.audio_decoder {
-                                adec.flush_buffers();
-                            }
-                        }
                     }
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
@@ -853,6 +952,7 @@ pub fn run_playback_worker(
                     if let Some(ref mut sess) = session {
                         match sess.select_audio_track(track_id) {
                             Ok(name) => {
+                                current_audio_generation = current_audio_generation.wrapping_add(1);
                                 let _ = audio_tx.send(AudioWorkerCommand::Reset);
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                     track_id,
@@ -872,6 +972,7 @@ pub fn run_playback_worker(
                 PlayerCommand::CycleAudioTrack => {
                     if let Some(ref mut sess) = session {
                         if let Some((next_id, name)) = sess.cycle_audio_track() {
+                            current_audio_generation = current_audio_generation.wrapping_add(1);
                             let _ = audio_tx.send(AudioWorkerCommand::Reset);
                             let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                 track_id: next_id,
@@ -1275,7 +1376,11 @@ pub fn run_playback_worker(
                                                     let silence =
                                                         vec![0.0f32; pcm.samples.len()];
                                                     let _ = audio_tx.send(
-                                                        AudioWorkerCommand::Samples(silence),
+                                                        AudioWorkerCommand::TimestampedSamples {
+                                                            pts_ms: pcm.pts_ms,
+                                                            samples: silence,
+                                                            generation: current_audio_generation,
+                                                        },
                                                     );
                                                 } else if (effective_vol - 1.0).abs() < 1e-3 {
                                                     let clamped: Vec<f32> = pcm
@@ -1284,7 +1389,11 @@ pub fn run_playback_worker(
                                                         .map(|s| s.clamp(-1.0, 1.0))
                                                         .collect();
                                                     let _ = audio_tx.send(
-                                                        AudioWorkerCommand::Samples(clamped),
+                                                        AudioWorkerCommand::TimestampedSamples {
+                                                            pts_ms: pcm.pts_ms,
+                                                            samples: clamped,
+                                                            generation: current_audio_generation,
+                                                        },
                                                     );
                                                 } else {
                                                     let scaled: Vec<f32> = pcm
@@ -1293,7 +1402,11 @@ pub fn run_playback_worker(
                                                         .map(|s| (s * effective_vol).clamp(-1.0, 1.0))
                                                         .collect();
                                                     let _ = audio_tx.send(
-                                                        AudioWorkerCommand::Samples(scaled),
+                                                        AudioWorkerCommand::TimestampedSamples {
+                                                            pts_ms: pcm.pts_ms,
+                                                            samples: scaled,
+                                                            generation: current_audio_generation,
+                                                        },
                                                     );
                                                 }
                                             }
@@ -1500,6 +1613,8 @@ pub fn run_playback_worker(
                     let drift_ms = (target_pts_ms as i64 - local_pts_ms as i64).abs();
                     if drift_ms > 1500 {
                         // Zone 3: Hard seek
+                        current_audio_generation = current_audio_generation.wrapping_add(1);
+                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
                         if let Some(ref mut sess) = session {
                             let landed = sess.seek(target_pts_ms, &video_ring);
                             clock.seek_to(landed as f64, now);
@@ -1757,10 +1872,11 @@ pub fn launch_desktop_player_app(
 
     // Spawn dedicated audio sink worker thread
     let audio_running = Arc::clone(&running);
+    let audio_clock = Arc::clone(&clock);
     let audio_handle = thread::Builder::new()
         .name("syncverse-audio-worker".to_string())
         .spawn(move || {
-            run_audio_sink_worker(audio_rx, audio_running);
+            run_audio_sink_worker(audio_rx, audio_clock, audio_running);
         })
         .map_err(|e| format!("Failed to spawn audio worker thread: {e}"))?;
 

@@ -292,6 +292,11 @@ impl VideoViewport {
         }
     }
 
+    /// Discards any pending video frame waiting for presentation.
+    pub fn clear_pending(&mut self) {
+        self.pending_frame = None;
+    }
+
     /// Resets the viewport state and texture handle for a newly opened media stream.
     pub fn reset(&mut self) {
         self.texture = None;

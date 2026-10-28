@@ -905,7 +905,7 @@ fn test_e2e_audio_playback_after_seek_and_track_switch() {
     let mut initial_samples = 0;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
-        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(100)) {
+        if let Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) = audio_rx.recv_timeout(Duration::from_millis(100)) {
             initial_samples += samples.len();
             if initial_samples > 4096 {
                 break;
@@ -922,7 +922,7 @@ fn test_e2e_audio_playback_after_seek_and_track_switch() {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(AudioWorkerCommand::Samples(samples)) => {
+            Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) => {
                 post_seek_samples += samples.len();
                 if post_seek_samples > 4096 {
                     break;
@@ -946,7 +946,7 @@ fn test_e2e_audio_playback_after_seek_and_track_switch() {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(AudioWorkerCommand::Samples(samples)) => {
+            Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) => {
                 post_cycle_samples += samples.len();
                 if post_cycle_samples > 4096 {
                     break;
@@ -968,7 +968,7 @@ fn test_e2e_audio_playback_after_seek_and_track_switch() {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(AudioWorkerCommand::Samples(samples)) => {
+            Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) => {
                 second_seek_samples += samples.len();
                 if second_seek_samples > 4096 {
                     break;
@@ -999,6 +999,7 @@ fn test_real_user_video_seek_10_minutes() {
     use std::sync::Arc;
     use std::time::Duration;
     use syncverse_clock::MasterClock;
+
     use syncverse_clock::PlaybackState;
     use syncverse_clock::SpscRingBuffer;
     use syncverse_codecs::VideoFrameRGBA;
@@ -1067,7 +1068,7 @@ fn test_real_user_video_seek_10_minutes() {
     let mut initial_samples = 0;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
-        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(100)) {
+        if let Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) = audio_rx.recv_timeout(Duration::from_millis(100)) {
             initial_samples += samples.len();
             if initial_samples > 4096 {
                 break;
@@ -1088,7 +1089,7 @@ fn test_real_user_video_seek_10_minutes() {
     let mut latency = Duration::ZERO;
     while seek_start.elapsed() < Duration::from_secs(3) {
         match audio_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(AudioWorkerCommand::Samples(samples)) => {
+            Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) => {
                 post_seek_samples += samples.len();
                 if post_seek_samples > 4096 {
                     latency = seek_start.elapsed();
@@ -1191,7 +1192,7 @@ fn test_real_user_video_paused_seek_and_unpause() {
     let start = std::time::Instant::now();
     let mut latency = Duration::ZERO;
     while start.elapsed() < Duration::from_secs(3) {
-        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(50)) {
+        if let Ok(AudioWorkerCommand::Samples(samples) | AudioWorkerCommand::TimestampedSamples { samples, .. }) = audio_rx.recv_timeout(Duration::from_millis(50)) {
             unpaused_samples += samples.len();
             if unpaused_samples > 4096 {
                 latency = start.elapsed();
