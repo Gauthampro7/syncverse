@@ -70,15 +70,40 @@ fn run_audio_sink_worker(
     let mut sink = AutoAudioSink::new();
     let mut local_generation: u64 = 0;
     let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(128);
+    let mut needs_fade_in = false;
+
+    let handle_reset = |local_gen: &mut u64,
+                        queue: &mut VecDeque<(u64, Vec<f32>, u64)>,
+                        sink: &mut AutoAudioSink,
+                        fade_in: &mut bool| {
+        *local_gen = local_gen.wrapping_add(1);
+        // Smooth micro-fade-out of remaining front audio to eliminate DC offset clicks/pops
+        if let Some((_, ref samples, _)) = queue.front() {
+            let fade_len = samples.len().min(256);
+            if fade_len > 0 {
+                let mut fade_buf = samples[..fade_len].to_vec();
+                for (i, s) in fade_buf.iter_mut().enumerate() {
+                    *s *= 1.0 - (i as f32 / fade_len as f32);
+                }
+                let _ = sink.write_samples(&fade_buf);
+                let _ = sink.flush();
+            }
+        }
+        queue.clear();
+        *fade_in = true;
+    };
 
     while running.load(Ordering::Relaxed) {
         // 1. Drain incoming commands non-blockingly to catch Resets and queue fresh samples
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 AudioWorkerCommand::Reset => {
-                    local_generation = local_generation.wrapping_add(1);
-                    pending_queue.clear();
-                    sink = AutoAudioSink::new();
+                    handle_reset(
+                        &mut local_generation,
+                        &mut pending_queue,
+                        &mut sink,
+                        &mut needs_fade_in,
+                    );
                 }
                 AudioWorkerCommand::Pause => {
                     let _ = sink.pause();
@@ -115,9 +140,12 @@ fn run_audio_sink_worker(
             if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(5)) {
                 match cmd {
                     AudioWorkerCommand::Reset => {
-                        local_generation = local_generation.wrapping_add(1);
-                        pending_queue.clear();
-                        sink = AutoAudioSink::new();
+                        handle_reset(
+                            &mut local_generation,
+                            &mut pending_queue,
+                            &mut sink,
+                            &mut needs_fade_in,
+                        );
                     }
                     AudioWorkerCommand::Pause => {
                         let _ = sink.pause();
@@ -172,13 +200,37 @@ fn run_audio_sink_worker(
             continue;
         } else {
             // Frame is within presentation window (-500ms <= delta <= 80ms): write to soundcard!
-            let (_, samples, _) = pending_queue.pop_front().unwrap();
+            let (_, mut samples, _) = pending_queue.pop_front().unwrap();
+            if needs_fade_in && !samples.is_empty() {
+                let fade_len = samples.len().min(256);
+                for (i, s) in samples[..fade_len].iter_mut().enumerate() {
+                    *s *= i as f32 / fade_len as f32;
+                }
+                needs_fade_in = false;
+            }
             if sink.write_samples(&samples).is_err() {
                 sink = AutoAudioSink::new();
                 let _ = sink.write_samples(&samples);
             }
         }
     }
+}
+
+/// Cleans raw subtitle packet text demuxed from container bitstreams (SRT, VTT, or Matroska ASS/SSA).
+fn clean_demuxed_subtitle_packet(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('\0');
+    if let Some(stripped) = trimmed.strip_prefix("Dialogue:") {
+        let parts: Vec<&str> = stripped.splitn(10, ',').collect();
+        if parts.len() == 10 {
+            return syncverse_demux::subtitles::clean_ass_text(parts[9]);
+        }
+    } else if trimmed.chars().take(30).filter(|&c| c == ',').count() >= 8 {
+        let parts: Vec<&str> = trimmed.splitn(9, ',').collect();
+        if parts.len() == 9 {
+            return syncverse_demux::subtitles::clean_ass_text(parts[8]);
+        }
+    }
+    syncverse_demux::subtitles::clean_srt_text(trimmed)
 }
 
 /// Formats track info into a human-readable display string.
@@ -1099,8 +1151,34 @@ pub fn run_playback_worker(
                     if let Some(ref mut sess) = session {
                         match sess.select_audio_track(track_id) {
                             Ok(name) => {
+                                let was_playing = clock.is_playing();
+                                let now = Instant::now();
+                                let current_pts = clock.current_pts(now).max(0.0) as u64;
+
+                                overflow_frame = None;
                                 current_audio_generation = current_audio_generation.wrapping_add(1);
                                 let _ = audio_tx.send(AudioWorkerCommand::Reset);
+
+                                let effective_vol = if is_muted { 0.0 } else { volume };
+                                let landed_pts = sess.seek_preroll(
+                                    current_pts,
+                                    &video_ring,
+                                    &audio_tx,
+                                    current_audio_generation,
+                                    effective_vol,
+                                    audio_delay_ms,
+                                );
+
+                                let resume_now = Instant::now();
+                                clock.seek_to(landed_pts as f64, resume_now);
+                                if was_playing {
+                                    clock.set_state(resume_now, PlaybackState::Playing);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                } else {
+                                    clock.set_state(resume_now, PlaybackState::Paused);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                }
+
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                     track_id,
                                     name: name.clone(),
@@ -1119,8 +1197,34 @@ pub fn run_playback_worker(
                 PlayerCommand::CycleAudioTrack => {
                     if let Some(ref mut sess) = session {
                         if let Some((next_id, name)) = sess.cycle_audio_track() {
+                            let was_playing = clock.is_playing();
+                            let now = Instant::now();
+                            let current_pts = clock.current_pts(now).max(0.0) as u64;
+
+                            overflow_frame = None;
                             current_audio_generation = current_audio_generation.wrapping_add(1);
                             let _ = audio_tx.send(AudioWorkerCommand::Reset);
+
+                            let effective_vol = if is_muted { 0.0 } else { volume };
+                            let landed_pts = sess.seek_preroll(
+                                current_pts,
+                                &video_ring,
+                                &audio_tx,
+                                current_audio_generation,
+                                effective_vol,
+                                audio_delay_ms,
+                            );
+
+                            let resume_now = Instant::now();
+                            clock.seek_to(landed_pts as f64, resume_now);
+                            if was_playing {
+                                clock.set_state(resume_now, PlaybackState::Playing);
+                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                            } else {
+                                clock.set_state(resume_now, PlaybackState::Paused);
+                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            }
+
                             let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                 track_id: next_id,
                                 name: name.clone(),
@@ -1525,7 +1629,7 @@ pub fn run_playback_worker(
                                     }
                                 } else if Some(packet.track_id) == sess.subtitle_track_id {
                                     let text = if let Ok(s) = std::str::from_utf8(&packet.data) {
-                                        syncverse_demux::subtitles::clean_srt_text(s)
+                                        clean_demuxed_subtitle_packet(s)
                                     } else {
                                         String::new()
                                     };

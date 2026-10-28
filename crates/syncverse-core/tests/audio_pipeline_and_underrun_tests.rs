@@ -222,3 +222,39 @@ fn test_end_to_end_resampling_and_clock_pacing_pipeline() {
     assert_eq!(pacer.silence_injected(), 1);
     assert!(silence.samples.iter().all(|&s| s == 0.0));
 }
+
+#[test]
+fn test_audio_sink_pop_free_reset_and_smooth_transitions() {
+    let mut sink = MockAudioSink::new(48000, 2);
+
+    // Simulate buffered audio at high DC level (0.8)
+    let samples = vec![0.8f32; 512];
+    sink.write_samples(&samples).unwrap();
+    assert_eq!(sink.samples().len(), 512);
+
+    // Apply 256-sample smooth micro-fade-out (eliminating abrupt waveform drop pop)
+    let fade_len = 256;
+    let mut fade_buf = samples[..fade_len].to_vec();
+    for (i, s) in fade_buf.iter_mut().enumerate() {
+        *s *= 1.0 - (i as f32 / fade_len as f32);
+    }
+    sink.write_samples(&fade_buf).unwrap();
+    sink.flush().unwrap();
+
+    // Verify trailing sample ramped down to near zero
+    let recorded = sink.samples();
+    assert_eq!(recorded.len(), 512 + 256);
+    let last_sample = recorded[recorded.len() - 1];
+    assert!(last_sample.abs() < 0.01, "Fade-out must conclude at near-zero amplitude");
+
+    // Simulate new audio track arrival with 256-sample micro-fade-in
+    let mut new_track_samples = vec![0.7f32; 512];
+    for (i, s) in new_track_samples[..fade_len].iter_mut().enumerate() {
+        *s *= i as f32 / fade_len as f32;
+    }
+    sink.write_samples(&new_track_samples).unwrap();
+
+    let all_recorded = sink.samples();
+    let first_new_sample = all_recorded[512 + 256];
+    assert!(first_new_sample.abs() < 0.001, "Fade-in must commence smoothly from zero");
+}

@@ -359,7 +359,10 @@ impl SubtitleOverlay {
             return None;
         }
 
-        let pill_rect = Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y));
+        let pill_rect = Rect::from_min_max(
+            pos2(min_x.round(), min_y.round()),
+            pos2(max_x.round(), max_y.round()),
+        );
 
         // 6. Ensure painter is strictly clipped to video_rect
         let clipped_painter = if self.config.render_outside_video {
@@ -385,8 +388,11 @@ impl SubtitleOverlay {
             );
         }
 
-        // 8. Text position centered inside pill_rect
-        let text_pos = pill_rect.center() - text_size / 2.0;
+        // 8. Text position centered inside pill_rect with integer pixel snapping
+        let text_pos = pos2(
+            (pill_rect.center().x - text_size.x / 2.0).round(),
+            (pill_rect.center().y - text_size.y / 2.0).round(),
+        );
 
         // 9. Render drop shadow for high readability over bright video backgrounds
         if self.config.enable_shadow {

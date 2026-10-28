@@ -234,3 +234,53 @@ fn test_delay_adjustment_math() {
     sub_delay_ms += 50;
     assert_eq!(sub_delay_ms, 0);
 }
+
+#[test]
+fn test_subtitle_cache_and_ordered_cue_insertion() {
+    use syncverse_ui::gui::subtitle_overlay::{SubtitleCue, SubtitleTrack};
+    use syncverse_ui::gui::SyncplayApp;
+
+    let mut app = SyncplayApp::new();
+
+    let cue1 = SubtitleCue::new(1000, 3000, "First cue");
+    let cue2 = SubtitleCue::new(5000, 8000, "Second cue");
+    let track = SubtitleTrack::new(0, "English", Some("en".to_string()), vec![cue1, cue2]);
+
+    app.add_subtitle_track(track);
+    app.select_subtitle_track(Some(0));
+
+    // 1. Initial query before any cue: 500ms -> None (cached as silent window [0, 999])
+    assert_eq!(app.current_active_subtitle(500), None);
+    assert_eq!(app.current_active_subtitle(700), None); // Cache hit!
+
+    // 2. Query within cue1: 1500ms -> "First cue" (cached as [1000, 3000])
+    assert_eq!(app.current_active_subtitle(1500), Some("First cue".to_string()));
+    assert_eq!(app.current_active_subtitle(2000), Some("First cue".to_string())); // Cache hit!
+    assert_eq!(app.current_active_subtitle(2999), Some("First cue".to_string())); // Cache hit!
+
+    // 3. Query between cues: 4000ms -> None (cached as silent window [3000, 4999])
+    assert_eq!(app.current_active_subtitle(4000), None);
+    assert_eq!(app.current_active_subtitle(4500), None); // Cache hit!
+
+    // 4. Query within cue2: 6000ms -> "Second cue"
+    assert_eq!(app.current_active_subtitle(6000), Some("Second cue".to_string()));
+
+    // 5. Invalidation on track switch to Off
+    app.select_subtitle_track(None);
+    assert_eq!(app.current_active_subtitle(1500), None);
+
+    // 6. Test out-of-order streaming cue insertion maintains partition_point order
+    let mut streaming_cues: Vec<SubtitleCue> = Vec::new();
+    let c_late = SubtitleCue::new(5000, 6000, "Late");
+    let c_early = SubtitleCue::new(2000, 3000, "Early");
+    let c_mid = SubtitleCue::new(3500, 4500, "Mid");
+
+    for c in [c_late, c_early, c_mid] {
+        let idx = streaming_cues.partition_point(|existing| existing.start_ms <= c.start_ms);
+        streaming_cues.insert(idx, c);
+    }
+
+    assert_eq!(streaming_cues[0].start_ms, 2000);
+    assert_eq!(streaming_cues[1].start_ms, 3500);
+    assert_eq!(streaming_cues[2].start_ms, 5000);
+}

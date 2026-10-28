@@ -1,5 +1,6 @@
 //! Main desktop graphical player application and eframe lifecycle coordinator.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -19,11 +20,21 @@ use crate::gui::file_dialog::FileDialogManager;
 use crate::gui::recent_files::RecentFilesManager;
 use crate::gui::sidebar::SidebarState;
 use crate::gui::subtitle_overlay::{
-    compute_effective_pts, find_active_cue_text, SubtitleCue, SubtitleOverlay, SubtitleTrack,
+    compute_effective_pts, find_active_cue, find_active_cue_text, SubtitleCue, SubtitleOverlay,
+    SubtitleTrack,
 };
 use crate::gui::viewport::VideoViewport;
 use crate::osd::OsdOverlay;
 use crate::snapshot::TripleBufferSnapshotExchange;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedSubtitleLookup {
+    track_index: usize,
+    subtitle_delay_ms: i64,
+    valid_start_ms: i64,
+    valid_end_ms: i64,
+    text: Option<String>,
+}
 
 /// Preset aspect ratio modes for sequential cycling.
 pub const ASPECT_RATIO_PRESETS: [&str; 6] = [
@@ -91,6 +102,9 @@ pub struct SyncplayApp {
     subtitle_overlay: SubtitleOverlay,
     active_subtitle_cues: Vec<SubtitleCue>,
     subtitle_track_data: Vec<SubtitleTrack>,
+    bg_subtitle_tx: Sender<(PathBuf, Result<SubtitleTrack, String>)>,
+    bg_subtitle_rx: Receiver<(PathBuf, Result<SubtitleTrack, String>)>,
+    cached_subtitle: RefCell<Option<CachedSubtitleLookup>>,
     aspect_ratio_index: usize,
     current_window_title: String,
 }
@@ -103,6 +117,8 @@ impl Default for SyncplayApp {
         let (command_tx, _command_rx) = channel::<PlayerCommand>();
         let (_event_tx, event_rx) = channel::<UiEvent>();
         let (local_event_tx, local_event_rx) = channel::<UiEvent>();
+        let (bg_subtitle_tx, bg_subtitle_rx) =
+            channel::<(PathBuf, Result<SubtitleTrack, String>)>();
 
         Self {
             viewport: VideoViewport::new(),
@@ -137,6 +153,9 @@ impl Default for SyncplayApp {
             subtitle_overlay: SubtitleOverlay::new(),
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
+            bg_subtitle_tx,
+            bg_subtitle_rx,
+            cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
         }
@@ -160,6 +179,8 @@ impl SyncplayApp {
         initial_file: Option<PathBuf>,
     ) -> Self {
         let (local_event_tx, local_event_rx) = channel::<UiEvent>();
+        let (bg_subtitle_tx, bg_subtitle_rx) =
+            channel::<(PathBuf, Result<SubtitleTrack, String>)>();
 
         // Trigger asynchronous background update check on startup
         crate::gui::updater::spawn_update_check(
@@ -201,6 +222,9 @@ impl SyncplayApp {
             subtitle_overlay: SubtitleOverlay::new(),
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
+            bg_subtitle_tx,
+            bg_subtitle_rx,
+            cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
         };
@@ -269,7 +293,15 @@ impl SyncplayApp {
         } else {
             self.active_subtitle_cues.clear();
         }
+        self.invalidate_subtitle_cache();
         let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(track_idx));
+    }
+
+    /// Invalidates the active subtitle lookup cache.
+    pub fn invalidate_subtitle_cache(&self) {
+        if let Ok(mut cache) = self.cached_subtitle.try_borrow_mut() {
+            *cache = None;
+        }
     }
 
     /// Returns the current aspect ratio preset label.
@@ -305,6 +337,7 @@ impl SyncplayApp {
     /// Sets the active subtitle cues directly for the currently active track.
     pub fn set_active_subtitle_cues(&mut self, cues: Vec<SubtitleCue>) {
         self.active_subtitle_cues = cues;
+        self.invalidate_subtitle_cache();
     }
 
     /// Appends a new subtitle track with its cues and title.
@@ -313,40 +346,122 @@ impl SyncplayApp {
             self.subtitle_tracks.push(track.title.clone());
         }
         self.subtitle_track_data.push(track);
+        self.invalidate_subtitle_cache();
     }
 
     /// Evaluates the currently active subtitle text based on current playback PTS and subtitle delay.
     ///
     /// Supports both nanosecond timestamps (as emitted in `PlayerUiSnapshot`) and millisecond
-    /// timestamps (for direct presentation queries and test harnesses).
+    /// timestamps (for direct presentation queries and test harnesses). Uses an internal cache
+    /// to eliminate redundant $O(\log N)$ cue searching and heap allocations across frames.
     pub fn current_active_subtitle(&self, media_position_pts: u64) -> Option<String> {
         let track_idx = self.subtitle_track_index?;
+
         let effective_pts_ms = compute_effective_pts(media_position_pts, self.subtitle_delay_ms);
-
-        // 1. Check pre-parsed track cues if available
-        if track_idx < self.subtitle_track_data.len() {
-            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(effective_pts_ms) {
-                return Some(text);
-            }
-        }
-
-        // 2. Check dynamically demuxed / active streaming cues
-        if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, effective_pts_ms) {
-            return Some(text);
-        }
-
-        // 3. Fallback for callers supplying PTS directly in milliseconds
         let direct_ms = media_position_pts as i64 + self.subtitle_delay_ms;
-        if track_idx < self.subtitle_track_data.len() {
-            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(direct_ms) {
-                return Some(text);
+
+        let query_ms = if media_position_pts < 1_000_000 {
+            direct_ms
+        } else {
+            effective_pts_ms
+        };
+
+        // 1. Fast-path: Check cached subtitle interval
+        if let Ok(cache_ref) = self.cached_subtitle.try_borrow() {
+            if let Some(ref cache) = *cache_ref {
+                if cache.track_index == track_idx && cache.subtitle_delay_ms == self.subtitle_delay_ms {
+                    if query_ms >= cache.valid_start_ms && query_ms <= cache.valid_end_ms {
+                        return cache.text.clone();
+                    }
+                    if direct_ms >= cache.valid_start_ms && direct_ms <= cache.valid_end_ms {
+                        return cache.text.clone();
+                    }
+                }
             }
         }
-        if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, direct_ms) {
-            return Some(text);
+
+        // 2. Cache miss: evaluate active subtitle and determine valid window
+        let mut result_text = None;
+        let mut target_query_ms = query_ms;
+
+        // 2a. Check pre-parsed track cues if available
+        if track_idx < self.subtitle_track_data.len() {
+            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(query_ms) {
+                result_text = Some(text);
+                target_query_ms = query_ms;
+            }
         }
 
-        None
+        // 2b. Check dynamically demuxed / active streaming cues
+        if result_text.is_none() {
+            if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, query_ms) {
+                result_text = Some(text);
+                target_query_ms = query_ms;
+            }
+        }
+
+        // 2c. Fallback for callers supplying PTS directly in milliseconds
+        if result_text.is_none() && query_ms != direct_ms {
+            if track_idx < self.subtitle_track_data.len() {
+                if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(direct_ms) {
+                    result_text = Some(text);
+                    target_query_ms = direct_ms;
+                }
+            }
+            if result_text.is_none() {
+                if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, direct_ms) {
+                    result_text = Some(text);
+                    target_query_ms = direct_ms;
+                }
+            }
+        }
+
+        // 3. Compute validity interval for caching
+        let (valid_start, valid_end) = if result_text.is_some() {
+            let mut start = i64::MIN;
+            let mut end = i64::MAX;
+            if track_idx < self.subtitle_track_data.len() {
+                if let Some(cue) = self.subtitle_track_data[track_idx].active_cue_at(target_query_ms) {
+                    start = cue.start_ms;
+                    end = cue.end_ms;
+                }
+            }
+            if start == i64::MIN {
+                if let Some(cue) = find_active_cue(&self.active_subtitle_cues, target_query_ms) {
+                    start = cue.start_ms;
+                    end = cue.end_ms;
+                }
+            }
+            (start.max(0), end)
+        } else {
+            let mut prev_end = 0i64;
+            let mut next_start = i64::MAX;
+            let cues = if track_idx < self.subtitle_track_data.len() {
+                &self.subtitle_track_data[track_idx].cues
+            } else {
+                &self.active_subtitle_cues
+            };
+            let upper = cues.partition_point(|cue| cue.start_ms <= target_query_ms);
+            if upper < cues.len() {
+                next_start = cues[upper].start_ms;
+            }
+            if upper > 0 {
+                prev_end = cues[upper - 1].end_ms;
+            }
+            (prev_end, next_start.saturating_sub(1))
+        };
+
+        if let Ok(mut cache_mut) = self.cached_subtitle.try_borrow_mut() {
+            *cache_mut = Some(CachedSubtitleLookup {
+                track_index: track_idx,
+                subtitle_delay_ms: self.subtitle_delay_ms,
+                valid_start_ms: valid_start,
+                valid_end_ms: valid_end,
+                text: result_text.clone(),
+            });
+        }
+
+        result_text
     }
 
     /// Loads and opens a media file.
@@ -403,8 +518,9 @@ impl SyncplayApp {
         self.controls_state.subtitle_dialog.set_tracks(dialog_items);
     }
 
-    /// Loads an external subtitle file (.srt, .vtt, .ass), parses its cues, registers it as active,
-    /// and dispatches `PlayerCommand::LoadExternalSubtitle` to the core playback runtime.
+    /// Loads an external subtitle file (.srt, .vtt, .ass) asynchronously in a background thread,
+    /// parses its cues without blocking the UI thread, registers it as active, and dispatches
+    /// `PlayerCommand::LoadExternalSubtitle` to the core playback runtime.
     pub fn load_external_subtitle_file(&mut self, path: PathBuf, now: Instant) {
         let ext = path
             .extension()
@@ -412,74 +528,52 @@ impl SyncplayApp {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let raw_content = syncverse_demux::subtitles::read_subtitle_to_string(&path)
-            .map_err(|e| e.to_string());
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("External Subtitle")
+            .to_string();
 
-        let parse_res = raw_content.and_then(|c| match ext.as_str() {
-            "srt" => syncverse_demux::subtitles::parse_srt(&c).map_err(|e| e.to_string()),
-            "vtt" => syncverse_demux::subtitles::parse_vtt(&c).map_err(|e| e.to_string()),
-            "ass" | "ssa" => syncverse_demux::subtitles::parse_ass(&c).map_err(|e| e.to_string()),
-            other => Err(format!("Unsupported subtitle format: .{other}")),
-        });
+        let track_id = self.subtitle_track_data.len();
+        let path_clone = path.clone();
+        let tx = self.bg_subtitle_tx.clone();
 
-        match parse_res {
-            Ok(parsed_cues) => {
-                let filename = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("External Subtitle")
-                    .to_string();
+        let _ = std::thread::Builder::new()
+            .name("syncverse-sub-loader".to_string())
+            .spawn(move || {
+                let res = (|| -> Result<SubtitleTrack, String> {
+                    let raw_content = syncverse_demux::subtitles::read_subtitle_to_string(&path_clone)
+                        .map_err(|e| e.to_string())?;
+                    let parsed_cues = match ext.as_str() {
+                        "srt" => syncverse_demux::subtitles::parse_srt(&raw_content).map_err(|e| e.to_string())?,
+                        "vtt" => syncverse_demux::subtitles::parse_vtt(&raw_content).map_err(|e| e.to_string())?,
+                        "ass" | "ssa" => syncverse_demux::subtitles::parse_ass(&raw_content).map_err(|e| e.to_string())?,
+                        other => return Err(format!("Unsupported subtitle format: .{other}")),
+                    };
+                    let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = parsed_cues
+                        .into_iter()
+                        .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
+                            start_ms: c.start.as_millis() as i64,
+                            end_ms: c.end.as_millis() as i64,
+                            text: c.text,
+                        })
+                        .collect();
+                    Ok(SubtitleTrack::with_format_and_origin(
+                        track_id,
+                        filename,
+                        None,
+                        ui_cues,
+                        ext.to_uppercase(),
+                        true,
+                    ))
+                })();
+                let _ = tx.send((path_clone, res));
+            });
 
-                let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = parsed_cues
-                    .into_iter()
-                    .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
-                        start_ms: c.start.as_millis() as i64,
-                        end_ms: c.end.as_millis() as i64,
-                        text: c.text,
-                    })
-                    .collect();
-
-                let new_track_id = self.subtitle_track_data.len();
-                let track = crate::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
-                    new_track_id,
-                    filename.clone(),
-                    None,
-                    ui_cues.clone(),
-                    ext.to_uppercase(),
-                    true,
-                );
-
-                self.subtitle_tracks.push(filename.clone());
-                self.subtitle_track_data.push(track);
-                self.subtitle_track_index = Some(new_track_id);
-                self.active_subtitle_cues = ui_cues;
-
-                let new_dialog_item = crate::gui::dialogs::SubtitleTrackItem {
-                    id: new_track_id,
-                    title: filename.clone(),
-                    language: None,
-                    format: ext.to_uppercase(),
-                    is_external: true,
-                    file_path: Some(path.clone()),
-                };
-                self.controls_state.subtitle_dialog.add_track(new_dialog_item);
-                self.controls_state.subtitle_dialog.select_track(Some(new_track_id));
-
-                let _ = self.command_tx.send(PlayerCommand::LoadExternalSubtitle(path));
-
-                self.osd_overlay.show_notification(
-                    format!("Loaded Subtitles: {filename}"),
-                    now,
-                );
-            }
-            Err(err) => {
-                eprintln!("[ERROR] Failed to load external subtitle: {err}");
-                self.osd_overlay.show_notification(
-                    format!("Subtitle Error: {err}"),
-                    now,
-                );
-            }
-        }
+        self.osd_overlay.show_notification(
+            "Loading subtitles...".to_string(),
+            now,
+        );
     }
 
     /// Appends a new chat record to the local in-memory view.
@@ -562,6 +656,7 @@ impl eframe::App for SyncplayApp {
                     if let Some(pos) = self.audio_tracks.iter().position(|t| t == &name) {
                         self.audio_track_index = pos;
                     }
+                    ctx.request_repaint();
                     self.osd_overlay.show_notification(format!("Audio: {}", name), now);
                 }
                 UiEvent::SubtitleTrackSelected { track_index, name } => {
@@ -574,6 +669,8 @@ impl eframe::App for SyncplayApp {
                     } else {
                         self.active_subtitle_cues.clear();
                     }
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                     let msg = if name == "Off" || track_index.is_none() {
                         "Subtitles: Off".to_string()
                     } else {
@@ -589,6 +686,8 @@ impl eframe::App for SyncplayApp {
                 UiEvent::SubtitleDelayChanged(ms) => {
                     self.subtitle_delay_ms = ms;
                     self.controls_state.subtitle_dialog.set_delay_ms(ms);
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                     self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", ms), now);
                 }
                 UiEvent::TracksDiscovered {
@@ -638,6 +737,8 @@ impl eframe::App for SyncplayApp {
                         })
                         .collect();
                     self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                 }
                 UiEvent::SubtitleCueDemuxed(cue) => {
                     if let Some(idx) = self.subtitle_track_index {
@@ -645,7 +746,54 @@ impl eframe::App for SyncplayApp {
                             self.subtitle_track_data[idx].add_cue(cue.clone());
                         }
                     }
-                    self.active_subtitle_cues.push(cue);
+                    let insert_idx = self
+                        .active_subtitle_cues
+                        .partition_point(|c| c.start_ms <= cue.start_ms);
+                    self.active_subtitle_cues.insert(insert_idx, cue);
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        // Drain background subtitle parser notifications
+        while let Ok((path, res)) = self.bg_subtitle_rx.try_recv() {
+            match res {
+                Ok(track) => {
+                    let new_track_id = self.subtitle_track_data.len();
+                    let filename = track.title.clone();
+                    let ext = track.format.clone();
+                    self.subtitle_tracks.push(filename.clone());
+                    self.active_subtitle_cues = track.cues.clone();
+                    self.subtitle_track_data.push(track);
+                    self.subtitle_track_index = Some(new_track_id);
+                    self.invalidate_subtitle_cache();
+
+                    let new_dialog_item = crate::gui::dialogs::SubtitleTrackItem {
+                        id: new_track_id,
+                        title: filename.clone(),
+                        language: None,
+                        format: ext,
+                        is_external: true,
+                        file_path: Some(path.clone()),
+                    };
+                    self.controls_state.subtitle_dialog.add_track(new_dialog_item);
+                    self.controls_state.subtitle_dialog.select_track(Some(new_track_id));
+
+                    let _ = self.command_tx.send(PlayerCommand::LoadExternalSubtitle(path));
+                    self.osd_overlay.show_notification(
+                        format!("Loaded Subtitles: {filename}"),
+                        now,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(err) => {
+                    eprintln!("[ERROR] Failed to load external subtitle: {err}");
+                    self.osd_overlay.show_notification(
+                        format!("Subtitle Error: {err}"),
+                        now,
+                    );
+                    ctx.request_repaint();
                 }
             }
         }
@@ -815,6 +963,7 @@ impl eframe::App for SyncplayApp {
                     "Audio: Track 1/1 - Default".to_string()
                 };
                 self.osd_overlay.show_notification(notif, now);
+                ctx.request_repaint();
             }
             // Subtitle track cycling (V or C)
             if ctx.input(|i| i.key_pressed(egui::Key::V) || i.key_pressed(egui::Key::C)) {
@@ -827,6 +976,8 @@ impl eframe::App for SyncplayApp {
                     };
                     self.subtitle_track_index = next_idx;
                     self.controls_state.subtitle_dialog.select_track(next_idx);
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                     match next_idx {
                         Some(idx) => {
                             if idx < self.subtitle_track_data.len() {
@@ -846,6 +997,8 @@ impl eframe::App for SyncplayApp {
                     }
                 } else {
                     self.active_subtitle_cues.clear();
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                     "Subtitles: Off".to_string()
                 };
                 self.osd_overlay.show_notification(notif, now);
@@ -878,12 +1031,16 @@ impl eframe::App for SyncplayApp {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
+                self.invalidate_subtitle_cache();
+                ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::X)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
+                self.invalidate_subtitle_cache();
+                ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
         }
