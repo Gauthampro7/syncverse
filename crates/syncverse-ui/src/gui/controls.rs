@@ -446,8 +446,8 @@ impl PlaybackControlsBar {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-            // Play / Pause Button (1: Playing, 0: Paused/Stopped)
-            let is_playing = snapshot.playback_state == 1;
+            // Play / Pause Button (Bit 0: 1 = Playing, 0 = Paused/Stopped)
+            let is_playing = (snapshot.playback_state & 1) != 0;
             let play_label = if is_playing { "⏸" } else { "▶" };
             let play_btn = egui::Button::new(
                 RichText::new(play_label)

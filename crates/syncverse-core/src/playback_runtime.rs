@@ -46,7 +46,11 @@ fn run_audio_sink_worker(rx: Receiver<AudioWorkerCommand>, running: Arc<AtomicBo
     while running.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(AudioWorkerCommand::Samples(samples)) => {
-                let _ = sink.write_samples(&samples);
+                if sink.write_samples(&samples).is_err() {
+                    // Auto-heal broken pipe or crashed sound daemon immediately
+                    sink = AutoAudioSink::new();
+                    let _ = sink.write_samples(&samples);
+                }
             }
             Ok(AudioWorkerCommand::Pause) => {
                 let _ = sink.pause();
@@ -310,8 +314,9 @@ impl PlaybackSession {
     }
 
     /// Performs random-access seek and flushes internal decoder buffers.
-    fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) {
-        let _ = self.demuxer.seek_to(target_ms);
+    /// Returns the actual landed keyframe presentation timestamp in milliseconds.
+    fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
+        let landed_pts = self.demuxer.seek_to(target_ms).unwrap_or(target_ms);
         if let Some(ref mut vdec) = self.video_decoder {
             vdec.flush();
         }
@@ -319,8 +324,9 @@ impl PlaybackSession {
             adec.flush_buffers();
         }
         while video_ring.try_pop().is_some() {}
-        self.seek_min_audio_pts = Some(target_ms);
+        self.seek_min_audio_pts = Some(landed_pts);
         self.eof_reached = false;
+        landed_pts
     }
 }
 
@@ -749,16 +755,17 @@ pub fn run_playback_worker(
                 PlayerCommand::Seek(target_ms) => {
                     overflow_frame = None;
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                    let mut landed_pts = target_ms;
                     if let Some(ref mut sess) = session {
-                        sess.seek(target_ms, &video_ring);
+                        landed_pts = sess.seek(target_ms, &video_ring);
                         let now = Instant::now();
-                        clock.seek_to(target_ms as f64, now);
+                        clock.seek_to(landed_pts as f64, now);
 
                         // If currently paused, decode forward to immediately show target video frame
                         if !clock.is_playing() && sess.video_track_id.is_some() {
                             let mut packets_read = 0;
                             let mut best_frame: Option<VideoFrameRGBA> = None;
-                            while packets_read < 120 {
+                            while packets_read < 30 {
                                 match sess.demuxer.read_packet() {
                                     Ok(Some(packet)) => {
                                         packets_read += 1;
@@ -771,13 +778,13 @@ pub fn run_playback_worker(
                                                     packet.is_keyframe,
                                                 );
                                                 while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
-                                                    let reached = rgba.pts_ms >= target_ms;
+                                                    let reached = rgba.pts_ms >= landed_pts;
                                                     best_frame = Some(rgba);
                                                     if reached {
                                                         break;
                                                     }
                                                 }
-                                                if best_frame.as_ref().is_some_and(|f| f.pts_ms >= target_ms) {
+                                                if best_frame.as_ref().is_some_and(|f| f.pts_ms >= landed_pts) {
                                                     break;
                                                 }
                                             }
@@ -789,21 +796,29 @@ pub fn run_playback_worker(
                             if let Some(f) = best_frame {
                                 let _ = video_ring.try_push(f);
                             }
+                            // Re-seek to landed_pts so audio and video streams remain intact for unpausing
+                            let _ = sess.demuxer.seek_to(landed_pts);
+                            if let Some(ref mut vdec) = sess.video_decoder {
+                                vdec.flush();
+                            }
+                            if let Some(ref mut adec) = sess.audio_decoder {
+                                adec.flush_buffers();
+                            }
                         }
                     }
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
-                            server.set_media_state(target_ms, speed, !clock.is_playing());
+                            server.set_media_state(landed_pts, speed, !clock.is_playing());
                             let _ = server.broadcast_room_state();
                         }
                         WatchPartyRole::Client { client, .. } => {
-                            let _ = client.send_seek(target_ms);
+                            let _ = client.send_seek(landed_pts);
                         }
                         WatchPartyRole::None => {}
                     }
                     let now = Instant::now();
                     let sender = get_sender_name(&party_role);
-                    let msg = RoomAnnouncement::seeked_ms(&sender, target_ms);
+                    let msg = RoomAnnouncement::seeked_ms(&sender, landed_pts);
                     broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
                 }
                 PlayerCommand::SetSpeed(spd) => {
@@ -1486,8 +1501,8 @@ pub fn run_playback_worker(
                     if drift_ms > 1500 {
                         // Zone 3: Hard seek
                         if let Some(ref mut sess) = session {
-                            sess.seek(target_pts_ms, &video_ring);
-                            clock.seek_to(target_pts_ms as f64, now);
+                            let landed = sess.seek(target_pts_ms, &video_ring);
+                            clock.seek_to(landed as f64, now);
                         }
                     } else if drift_ms > 15 && clock.is_playing() {
                         // Zone 2: Micro-speed steering

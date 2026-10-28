@@ -991,4 +991,228 @@ fn test_e2e_audio_playback_after_seek_and_track_switch() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_real_user_video_seek_10_minutes() {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use syncverse_clock::MasterClock;
+    use syncverse_clock::PlaybackState;
+    use syncverse_clock::SpscRingBuffer;
+    use syncverse_codecs::VideoFrameRGBA;
+    use syncverse_core::playback_runtime::{run_playback_worker, AudioWorkerCommand};
+    use syncverse_ui::command::PlayerCommand;
+    use syncverse_ui::event::UiEvent;
+    use syncverse_ui::snapshot::TripleBufferSnapshotExchange;
+
+    let media_path = PathBuf::from("/home/gautham/Videos/Your.Name.2016.1080p.Bluray.Multi-Audio.10bit.DTS-HD.MA.5.1.x265.[HashMiner].mkv");
+    if !media_path.exists() {
+        eprintln!("File does not exist, skipping real video test");
+        return;
+    }
+
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, command_rx) = channel::<PlayerCommand>();
+    let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let thread_exchange = Arc::clone(&exchange);
+    let thread_video_ring = Arc::clone(&video_ring);
+    let thread_clock = Arc::clone(&clock);
+    let thread_running = Arc::clone(&running);
+
+    let drain_video_ring = Arc::clone(&video_ring);
+    let drain_running = Arc::clone(&running);
+    let drain_handle = std::thread::spawn(move || {
+        while drain_running.load(Ordering::Relaxed) {
+            while drain_video_ring.try_pop().is_some() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let worker_handle = std::thread::spawn(move || {
+        run_playback_worker(
+            command_rx,
+            audio_tx,
+            event_tx,
+            thread_exchange,
+            thread_video_ring,
+            thread_clock,
+            thread_running,
+        );
+    });
+
+    // 1. Open media file
+    command_tx.send(PlayerCommand::OpenFile(media_path.clone())).unwrap();
+
+    let start = std::time::Instant::now();
+    let mut tracks_ready = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Ok(UiEvent::TracksDiscovered { .. }) = event_rx.recv_timeout(Duration::from_millis(100)) {
+            tracks_ready = true;
+            break;
+        }
+    }
+    assert!(tracks_ready, "TracksDiscovered must be emitted");
+
+    // 2. Start playback
+    command_tx.send(PlayerCommand::ForcePlay).unwrap();
+
+    // Receive initial audio samples
+    let mut initial_samples = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(100)) {
+            initial_samples += samples.len();
+            if initial_samples > 4096 {
+                break;
+            }
+        }
+    }
+    println!("[REAL TEST] Initial samples received: {}", initial_samples);
+    assert!(initial_samples > 4096, "Initial playback must yield audio samples (got {initial_samples})");
+
+    // 3. Skip 10 minutes forward (600,000 ms)
+    println!("[REAL TEST] Seeking to 600,000 ms (10 minutes)...");
+    command_tx.send(PlayerCommand::Seek(600_000)).unwrap();
+
+    // Check if audio samples arrive post-seek!
+    let mut post_seek_samples = 0;
+    let mut reset_count = 0;
+    let seek_start = std::time::Instant::now();
+    let mut latency = Duration::ZERO;
+    while seek_start.elapsed() < Duration::from_secs(3) {
+        match audio_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(AudioWorkerCommand::Samples(samples)) => {
+                post_seek_samples += samples.len();
+                if post_seek_samples > 4096 {
+                    latency = seek_start.elapsed();
+                    break;
+                }
+            }
+            Ok(AudioWorkerCommand::Reset) => {
+                reset_count += 1;
+            }
+            _ => {}
+        }
+    }
+    println!("[REAL TEST] Post-seek samples: {}, resets: {}, latency: {:?}", post_seek_samples, reset_count, latency);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = command_tx.send(PlayerCommand::Stop);
+    let _ = drain_handle.join();
+    let _ = worker_handle.join();
+
+    assert!(
+        post_seek_samples > 4096,
+        "Audio MUST continue outputting samples after 10-minute seek on real video! Got {post_seek_samples}"
+    );
+}
+
+#[test]
+fn test_real_user_video_paused_seek_and_unpause() {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use syncverse_clock::MasterClock;
+    use syncverse_clock::PlaybackState;
+    use syncverse_clock::SpscRingBuffer;
+    use syncverse_codecs::VideoFrameRGBA;
+    use syncverse_core::playback_runtime::{run_playback_worker, AudioWorkerCommand};
+    use syncverse_ui::command::PlayerCommand;
+    use syncverse_ui::event::UiEvent;
+    use syncverse_ui::snapshot::TripleBufferSnapshotExchange;
+
+    let media_path = PathBuf::from("/home/gautham/Videos/Your.Name.2016.1080p.Bluray.Multi-Audio.10bit.DTS-HD.MA.5.1.x265.[HashMiner].mkv");
+    if !media_path.exists() {
+        return;
+    }
+
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, command_rx) = channel::<PlayerCommand>();
+    let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let thread_exchange = Arc::clone(&exchange);
+    let thread_video_ring = Arc::clone(&video_ring);
+    let thread_clock = Arc::clone(&clock);
+    let thread_running = Arc::clone(&running);
+
+    let drain_video_ring = Arc::clone(&video_ring);
+    let drain_running = Arc::clone(&running);
+    let drain_handle = std::thread::spawn(move || {
+        while drain_running.load(Ordering::Relaxed) {
+            while drain_video_ring.try_pop().is_some() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let worker_handle = std::thread::spawn(move || {
+        run_playback_worker(
+            command_rx,
+            audio_tx,
+            event_tx,
+            thread_exchange,
+            thread_video_ring,
+            thread_clock,
+            thread_running,
+        );
+    });
+
+    // 1. Open media file
+    command_tx.send(PlayerCommand::OpenFile(media_path.clone())).unwrap();
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Ok(UiEvent::TracksDiscovered { .. }) = event_rx.recv_timeout(Duration::from_millis(100)) {
+            break;
+        }
+    }
+
+    // 2. Seek while PAUSED (target: 600,000 ms)
+    command_tx.send(PlayerCommand::Seek(600_000)).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    // 3. Unpause (ForcePlay)
+    command_tx.send(PlayerCommand::ForcePlay).unwrap();
+
+    // 4. Verify audio resumes immediately post-unpause!
+    let mut unpaused_samples = 0;
+    let start = std::time::Instant::now();
+    let mut latency = Duration::ZERO;
+    while start.elapsed() < Duration::from_secs(3) {
+        if let Ok(AudioWorkerCommand::Samples(samples)) = audio_rx.recv_timeout(Duration::from_millis(50)) {
+            unpaused_samples += samples.len();
+            if unpaused_samples > 4096 {
+                latency = start.elapsed();
+                break;
+            }
+        }
+    }
+
+    println!("[REAL PAUSED TEST] Unpaused samples: {}, latency: {:?}", unpaused_samples, latency);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = command_tx.send(PlayerCommand::Stop);
+    let _ = drain_handle.join();
+    let _ = worker_handle.join();
+
+    assert!(
+        unpaused_samples > 4096,
+        "Audio MUST resume seamlessly after seeking while paused! Got {unpaused_samples}"
+    );
+}
+
+
+
 

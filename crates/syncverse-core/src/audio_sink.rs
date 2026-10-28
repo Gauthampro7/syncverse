@@ -192,6 +192,7 @@ impl AudioSink for PipeAudioSink {
         self.stdin
             .write_all(&self.byte_buffer)
             .map_err(CoreError::Io)?;
+        let _ = self.stdin.flush();
         Ok(samples.len())
     }
 
