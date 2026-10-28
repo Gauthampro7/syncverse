@@ -284,3 +284,44 @@ fn test_subtitle_cache_and_ordered_cue_insertion() {
     assert_eq!(streaming_cues[1].start_ms, 3500);
     assert_eq!(streaming_cues[2].start_ms, 5000);
 }
+
+#[test]
+fn test_subtitle_cache_overlapping_cues() {
+    use syncverse_ui::gui::subtitle_overlay::{SubtitleCue, SubtitleTrack};
+    use syncverse_ui::gui::SyncplayApp;
+
+    let mut app = SyncplayApp::new();
+
+    let cue1 = SubtitleCue::new(1000, 5000, "First cue");
+    let cue2 = SubtitleCue::new(2000, 4000, "Second cue");
+    let track = SubtitleTrack::new(0, "English", Some("en".to_string()), vec![cue1, cue2]);
+
+    app.add_subtitle_track(track);
+    app.select_subtitle_track(Some(0));
+
+    // 1. Before any cue: 500ms -> None
+    assert_eq!(app.current_active_subtitle(500), None);
+    assert_eq!(app.current_active_subtitle(800), None);
+
+    // 2. At 1500: only cue 1 is active (cache interval [1000, 1999])
+    assert_eq!(app.current_active_subtitle(1500), Some("First cue".to_string()));
+    assert_eq!(app.current_active_subtitle(1800), Some("First cue".to_string()));
+
+    // 3. At 2500: BOTH cues 1 and 2 are active (cache interval [2000, 4000])
+    assert_eq!(
+        app.current_active_subtitle(2500),
+        Some("First cue\nSecond cue".to_string())
+    );
+    assert_eq!(
+        app.current_active_subtitle(3500),
+        Some("First cue\nSecond cue".to_string())
+    );
+
+    // 4. At 4500: Cue 2 has ended, only Cue 1 is active (cache interval [4001, 5000])
+    assert_eq!(app.current_active_subtitle(4500), Some("First cue".to_string()));
+
+    // 5. At 5500: Both cues have ended -> None
+    assert_eq!(app.current_active_subtitle(5500), None);
+    assert_eq!(app.current_active_subtitle(6000), None);
+}
+

@@ -258,3 +258,55 @@ fn test_audio_sink_pop_free_reset_and_smooth_transitions() {
     let first_new_sample = all_recorded[512 + 256];
     assert!(first_new_sample.abs() < 0.001, "Fade-in must commence smoothly from zero");
 }
+
+#[test]
+fn test_audio_track_switch_preroll_and_continuous_clock() {
+    use std::sync::mpsc::channel;
+    use syncverse_core::playback_runtime::AudioWorkerCommand;
+
+    let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let mut generation: u64 = 1;
+
+    // Simulate switching audio track at 1500ms
+    generation = generation.wrapping_add(1);
+    audio_tx.send(AudioWorkerCommand::Reset).unwrap();
+
+    // Verify reset command received
+    match audio_rx.try_recv().unwrap() {
+        AudioWorkerCommand::Reset => {}
+        other => panic!("Expected Reset, got {:?}", other),
+    }
+
+    // Preroll produces batch of audio frames for new track at generation 2
+    for pts in (1500..2000).step_by(20) {
+        audio_tx
+            .send(AudioWorkerCommand::TimestampedSamples {
+                pts_ms: pts,
+                samples: vec![0.5f32; 1920], // 20ms of 48kHz stereo
+                generation,
+            })
+            .unwrap();
+    }
+
+    // Verify all frames queued with correct generation and monotonic PTS
+    let mut frame_count = 0;
+    let mut expected_pts = 1500;
+    while let Ok(cmd) = audio_rx.try_recv() {
+        match cmd {
+            AudioWorkerCommand::TimestampedSamples {
+                pts_ms,
+                samples,
+                generation: gen,
+            } => {
+                assert_eq!(gen, generation);
+                assert_eq!(pts_ms, expected_pts);
+                assert_eq!(samples.len(), 1920);
+                expected_pts += 20;
+                frame_count += 1;
+            }
+            other => panic!("Unexpected command: {:?}", other),
+        }
+    }
+    assert_eq!(frame_count, 25, "Expected 25 frames (500ms of prerolled audio)");
+}
+

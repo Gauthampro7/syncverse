@@ -276,6 +276,7 @@ struct PlaybackSession {
     duration_ms: u64,
     eof_reached: bool,
     pending_video_packets: VecDeque<DemuxPacket>,
+    last_demuxed_video_dts: Option<u64>,
     video_metadata: syncverse_ui::gui::dialogs::VideoStreamMetadata,
 }
 
@@ -399,6 +400,7 @@ impl PlaybackSession {
             duration_ms,
             eof_reached: false,
             pending_video_packets: VecDeque::with_capacity(64),
+            last_demuxed_video_dts: None,
             video_metadata,
         })
     }
@@ -515,6 +517,7 @@ impl PlaybackSession {
     ) -> u64 {
         self.pending_video_packets.clear();
         let _ = self.demuxer.seek_to(target_ms);
+        self.last_demuxed_video_dts = Some(target_ms);
         if let Some(ref mut vdec) = self.video_decoder {
             vdec.flush();
         }
@@ -537,6 +540,8 @@ impl PlaybackSession {
                     packets_read += 1;
 
                     if Some(packet.track_id) == self.video_track_id {
+                        let pkt_dts = packet.dts_ms.unwrap_or(packet.pts_ms);
+                        self.last_demuxed_video_dts = Some(pkt_dts);
                         if first_video_frame.is_none() {
                             if let Some(ref mut vdec) = self.video_decoder {
                                 let _ = vdec.send_packet(
@@ -608,6 +613,88 @@ impl PlaybackSession {
     fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
         let (dummy_tx, _) = channel();
         self.seek_preroll(target_ms, video_ring, &dummy_tx, 0, 1.0, 0)
+    }
+
+    /// Performs non-disruptive audio track catch-up preroll without flushing video or resetting clock.
+    ///
+    /// Seeks container demuxer back to `current_pts`, rapidly decodes audio frames for the new track
+    /// from `current_pts` up to the latest demuxed video position, trims boundary samples, scales volume,
+    /// and pre-fills `audio_tx` to prevent audio sink underruns. Video packets prior to the last demuxed
+    /// DTS are skipped, leaving the video pipeline and presentation clock completely continuous.
+    fn switch_audio_track_preroll(
+        &mut self,
+        current_pts: u64,
+        audio_tx: &Sender<AudioWorkerCommand>,
+        audio_generation: u64,
+        effective_vol: f32,
+        audio_delay_ms: i64,
+    ) {
+        let catchup_dts = self.last_demuxed_video_dts;
+        let _ = self.demuxer.seek_to(current_pts);
+        self.eof_reached = false;
+
+        let max_packets = 5000;
+        let mut packets_read = 0;
+
+        while packets_read < max_packets {
+            match self.demuxer.read_packet() {
+                Ok(Some(packet)) => {
+                    packets_read += 1;
+
+                    if Some(packet.track_id) == self.audio_track_id {
+                        let dur = packet.duration_ms.unwrap_or(25);
+                        if packet.pts_ms + dur >= current_pts {
+                            if let Some(ref mut adec) = self.audio_decoder {
+                                let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                                if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
+                                    for mut pcm in pcm_frames {
+                                        if pcm.pts_ms < current_pts {
+                                            let diff_ms = current_pts - pcm.pts_ms;
+                                            let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
+                                            let float_count = num_frames * pcm.channels as usize;
+                                            if float_count < pcm.samples.len() {
+                                                pcm.samples.drain(0..float_count);
+                                                pcm.pts_ms = current_pts;
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                        let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
+                                            pts_ms: pcm.pts_ms,
+                                            samples,
+                                            generation: audio_generation,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else if Some(packet.track_id) == self.video_track_id {
+                        let pkt_dts = packet.dts_ms.unwrap_or(packet.pts_ms);
+                        if let Some(target_dts) = catchup_dts {
+                            if pkt_dts > target_dts {
+                                self.last_demuxed_video_dts = Some(pkt_dts);
+                                self.pending_video_packets.push_back(packet);
+                                break;
+                            }
+                        } else if packet.pts_ms >= current_pts {
+                            self.last_demuxed_video_dts = Some(pkt_dts);
+                            self.pending_video_packets.push_back(packet);
+                            break;
+                        }
+                    }
+
+                    if self.video_track_id.is_none() && packet.pts_ms >= current_pts + 500 {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    self.eof_reached = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -1151,31 +1238,24 @@ pub fn run_playback_worker(
                     if let Some(ref mut sess) = session {
                         match sess.select_audio_track(track_id) {
                             Ok(name) => {
-                                let was_playing = clock.is_playing();
                                 let now = Instant::now();
                                 let current_pts = clock.current_pts(now).max(0.0) as u64;
 
-                                overflow_frame = None;
                                 current_audio_generation = current_audio_generation.wrapping_add(1);
                                 let _ = audio_tx.send(AudioWorkerCommand::Reset);
 
                                 let effective_vol = if is_muted { 0.0 } else { volume };
-                                let landed_pts = sess.seek_preroll(
+                                sess.switch_audio_track_preroll(
                                     current_pts,
-                                    &video_ring,
                                     &audio_tx,
                                     current_audio_generation,
                                     effective_vol,
                                     audio_delay_ms,
                                 );
 
-                                let resume_now = Instant::now();
-                                clock.seek_to(landed_pts as f64, resume_now);
-                                if was_playing {
-                                    clock.set_state(resume_now, PlaybackState::Playing);
+                                if clock.is_playing() {
                                     let _ = audio_tx.send(AudioWorkerCommand::Resume);
                                 } else {
-                                    clock.set_state(resume_now, PlaybackState::Paused);
                                     let _ = audio_tx.send(AudioWorkerCommand::Pause);
                                 }
 
@@ -1197,31 +1277,24 @@ pub fn run_playback_worker(
                 PlayerCommand::CycleAudioTrack => {
                     if let Some(ref mut sess) = session {
                         if let Some((next_id, name)) = sess.cycle_audio_track() {
-                            let was_playing = clock.is_playing();
                             let now = Instant::now();
                             let current_pts = clock.current_pts(now).max(0.0) as u64;
 
-                            overflow_frame = None;
                             current_audio_generation = current_audio_generation.wrapping_add(1);
                             let _ = audio_tx.send(AudioWorkerCommand::Reset);
 
                             let effective_vol = if is_muted { 0.0 } else { volume };
-                            let landed_pts = sess.seek_preroll(
+                            sess.switch_audio_track_preroll(
                                 current_pts,
-                                &video_ring,
                                 &audio_tx,
                                 current_audio_generation,
                                 effective_vol,
                                 audio_delay_ms,
                             );
 
-                            let resume_now = Instant::now();
-                            clock.seek_to(landed_pts as f64, resume_now);
-                            if was_playing {
-                                clock.set_state(resume_now, PlaybackState::Playing);
+                            if clock.is_playing() {
                                 let _ = audio_tx.send(AudioWorkerCommand::Resume);
                             } else {
-                                clock.set_state(resume_now, PlaybackState::Paused);
                                 let _ = audio_tx.send(AudioWorkerCommand::Pause);
                             }
 
@@ -1287,21 +1360,28 @@ pub fn run_playback_worker(
                 PlayerCommand::LoadExternalSubtitle(path) => {
                     if let Some(ref mut sess) = session {
                         let next_track_id = 1000 + sess.available_subtitle_tracks.len();
-                        if let Ok(track) = syncverse_demux::subtitles::parse_subtitle_file(&path, next_track_id, None) {
-                            let track_idx = sess.available_subtitle_tracks.len();
-                            let label = track.display_label();
-                            sess.available_subtitle_tracks.push(track);
-                            sess.selected_subtitle_track_index = Some(track_idx);
-                            sess.subtitle_track_id = None;
-                            let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
-                                track_index: Some(track_idx),
-                                name: label.clone(),
-                            });
-                            let _ = event_tx.send(UiEvent::HudNotification {
-                                text: format!("Subtitles: {label}"),
-                                timestamp: Instant::now(),
-                            });
-                        }
+                        let filename = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("External Subtitle")
+                            .to_string();
+                        let ext = path
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("srt")
+                            .to_string();
+                        let track = syncverse_common::subtitles::SubtitleTrack::new(
+                            next_track_id,
+                            syncverse_common::subtitles::SubtitleSource::External,
+                            ext,
+                            None,
+                            filename,
+                            Vec::new(),
+                        );
+                        let track_idx = sess.available_subtitle_tracks.len();
+                        sess.available_subtitle_tracks.push(track);
+                        sess.selected_subtitle_track_index = Some(track_idx);
+                        sess.subtitle_track_id = None;
                     }
                 }
                 PlayerCommand::SetSubtitleDelay(delay_ms) => {
@@ -1594,6 +1674,8 @@ pub fn run_playback_worker(
                                 let pkt_pts_ms = packet.pts_ms;
 
                                 if Some(packet.track_id) == sess.video_track_id {
+                                    let pkt_dts = packet.dts_ms.unwrap_or(packet.pts_ms);
+                                    sess.last_demuxed_video_dts = Some(pkt_dts);
                                     if sess.pending_video_packets.is_empty() && overflow_frame.is_none() {
                                         if let Some(ref mut vdec) = sess.video_decoder {
                                             let _ = vdec.send_packet(

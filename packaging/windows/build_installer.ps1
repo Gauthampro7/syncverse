@@ -68,7 +68,7 @@ Write-Host "  Found ISCC compiler: $Iscc" -ForegroundColor Green
 Write-Host "[3/3] Compiling Windows Installer with Inno Setup..." -ForegroundColor Yellow
 $IssPath = "$PSScriptRoot\installer.iss"
 $version = (Get-Content "$ProjectRoot\Cargo.toml" | Select-String '^version = "(.*)"' | ForEach-Object { $_.Matches.Groups[1].Value })
-if (-not $version) { $version = "0.1.8" }
+if (-not $version) { $version = "0.1.9" }
 & $Iscc "/DMyAppVersion=$version" "$IssPath"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "ISCC compilation failed with exit code $LASTEXITCODE"

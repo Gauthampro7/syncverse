@@ -20,8 +20,7 @@ use crate::gui::file_dialog::FileDialogManager;
 use crate::gui::recent_files::RecentFilesManager;
 use crate::gui::sidebar::SidebarState;
 use crate::gui::subtitle_overlay::{
-    compute_effective_pts, find_active_cue, find_active_cue_text, SubtitleCue, SubtitleOverlay,
-    SubtitleTrack,
+    compute_effective_pts, find_active_cues, SubtitleCue, SubtitleOverlay, SubtitleTrack,
 };
 use crate::gui::viewport::VideoViewport;
 use crate::osd::OsdOverlay;
@@ -381,74 +380,67 @@ impl SyncplayApp {
         }
 
         // 2. Cache miss: evaluate active subtitle and determine valid window
-        let mut result_text = None;
-        let mut target_query_ms = query_ms;
-
-        // 2a. Check pre-parsed track cues if available
-        if track_idx < self.subtitle_track_data.len() {
-            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(query_ms) {
-                result_text = Some(text);
-                target_query_ms = query_ms;
-            }
-        }
-
-        // 2b. Check dynamically demuxed / active streaming cues
-        if result_text.is_none() {
-            if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, query_ms) {
-                result_text = Some(text);
-                target_query_ms = query_ms;
-            }
-        }
-
-        // 2c. Fallback for callers supplying PTS directly in milliseconds
-        if result_text.is_none() && query_ms != direct_ms {
-            if track_idx < self.subtitle_track_data.len() {
-                if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(direct_ms) {
-                    result_text = Some(text);
-                    target_query_ms = direct_ms;
-                }
-            }
-            if result_text.is_none() {
-                if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, direct_ms) {
-                    result_text = Some(text);
-                    target_query_ms = direct_ms;
-                }
-            }
-        }
-
-        // 3. Compute validity interval for caching
-        let (valid_start, valid_end) = if result_text.is_some() {
-            let mut start = i64::MIN;
-            let mut end = i64::MAX;
-            if track_idx < self.subtitle_track_data.len() {
-                if let Some(cue) = self.subtitle_track_data[track_idx].active_cue_at(target_query_ms) {
-                    start = cue.start_ms;
-                    end = cue.end_ms;
-                }
-            }
-            if start == i64::MIN {
-                if let Some(cue) = find_active_cue(&self.active_subtitle_cues, target_query_ms) {
-                    start = cue.start_ms;
-                    end = cue.end_ms;
-                }
-            }
-            (start.max(0), end)
+        let cues = if track_idx < self.subtitle_track_data.len() {
+            &self.subtitle_track_data[track_idx].cues
         } else {
-            let mut prev_end = 0i64;
-            let mut next_start = i64::MAX;
-            let cues = if track_idx < self.subtitle_track_data.len() {
-                &self.subtitle_track_data[track_idx].cues
+            &self.active_subtitle_cues
+        };
+
+        let (active_cues, target_query_ms) = {
+            let direct_matches = find_active_cues(cues, query_ms);
+            if direct_matches.is_empty() && query_ms != direct_ms {
+                let alt_matches = find_active_cues(cues, direct_ms);
+                if !alt_matches.is_empty() {
+                    (alt_matches, direct_ms)
+                } else {
+                    (direct_matches, query_ms)
+                }
             } else {
-                &self.active_subtitle_cues
+                (direct_matches, query_ms)
+            }
+        };
+
+        let result_text = if active_cues.is_empty() {
+            None
+        } else {
+            Some(
+                active_cues
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+
+        // 3. Compute mathematically exact validity interval for caching
+        let (valid_start, valid_end) = if !active_cues.is_empty() {
+            let earliest_end = active_cues.iter().map(|c| c.end_ms).min().unwrap_or(i64::MAX);
+            let latest_start = active_cues.iter().map(|c| c.start_ms).max().unwrap_or(i64::MIN);
+            let upper = cues.partition_point(|c| c.start_ms <= target_query_ms);
+            let next_start = if upper < cues.len() {
+                cues[upper].start_ms
+            } else {
+                i64::MAX
             };
+            (latest_start.max(0), earliest_end.min(next_start.saturating_sub(1)))
+        } else {
             let upper = cues.partition_point(|cue| cue.start_ms <= target_query_ms);
-            if upper < cues.len() {
-                next_start = cues[upper].start_ms;
-            }
-            if upper > 0 {
-                prev_end = cues[upper - 1].end_ms;
-            }
-            (prev_end, next_start.saturating_sub(1))
+            let next_start = if upper < cues.len() {
+                cues[upper].start_ms
+            } else {
+                i64::MAX
+            };
+            let prev_end = if upper > 0 {
+                let candidate_start = upper.saturating_sub(64);
+                cues[candidate_start..upper]
+                    .iter()
+                    .map(|c| c.end_ms)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (prev_end.max(0), next_start.saturating_sub(1))
         };
 
         if let Ok(mut cache_mut) = self.cached_subtitle.try_borrow_mut() {
