@@ -321,12 +321,24 @@ impl ShortcutsDialog {
                             ui.label("Toggle Play / Pause");
                             ui.end_row();
 
-                            ui.label(RichText::new("F11 / Double-Click").monospace().strong());
+                            ui.label(RichText::new("F / F11 / Double-Click").monospace().strong());
                             ui.label("Toggle Fullscreen Mode");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Esc").monospace().strong());
+                            ui.label("Close Modal Dialog / Exit Fullscreen");
                             ui.end_row();
 
                             ui.label(RichText::new("Ctrl + O").monospace().strong());
                             ui.label("Open Media File (Native File Picker)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + Q").monospace().strong());
+                            ui.label("Quit Application");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Mouse Wheel / Scroll").monospace().strong());
+                            ui.label("Adjust Volume (±5%)");
                             ui.end_row();
 
                             ui.label(RichText::new("Tab").monospace().strong());
@@ -849,6 +861,8 @@ pub struct VideoStreamMetadata {
     pub bit_depth: Option<u32>,
     /// Pixel format description (e.g. "yuv420p", "yuv420p10le").
     pub pixel_format: Option<String>,
+    /// Container or video timescale base in ticks per second.
+    pub timescale: Option<u64>,
 }
 
 impl VideoStreamMetadata {
@@ -1079,6 +1093,12 @@ impl VideoConfigDialog {
                         ui.label(RichText::new("Codec / Format:").strong());
                         ui.label(self.metadata.codec_str());
                         ui.end_row();
+
+                        if let Some(ts) = self.metadata.timescale {
+                            ui.label(RichText::new("Timescale:").strong());
+                            ui.label(format!("{} ticks/sec", ts));
+                            ui.end_row();
+                        }
                     });
 
                 ui.add_space(10.0);
@@ -1555,6 +1575,7 @@ mod tests {
             frame_rate: Some(59.94),
             bit_depth: Some(8),
             pixel_format: Some("yuv420p".to_string()),
+            timescale: Some(1000),
         };
 
         assert_eq!(meta.resolution_str(), "1920 × 1080 (1080p FHD)");

@@ -185,7 +185,7 @@ pub struct SidebarState {
 impl Default for SidebarState {
     fn default() -> Self {
         Self {
-            is_expanded: true,
+            is_expanded: false,
             panel_width: 300.0,
             input_text: String::new(),
             autoscroll: true,

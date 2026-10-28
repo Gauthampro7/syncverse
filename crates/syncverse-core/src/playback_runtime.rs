@@ -224,6 +224,7 @@ struct PlaybackSession {
     duration_ms: u64,
     eof_reached: bool,
     pending_video_packets: VecDeque<DemuxPacket>,
+    video_metadata: syncverse_ui::gui::dialogs::VideoStreamMetadata,
 }
 
 impl PlaybackSession {
@@ -320,6 +321,16 @@ impl PlaybackSession {
             None
         };
 
+        let video_metadata = syncverse_ui::gui::dialogs::VideoStreamMetadata {
+            width: vt.as_ref().and_then(|v| v.width),
+            height: vt.as_ref().and_then(|v| v.height),
+            codec: vt.as_ref().map(|v| v.codec_id.clone()),
+            frame_rate: None,
+            bit_depth: Some(8),
+            pixel_format: Some("yuv420p".to_string()),
+            timescale: Some(info.timescale),
+        };
+
         Ok(Self {
             demuxer,
             video_decoder,
@@ -333,6 +344,7 @@ impl PlaybackSession {
             duration_ms,
             eof_reached: false,
             pending_video_packets: VecDeque::with_capacity(64),
+            video_metadata,
         })
     }
 
@@ -716,12 +728,27 @@ pub fn run_playback_worker(
                                         end_ms: c.end.as_millis() as i64,
                                         text: c.text.clone(),
                                     }).collect();
-                                    syncverse_ui::gui::subtitle_overlay::SubtitleTrack::new(
+                                    syncverse_ui::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
                                         t.id,
                                         t.display_label(),
                                         t.language.clone(),
                                         cues,
+                                        t.format.clone(),
+                                        t.source == syncverse_common::subtitles::SubtitleSource::External,
                                     )
+                                })
+                                .collect();
+
+                            let audio_items: Vec<syncverse_ui::gui::dialogs::AudioTrackItem> = new_session
+                                .available_audio_tracks
+                                .iter()
+                                .map(|t| syncverse_ui::gui::dialogs::AudioTrackItem {
+                                    id: t.track_id,
+                                    title: t.title.clone().unwrap_or_else(|| format!("Track {}", t.track_id)),
+                                    language: t.language.clone(),
+                                    codec: t.codec_id.clone(),
+                                    channels: t.channels,
+                                    sample_rate: t.sample_rate,
                                 })
                                 .collect();
 
@@ -729,6 +756,8 @@ pub fn run_playback_worker(
                                 audio_tracks: audio_tracks_info,
                                 subtitle_tracks: subtitle_tracks_info,
                             });
+                            let _ = event_tx.send(UiEvent::AudioDataDiscovered(audio_items));
+                            let _ = event_tx.send(UiEvent::VideoMetadataDiscovered(new_session.video_metadata.clone()));
                             let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_subtitle_tracks));
                             if let Some(at) = new_session.available_audio_tracks.first() {
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
@@ -1798,9 +1827,24 @@ pub fn run_playback_worker(
         let now = Instant::now();
         if now.duration_since(last_snapshot_instant) >= Duration::from_millis(25) {
             last_snapshot_instant = now;
-            let current_pts_ms = clock.current_pts(now);
+            let mut current_pts_ms = clock.current_pts(now);
             let dur_ms = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
-            let is_playing = clock.is_playing();
+            let mut is_playing = clock.is_playing();
+
+            // EOF auto-pause and boundary clamping at media duration
+            if dur_ms > 0 && current_pts_ms >= dur_ms as f64 {
+                current_pts_ms = dur_ms as f64;
+                if is_playing {
+                    clock.seek_to(dur_ms as f64, now);
+                    clock.set_state(now, PlaybackState::Paused);
+                    let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                    is_playing = false;
+                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                        server.set_media_state(dur_ms, 1.0, true);
+                        let _ = server.broadcast_room_state();
+                    }
+                }
+            }
 
             let (
                 peer_count,

@@ -7,8 +7,8 @@ pub mod vtt;
 
 pub use ass::{clean_ass_text, parse_ass, parse_ass_dialogue_line, parse_ass_timestamp};
 pub use scanner::{
-    detect_subtitle_language, lookup_language, parse_subtitle_file, scan_external_subtitles,
-    SUBTITLE_EXTENSIONS,
+    decode_subtitle_bytes, detect_subtitle_language, lookup_language, parse_subtitle_file,
+    read_subtitle_to_string, scan_external_subtitles, SUBTITLE_EXTENSIONS,
 };
 pub use srt::{clean_srt_text, parse_srt, parse_srt_timestamp};
 pub use vtt::{clean_vtt_text, parse_vtt, parse_vtt_timestamp};

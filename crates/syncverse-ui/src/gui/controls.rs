@@ -279,10 +279,7 @@ impl PlaybackControlsBar {
     ) -> Vec<ControlsBarAction> {
         let mut actions = Vec::new();
 
-        // 1. Process keyboard shortcuts (Spacebar for Play/Pause, 'M' for Mute)
-        actions.extend(Self::handle_shortcuts(ui.ctx(), state));
-
-        // 2. Container frame with sleek dark styling
+        // 1. Container frame with sleek dark styling
         egui::Frame::new()
             .fill(style::BAR_BACKGROUND)
             .stroke(Stroke::new(1.0, style::BAR_BORDER))
@@ -654,9 +651,21 @@ impl PlaybackControlsBar {
                 let slider = egui::Slider::new(&mut vol, 0.0..=1.0)
                     .show_value(false)
                     .trailing_fill(true);
-                if ui.add_sized(Vec2::new(80.0, 16.0), slider).changed() {
+                let slider_resp = ui.add_sized(Vec2::new(80.0, 16.0), slider);
+                if slider_resp.changed() {
                     state.volume.set_volume(vol);
                     actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+                } else if slider_resp.hovered() {
+                    let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll_y > 0.0 {
+                        let new_vol = (state.volume.volume + 0.05).min(1.0);
+                        state.volume.set_volume(new_vol);
+                        actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+                    } else if scroll_y < 0.0 {
+                        let new_vol = (state.volume.volume - 0.05).max(0.0);
+                        state.volume.set_volume(new_vol);
+                        actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+                    }
                 }
 
                 // Mute Toggle Button ('M')
@@ -672,30 +681,6 @@ impl PlaybackControlsBar {
                 }
             });
         });
-
-        actions
-    }
-
-    /// Handles keyboard shortcuts when text focus is absent.
-    fn handle_shortcuts(
-        ctx: &Context,
-        state: &mut ControlsBarState,
-    ) -> Vec<ControlsBarAction> {
-        let mut actions = Vec::new();
-        let has_text_focus = ctx.memory(|m| m.focused().is_some());
-
-        if !has_text_focus {
-            // Spacebar -> Toggle Play/Pause
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                actions.push(ControlsBarAction::TogglePause);
-            }
-
-            // 'M' -> Toggle Mute
-            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
-                state.volume.toggle_mute();
-                actions.push(ControlsBarAction::ToggleMute);
-            }
-        }
 
         actions
     }

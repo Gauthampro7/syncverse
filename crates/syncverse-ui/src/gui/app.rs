@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, Context, CornerRadius, Stroke, ViewportBuilder, ViewportCommand};
 use syncverse_chat::ChatRecord;
@@ -92,6 +92,7 @@ pub struct SyncplayApp {
     active_subtitle_cues: Vec<SubtitleCue>,
     subtitle_track_data: Vec<SubtitleTrack>,
     aspect_ratio_index: usize,
+    current_window_title: String,
 }
 
 impl Default for SyncplayApp {
@@ -137,6 +138,7 @@ impl Default for SyncplayApp {
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
             aspect_ratio_index: 0,
+            current_window_title: "Syncverse — Desktop Media Player".to_string(),
         }
     }
 }
@@ -200,6 +202,7 @@ impl SyncplayApp {
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
             aspect_ratio_index: 0,
+            current_window_title: "Syncverse — Desktop Media Player".to_string(),
         };
 
         if let Some(path) = initial_file {
@@ -207,6 +210,17 @@ impl SyncplayApp {
         }
 
         app
+    }
+
+    /// Returns `true` if any of the application's 7 modal configuration/dialog windows are open.
+    pub fn is_any_modal_open(&self) -> bool {
+        self.host_dialog.is_open
+            || self.connect_dialog.is_open
+            || self.shortcuts_dialog.is_open
+            || self.about_dialog.is_open
+            || self.controls_state.audio_dialog.is_open
+            || self.controls_state.subtitle_dialog.is_open
+            || self.controls_state.video_dialog.is_open
     }
 
     /// Returns a reference to the active OSD HUD overlay.
@@ -341,6 +355,8 @@ impl SyncplayApp {
         self.recent_files.add_file(&path);
         let _ = self.command_tx.send(PlayerCommand::OpenFile(path.clone()));
         self.current_file = Some(path.clone());
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("Media");
+        self.current_window_title = format!("{} — Syncverse", filename);
         self.sidebar_state.local_ready = true;
         self.subtitle_track_index = None;
         self.subtitle_tracks.clear();
@@ -360,11 +376,13 @@ impl SyncplayApp {
                     text: c.text,
                 })
                 .collect();
-            let track = crate::gui::subtitle_overlay::SubtitleTrack::new(
+            let track = crate::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
                 ext_track.id,
                 label.clone(),
                 ext_track.language,
                 ui_cues,
+                ext_track.format.to_uppercase(),
+                true,
             );
             self.subtitle_tracks.push(label);
             self.subtitle_track_data.push(track);
@@ -377,8 +395,8 @@ impl SyncplayApp {
                 id: i,
                 title: t.title.clone(),
                 language: t.language.clone(),
-                format: "SUB".to_string(),
-                is_external: true,
+                format: t.format.clone(),
+                is_external: t.is_external,
                 file_path: None,
             })
             .collect();
@@ -394,18 +412,15 @@ impl SyncplayApp {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let parse_res = match ext.as_str() {
-            "srt" => std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|c| syncverse_demux::subtitles::parse_srt(&c).map_err(|e| e.to_string())),
-            "vtt" => std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|c| syncverse_demux::subtitles::parse_vtt(&c).map_err(|e| e.to_string())),
-            "ass" | "ssa" => std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|c| syncverse_demux::subtitles::parse_ass(&c).map_err(|e| e.to_string())),
+        let raw_content = syncverse_demux::subtitles::read_subtitle_to_string(&path)
+            .map_err(|e| e.to_string());
+
+        let parse_res = raw_content.and_then(|c| match ext.as_str() {
+            "srt" => syncverse_demux::subtitles::parse_srt(&c).map_err(|e| e.to_string()),
+            "vtt" => syncverse_demux::subtitles::parse_vtt(&c).map_err(|e| e.to_string()),
+            "ass" | "ssa" => syncverse_demux::subtitles::parse_ass(&c).map_err(|e| e.to_string()),
             other => Err(format!("Unsupported subtitle format: .{other}")),
-        };
+        });
 
         match parse_res {
             Ok(parsed_cues) => {
@@ -425,11 +440,13 @@ impl SyncplayApp {
                     .collect();
 
                 let new_track_id = self.subtitle_track_data.len();
-                let track = crate::gui::subtitle_overlay::SubtitleTrack::new(
+                let track = crate::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
                     new_track_id,
                     filename.clone(),
                     None,
                     ui_cues.clone(),
+                    ext.to_uppercase(),
+                    true,
                 );
 
                 self.subtitle_tracks.push(filename.clone());
@@ -437,20 +454,15 @@ impl SyncplayApp {
                 self.subtitle_track_index = Some(new_track_id);
                 self.active_subtitle_cues = ui_cues;
 
-                let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
-                    .subtitle_track_data
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
-                        id: i,
-                        title: t.title.clone(),
-                        language: t.language.clone(),
-                        format: ext.to_uppercase(),
-                        is_external: true,
-                        file_path: Some(path.clone()),
-                    })
-                    .collect();
-                self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+                let new_dialog_item = crate::gui::dialogs::SubtitleTrackItem {
+                    id: new_track_id,
+                    title: filename.clone(),
+                    language: None,
+                    format: ext.to_uppercase(),
+                    is_external: true,
+                    file_path: Some(path.clone()),
+                };
+                self.controls_state.subtitle_dialog.add_track(new_dialog_item);
                 self.controls_state.subtitle_dialog.select_track(Some(new_track_id));
 
                 let _ = self.command_tx.send(PlayerCommand::LoadExternalSubtitle(path));
@@ -545,7 +557,8 @@ impl eframe::App for SyncplayApp {
                 UiEvent::HudNotification { text, timestamp } => {
                     self.osd_overlay.show_notification(text, timestamp);
                 }
-                UiEvent::AudioTrackSelected { track_id: _, name } => {
+                UiEvent::AudioTrackSelected { track_id, name } => {
+                    self.controls_state.audio_dialog.select_track(track_id);
                     if let Some(pos) = self.audio_tracks.iter().position(|t| t == &name) {
                         self.audio_track_index = pos;
                     }
@@ -570,20 +583,43 @@ impl eframe::App for SyncplayApp {
                 }
                 UiEvent::AudioDelayChanged(ms) => {
                     self.audio_delay_ms = ms;
+                    self.controls_state.audio_dialog.set_delay_ms(ms);
                     self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", ms), now);
                 }
                 UiEvent::SubtitleDelayChanged(ms) => {
                     self.subtitle_delay_ms = ms;
+                    self.controls_state.subtitle_dialog.delay_ms = ms;
                     self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", ms), now);
                 }
                 UiEvent::TracksDiscovered {
                     audio_tracks,
                     subtitle_tracks,
                 } => {
-                    self.audio_tracks = audio_tracks;
+                    self.audio_tracks = audio_tracks.clone();
+                    if self.controls_state.audio_dialog.tracks.is_empty() {
+                        let items: Vec<crate::gui::dialogs::AudioTrackItem> = audio_tracks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, name)| crate::gui::dialogs::AudioTrackItem {
+                                id: i as u64,
+                                title: name.clone(),
+                                language: None,
+                                codec: String::new(),
+                                channels: None,
+                                sample_rate: None,
+                            })
+                            .collect();
+                        self.controls_state.audio_dialog.set_tracks(items);
+                    }
                     if self.subtitle_tracks.is_empty() {
                         self.subtitle_tracks = subtitle_tracks;
                     }
+                }
+                UiEvent::AudioDataDiscovered(tracks) => {
+                    self.controls_state.audio_dialog.set_tracks(tracks);
+                }
+                UiEvent::VideoMetadataDiscovered(meta) => {
+                    self.controls_state.video_dialog.set_metadata(meta);
                 }
                 UiEvent::SubtitleDataDiscovered(tracks) => {
                     self.subtitle_track_data = tracks;
@@ -596,8 +632,8 @@ impl eframe::App for SyncplayApp {
                             id: i,
                             title: t.title.clone(),
                             language: t.language.clone(),
-                            format: "SUB".to_string(),
-                            is_external: true,
+                            format: t.format.clone(),
+                            is_external: t.is_external,
                             file_path: None,
                         })
                         .collect();
@@ -619,24 +655,63 @@ impl eframe::App for SyncplayApp {
             let _ = self.command_tx.send(PlayerCommand::Stop);
         }
 
+        // Push current dynamic window title to viewport
+        ctx.send_viewport_cmd(ViewportCommand::Title(self.current_window_title.clone()));
+
         // 2. Poll latest atomic UI snapshot from telemetry aggregator
         let snapshot = self.exchange.poll_latest_snapshot();
 
-        // 3. User activity tracking for fullscreen auto-hide
-        if ctx.input(|i| i.pointer.is_moving() || i.pointer.any_click()) {
+        // 3. User activity tracking for fullscreen auto-hide & cursor visibility
+        if ctx.input(|i| i.pointer.is_moving() || i.pointer.any_click() || i.smooth_scroll_delta != egui::Vec2::ZERO) {
             self.controls_state.on_user_activity(now);
         }
-
-        // 4. Global keyboard shortcuts (suppressed if typing in text edit or modal dialog open)
-        let has_text_focus = ctx.memory(|m| m.focused().is_some());
-        if !has_text_focus && !self.host_dialog.is_open && !self.connect_dialog.is_open {
-            if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-                self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
+        if self.controls_state.is_fullscreen {
+            if !self.controls_state.is_visible(now) {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            } else {
+                ctx.set_cursor_icon(egui::CursorIcon::Default);
+                let remaining = Duration::from_secs_f64(self.controls_state.autohide_delay_secs)
+                    .saturating_sub(now.saturating_duration_since(self.controls_state.last_mouse_activity));
+                ctx.request_repaint_after(remaining);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.controls_state.is_fullscreen {
+        } else {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
+        }
+
+        // Escape hierarchy: closes top-most open modal/dialog first, then exits fullscreen
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.shortcuts_dialog.is_open {
+                self.shortcuts_dialog.is_open = false;
+            } else if self.about_dialog.is_open {
+                self.about_dialog.is_open = false;
+            } else if self.controls_state.video_dialog.is_open {
+                self.controls_state.video_dialog.close();
+            } else if self.controls_state.subtitle_dialog.is_open {
+                self.controls_state.subtitle_dialog.close();
+            } else if self.controls_state.audio_dialog.is_open {
+                self.controls_state.audio_dialog.close();
+            } else if self.connect_dialog.is_open {
+                self.connect_dialog.is_open = false;
+            } else if self.host_dialog.is_open {
+                self.host_dialog.is_open = false;
+            } else if self.controls_state.is_fullscreen {
                 self.controls_state.is_fullscreen = false;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+            }
+        }
+
+        // Ctrl+Q cleanly stops playback and closes application
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Q)) {
+            let _ = self.command_tx.send(PlayerCommand::Stop);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        // 4. Global keyboard shortcuts (suppressed if typing in text edit or any modal dialog is open)
+        let has_text_focus = ctx.memory(|m| m.focused().is_some());
+        if !has_text_focus && !self.is_any_modal_open() {
+            if ctx.input(|i| i.key_pressed(egui::Key::F11) || i.key_pressed(egui::Key::F)) {
+                self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
                 self.sidebar_state.toggle();
@@ -649,6 +724,8 @@ impl eframe::App for SyncplayApp {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                self.osd_overlay.show_notification(toast.to_string(), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 let offset_ms = if ctx.input(|i| i.modifiers.shift) { -30_000 } else { -5_000 };
@@ -656,6 +733,10 @@ impl eframe::App for SyncplayApp {
                 let target = (current_ms + offset_ms).max(0) as u64;
                 self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                self.osd_overlay.show_notification(
+                    format!("Seek: {}", ControlsBarState::format_timestamp(target)),
+                    now,
+                );
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                 let offset_ms = if ctx.input(|i| i.modifiers.shift) { 30_000 } else { 5_000 };
@@ -664,43 +745,65 @@ impl eframe::App for SyncplayApp {
                 let target = ((current_ms + offset_ms).max(0) as u64).min(dur_ms);
                 self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                self.osd_overlay.show_notification(
+                    format!("Seek: {}", ControlsBarState::format_timestamp(target)),
+                    now,
+                );
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                 let new_vol = (self.controls_state.volume.volume + 0.05).min(1.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                self.osd_overlay.show_notification(
+                    format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                    now,
+                );
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                self.osd_overlay.show_notification(
+                    format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                    now,
+                );
             }
             if ctx.input(|i| i.key_pressed(egui::Key::M)) {
                 self.controls_state.volume.toggle_mute();
                 let _ = self.command_tx.send(PlayerCommand::ToggleMute);
+                let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
+                self.osd_overlay.show_notification(toast.to_string(), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::S)) {
                 let _ = self.command_tx.send(PlayerCommand::Stop);
+                self.osd_overlay.show_notification("Stopped".to_string(), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
                 let spd = (self.controls_state.speed - 0.25).max(0.25);
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
                 let spd = (self.controls_state.speed + 0.25).min(3.0);
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.controls_state.speed = 1.0;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(1.0));
+                self.osd_overlay.show_notification("Speed: 1.00x".to_string(), now);
             }
             // Audio track cycling (B)
             if ctx.input(|i| i.key_pressed(egui::Key::B)) {
                 let _ = self.command_tx.send(PlayerCommand::CycleAudioTrack);
                 let notif = if !self.audio_tracks.is_empty() {
                     self.audio_track_index = (self.audio_track_index + 1) % self.audio_tracks.len();
+                    if self.audio_track_index < self.controls_state.audio_dialog.tracks.len() {
+                        let id = self.controls_state.audio_dialog.tracks[self.audio_track_index].id;
+                        self.controls_state.audio_dialog.select_track(id);
+                    }
                     format!(
                         "Audio: Track {}/{} - {}",
                         self.audio_track_index + 1,
@@ -748,31 +851,38 @@ impl eframe::App for SyncplayApp {
             }
             // Aspect ratio cycling (A)
             if ctx.input(|i| i.key_pressed(egui::Key::A)) {
-                let _ = self.command_tx.send(PlayerCommand::CycleAspectRatio);
-                self.aspect_ratio_index = (self.aspect_ratio_index + 1) % ASPECT_RATIO_PRESETS.len();
-                let notif = format!("Aspect Ratio: {}", ASPECT_RATIO_PRESETS[self.aspect_ratio_index]);
-                self.osd_overlay.show_notification(notif, now);
+                let new_ar = self.viewport.cycle_aspect_override();
+                self.controls_state.aspect_ratio = new_ar;
+                self.controls_state.video_dialog.set_aspect_ratio(new_ar);
+                if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == new_ar) {
+                    self.aspect_ratio_index = pos;
+                }
+                self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
             }
             // Audio delay adjustment (J: -50ms, K: +50ms)
             if ctx.input(|i| i.key_pressed(egui::Key::J)) {
                 self.audio_delay_ms -= 50;
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
+                self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::K)) {
                 self.audio_delay_ms += 50;
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
+                self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
             // Subtitle delay adjustment (Z: -50ms, X: +50ms)
             if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
                 self.subtitle_delay_ms -= 50;
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
+                self.controls_state.subtitle_dialog.delay_ms = self.subtitle_delay_ms;
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::X)) {
                 self.subtitle_delay_ms += 50;
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
+                self.controls_state.subtitle_dialog.delay_ms = self.subtitle_delay_ms;
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
         }
@@ -1061,6 +1171,11 @@ impl eframe::App for SyncplayApp {
                                     ui.close();
                                     self.viewport.set_aspect_override(ar);
                                     self.controls_state.aspect_ratio = ar;
+                                    self.controls_state.video_dialog.set_aspect_ratio(ar);
+                                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
+                                        self.aspect_ratio_index = pos;
+                                    }
+                                    self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                                 }
                             }
                         });
@@ -1143,10 +1258,20 @@ impl eframe::App for SyncplayApp {
                         ControlsBarAction::SetAspectRatio(ar) => {
                             self.viewport.set_aspect_override(ar);
                             self.controls_state.aspect_ratio = ar;
+                            self.controls_state.video_dialog.set_aspect_ratio(ar);
+                            if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
+                                self.aspect_ratio_index = pos;
+                            }
+                            self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                         }
                         ControlsBarAction::CycleAspectRatio => {
                             let new_ar = self.viewport.cycle_aspect_override();
                             self.controls_state.aspect_ratio = new_ar;
+                            self.controls_state.video_dialog.set_aspect_ratio(new_ar);
+                            if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == new_ar) {
+                                self.aspect_ratio_index = pos;
+                            }
+                            self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
                         }
                         ControlsBarAction::OpenAudioSettings => {
                             self.controls_state.audio_dialog.open();
@@ -1172,13 +1297,157 @@ impl eframe::App for SyncplayApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ui, |ui| {
-                let action = self.viewport.show(ui);
+                let current_ar = self.viewport.aspect_override();
+                let mut menu_aspect_ratio = None;
+
+                let action = self.viewport.show_with_context_menu(ui, |ui| {
+                    ui.set_min_width(220.0);
+                    ui.label(egui::RichText::new("🎬 Syncverse").strong().color(egui::Color32::WHITE));
+                    ui.separator();
+
+                    let play_pause_label = if self.clock.is_playing() { "⏸ Pause (Space)" } else { "▶ Play (Space)" };
+                    if ui.button(play_pause_label).clicked() {
+                        ui.close();
+                        let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                        let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                        self.osd_overlay.show_notification(toast.to_string(), now);
+                    }
+                    if ui.button("⏹ Stop (S)").clicked() {
+                        ui.close();
+                        let _ = self.command_tx.send(PlayerCommand::Stop);
+                        self.osd_overlay.show_notification("Stopped".to_string(), now);
+                    }
+
+                    ui.separator();
+
+                    if ui.button("📂 Open File... (Ctrl+O)").clicked() {
+                        ui.close();
+                        self.file_dialog.open_file_dialog();
+                    }
+
+                    let fs_label = if self.controls_state.is_fullscreen { "⛶ Exit Fullscreen (F / Esc)" } else { "⛶ Fullscreen (F / F11)" };
+                    if ui.button(fs_label).clicked() {
+                        ui.close();
+                        self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
+                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
+                    }
+
+                    ui.separator();
+
+                    ui.menu_button("📐 Aspect Ratio", |ui| {
+                        for &ar in &crate::gui::aspect_ratio::AspectRatioOverride::ALL {
+                            let is_selected = current_ar == ar;
+                            if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                                ui.close();
+                                menu_aspect_ratio = Some(ar);
+                            }
+                        }
+                    });
+
+                    ui.menu_button("⏩ Playback Speed", |ui| {
+                        for &spd in &crate::gui::controls::SUPPORTED_SPEEDS {
+                            let label = if (spd - 1.0).abs() < 1e-3 {
+                                "1.0x (Normal)".to_string()
+                            } else {
+                                format!("{:.2}x", spd)
+                            };
+                            let is_selected = (self.controls_state.speed - spd).abs() < 1e-3;
+                            if ui.selectable_label(is_selected, label).clicked() {
+                                ui.close();
+                                self.controls_state.speed = spd;
+                                let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                                self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
+                            }
+                        }
+                    });
+
+                    ui.menu_button("🔊 Audio", |ui| {
+                        let mute_label = if self.controls_state.volume.is_muted { "Unmute (M)" } else { "Mute (M)" };
+                        if ui.button(mute_label).clicked() {
+                            ui.close();
+                            self.controls_state.volume.toggle_mute();
+                            let _ = self.command_tx.send(PlayerCommand::ToggleMute);
+                            let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
+                            self.osd_overlay.show_notification(toast.to_string(), now);
+                        }
+                        if ui.button("Audio Settings & Delay...").clicked() {
+                            ui.close();
+                            self.controls_state.audio_dialog.open();
+                        }
+                    });
+
+                    ui.menu_button("💬 Subtitles", |ui| {
+                        let off_selected = self.subtitle_track_index.is_none();
+                        if ui.selectable_label(off_selected, "Off").clicked() {
+                            ui.close();
+                            self.subtitle_track_index = None;
+                            self.controls_state.subtitle_dialog.select_track(None);
+                            self.active_subtitle_cues.clear();
+                            let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(None));
+                            self.osd_overlay.show_notification("Subtitles: Off".to_string(), now);
+                        }
+                        for (idx, track) in self.subtitle_tracks.iter().enumerate() {
+                            let is_selected = self.subtitle_track_index == Some(idx);
+                            if ui.selectable_label(is_selected, track).clicked() {
+                                ui.close();
+                                self.subtitle_track_index = Some(idx);
+                                self.controls_state.subtitle_dialog.select_track(Some(idx));
+                                if idx < self.subtitle_track_data.len() {
+                                    self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
+                                }
+                                let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(Some(idx)));
+                                self.osd_overlay.show_notification(format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track), now);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Subtitle Settings & Delay...").clicked() {
+                            ui.close();
+                            self.controls_state.subtitle_dialog.open();
+                        }
+                    });
+
+                    ui.separator();
+                    if ui.button("Video Stream Details...").clicked() {
+                        ui.close();
+                        self.controls_state.video_dialog.open();
+                    }
+                    if ui.button("⌨ Keyboard Shortcuts (F1)").clicked() {
+                        ui.close();
+                        self.shortcuts_dialog.open();
+                    }
+                });
+
+                if let Some(ar) = menu_aspect_ratio {
+                    self.viewport.set_aspect_override(ar);
+                    self.controls_state.aspect_ratio = ar;
+                    self.controls_state.video_dialog.set_aspect_ratio(ar);
+                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
+                        self.aspect_ratio_index = pos;
+                    }
+                    self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
+                }
+
+                if action.open_file {
+                    self.file_dialog.open_file_dialog();
+                }
                 if action.toggle_fullscreen {
                     self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
                 }
                 if action.toggle_play_pause {
                     let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                    let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                    self.osd_overlay.show_notification(toast.to_string(), now);
+                }
+                if action.scroll_delta != 0.0 {
+                    let step = action.scroll_delta.signum() * 0.05;
+                    let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, 1.0);
+                    self.controls_state.volume.set_volume(new_vol);
+                    let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                    self.osd_overlay.show_notification(
+                        format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                        now,
+                    );
                 }
 
                 // 11a. Synchronized Subtitle Overlay (anchored strictly inside active video_rect)
@@ -1289,6 +1558,10 @@ impl eframe::App for SyncplayApp {
                 crate::gui::VideoConfigAction::SetAspectRatio(ar) => {
                     self.viewport.set_aspect_override(ar);
                     self.controls_state.aspect_ratio = ar;
+                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
+                        self.aspect_ratio_index = pos;
+                    }
+                    self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                 }
                 crate::gui::VideoConfigAction::SetSpeed(spd) => {
                     self.controls_state.speed = spd;

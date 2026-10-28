@@ -39,8 +39,16 @@ impl OsdOverlay {
     }
 
     /// Triggers a new OSD HUD notification banner with the provided text at the given instant.
+    ///
+    /// If an identical toast is already active, its display timer is seamlessly refreshed
+    /// without visual flicker or re-allocation.
     pub fn show_notification(&mut self, text: impl Into<String>, timestamp: Instant) {
-        self.active_text = Some(text.into());
+        let text_str = text.into();
+        if self.active_text.as_deref() == Some(&text_str) && self.opacity(timestamp) > 0.0 {
+            self.trigger_time = Some(timestamp);
+            return;
+        }
+        self.active_text = Some(text_str);
         self.trigger_time = Some(timestamp);
     }
 

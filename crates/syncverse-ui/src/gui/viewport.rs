@@ -195,12 +195,16 @@ impl VideoTextureBuffer {
 }
 
 /// Actions emitted by the video viewport widget to the parent window application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ViewportAction {
     /// User double-clicked: toggle fullscreen.
     pub toggle_fullscreen: bool,
     /// User clicked: toggle play/pause.
     pub toggle_play_pause: bool,
+    /// User clicked empty viewport: open media file picker.
+    pub open_file: bool,
+    /// Vertical mouse scroll delta over viewport.
+    pub scroll_delta: f32,
 }
 
 /// GPU-accelerated video rendering viewport managing texture allocation and presentation.
@@ -213,6 +217,7 @@ pub struct VideoViewport {
     pending_frame: Option<VideoFrameRGBA>,
     aspect_override: AspectRatioOverride,
     last_video_rect: Option<Rect>,
+    pending_click: Option<(Instant, bool)>,
 }
 
 impl Default for VideoViewport {
@@ -233,6 +238,7 @@ impl VideoViewport {
             pending_frame: None,
             aspect_override: AspectRatioOverride::Original,
             last_video_rect: None,
+            pending_click: None,
         }
     }
 
@@ -311,6 +317,7 @@ impl VideoViewport {
         self.video_width = 0;
         self.video_height = 0;
         self.last_video_rect = None;
+        self.pending_click = None;
     }
 
     /// Uploads frame RGBA data to the `egui::TextureHandle`.
@@ -389,6 +396,15 @@ impl VideoViewport {
 
     /// Renders the video viewport widget into egui with automatic pillarbox/letterbox fill.
     pub fn show(&mut self, ui: &mut Ui) -> ViewportAction {
+        self.show_with_context_menu(ui, |_| {})
+    }
+
+    /// Renders the video viewport widget into egui with an optional right-click context menu.
+    pub fn show_with_context_menu<F: FnOnce(&mut Ui)>(
+        &mut self,
+        ui: &mut Ui,
+        context_menu: F,
+    ) -> ViewportAction {
         let mut action = ViewportAction::default();
         let available_rect = ui.available_rect_before_wrap();
         let available_w = available_rect.width();
@@ -396,6 +412,9 @@ impl VideoViewport {
 
         // 1. Allocate full interactive space
         let (rect, response) = ui.allocate_exact_size(available_rect.size(), egui::Sense::click());
+
+        // Context menu on right click
+        response.context_menu(context_menu);
 
         // 2. Black background fill (letterbox/pillarbox margins)
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
@@ -432,17 +451,37 @@ impl VideoViewport {
             ui.painter().text(
                 center,
                 egui::Align2::CENTER_CENTER,
-                "Syncverse\nDrop video file here or click Open File",
+                "Syncverse\nDrop video file here or click to open",
                 egui::FontId::proportional(18.0),
                 Color32::from_rgb(100, 116, 139),
             );
         }
 
-        // 5. Handle mouse click events
+        // 5. Handle mouse click and scroll events
+        if response.hovered() {
+            action.scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+        }
+
+        let is_empty = self.texture.is_none();
         if response.double_clicked() {
+            // Double-click toggles fullscreen: cancel any pending single-click
+            self.pending_click = None;
             action.toggle_fullscreen = true;
         } else if response.clicked() {
-            action.toggle_play_pause = true;
+            // Single-click: stage for delayed dispatch to avoid spurious toggle on double-click
+            self.pending_click = Some((Instant::now(), is_empty));
+            ui.ctx().request_repaint_after(Duration::from_millis(260));
+        }
+
+        if let Some((click_time, empty)) = self.pending_click {
+            if Instant::now().duration_since(click_time) >= Duration::from_millis(250) {
+                self.pending_click = None;
+                if empty {
+                    action.open_file = true;
+                } else {
+                    action.toggle_play_pause = true;
+                }
+            }
         }
 
         action

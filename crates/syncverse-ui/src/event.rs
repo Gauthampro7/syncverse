@@ -75,6 +75,10 @@ pub enum UiEvent {
     SubtitleDataDiscovered(Vec<crate::gui::subtitle_overlay::SubtitleTrack>),
     /// Streaming subtitle cue dynamically demuxed from container bitstream.
     SubtitleCueDemuxed(crate::gui::subtitle_overlay::SubtitleCue),
+    /// Discovered audio streams with detailed channel, codec, and sample rate metadata.
+    AudioDataDiscovered(Vec<crate::gui::dialogs::AudioTrackItem>),
+    /// Discovered video stream metadata including resolution, codec, and timescale.
+    VideoMetadataDiscovered(crate::gui::dialogs::VideoStreamMetadata),
 }
 
 #[cfg(test)]
@@ -128,6 +132,13 @@ mod tests {
             "Streamed",
         ));
 
+        let audio_data = UiEvent::AudioDataDiscovered(vec![crate::gui::dialogs::AudioTrackItem::new(
+            0,
+            "English",
+            "aac",
+        )]);
+        let video_meta = UiEvent::VideoMetadataDiscovered(crate::gui::dialogs::VideoStreamMetadata::default());
+
         assert!(matches!(audio_ev, UiEvent::AudioTrackSelected { track_id: 1, .. }));
         assert!(matches!(sub_ev, UiEvent::SubtitleTrackSelected { track_index: Some(0), .. }));
         assert!(matches!(sub_off, UiEvent::SubtitleTrackSelected { track_index: None, .. }));
@@ -135,6 +146,8 @@ mod tests {
         assert!(matches!(sub_delay, UiEvent::SubtitleDelayChanged(50)));
         assert!(matches!(tracks_disc, UiEvent::TracksDiscovered { .. }));
         assert!(matches!(sub_data, UiEvent::SubtitleDataDiscovered(..)));
+        assert!(matches!(audio_data, UiEvent::AudioDataDiscovered(..)));
+        assert!(matches!(video_meta, UiEvent::VideoMetadataDiscovered(..)));
         assert!(matches!(sub_cue, UiEvent::SubtitleCueDemuxed(..)));
     }
 }

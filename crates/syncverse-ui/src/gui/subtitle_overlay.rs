@@ -49,6 +49,10 @@ pub struct SubtitleTrack {
     pub language: Option<String>,
     /// Chronologically ordered subtitle cues.
     pub cues: Vec<SubtitleCue>,
+    /// Track format (e.g. "SRT", "VTT", "ASS", "SUB").
+    pub format: String,
+    /// Whether this track originated from an external file.
+    pub is_external: bool,
 }
 
 impl SubtitleTrack {
@@ -65,6 +69,28 @@ impl SubtitleTrack {
             title: title.into(),
             language,
             cues,
+            format: "SRT".to_string(),
+            is_external: false,
+        }
+    }
+
+    /// Constructs a new `SubtitleTrack` with explicit format and origin.
+    pub fn with_format_and_origin(
+        id: usize,
+        title: impl Into<String>,
+        language: Option<String>,
+        mut cues: Vec<SubtitleCue>,
+        format: impl Into<String>,
+        is_external: bool,
+    ) -> Self {
+        cues.sort_by_key(|c| c.start_ms);
+        Self {
+            id,
+            title: title.into(),
+            language,
+            cues,
+            format: format.into(),
+            is_external,
         }
     }
 

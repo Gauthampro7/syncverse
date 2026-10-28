@@ -138,6 +138,92 @@ pub fn detect_subtitle_language(filename: &str, media_stem: &str) -> (Option<Str
     (detected_lang_code, title)
 }
 
+/// Decodes raw subtitle file bytes into a UTF-8 `String`, with automatic fallback for:
+/// - UTF-8 with BOM (`0xEF, 0xBB, 0xBF`)
+/// - UTF-16 Little-Endian with BOM (`0xFF, 0xFE`)
+/// - UTF-16 Big-Endian with BOM (`0xFE, 0xFF`)
+/// - Standard UTF-8
+/// - Windows-1252 / ISO-8859-1 (Latin-1) legacy encodings
+pub fn decode_subtitle_bytes(bytes: &[u8]) -> String {
+    // 1. Check for UTF-8 BOM
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(s) = std::str::from_utf8(&bytes[3..]) {
+            return s.to_string();
+        }
+    }
+
+    // 2. Check for UTF-16 LE BOM
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (chunks, _) = bytes[2..].as_chunks::<2>();
+        let u16_iter = chunks.iter().map(|&[b0, b1]| u16::from_le_bytes([b0, b1]));
+        let decoded: String = char::decode_utf16(u16_iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        return decoded;
+    }
+
+    // 3. Check for UTF-16 BE BOM
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (chunks, _) = bytes[2..].as_chunks::<2>();
+        let u16_iter = chunks.iter().map(|&[b0, b1]| u16::from_be_bytes([b0, b1]));
+        let decoded: String = char::decode_utf16(u16_iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        return decoded;
+    }
+
+    // 4. Try standard UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        let s = s.strip_prefix('\u{feff}').unwrap_or(s);
+        return s.to_string();
+    }
+
+    // 5. Fallback: Windows-1252 / ISO-8859-1 decoding
+    bytes.iter().map(|&b| decode_windows_1252_byte(b)).collect()
+}
+
+/// Helper mapping Windows-1252 bytes (0x80..=0x9F) to Unicode characters, matching Latin-1 elsewhere.
+fn decode_windows_1252_byte(b: u8) -> char {
+    match b {
+        0x80 => '€',
+        0x82 => '‚',
+        0x83 => 'ƒ',
+        0x84 => '„',
+        0x85 => '…',
+        0x86 => '†',
+        0x87 => '‡',
+        0x88 => 'ˆ',
+        0x89 => '‰',
+        0x8A => 'Š',
+        0x8B => '‹',
+        0x8C => 'Œ',
+        0x8E => 'Ž',
+        0x91 => '‘',
+        0x92 => '’',
+        0x93 => '“',
+        0x94 => '”',
+        0x95 => '•',
+        0x96 => '–',
+        0x97 => '—',
+        0x98 => '˜',
+        0x99 => '™',
+        0x9A => 'š',
+        0x9B => '›',
+        0x9C => 'œ',
+        0x9E => 'ž',
+        0x9F => 'Ÿ',
+        _ => b as char,
+    }
+}
+
+/// Reads a subtitle file from filesystem with robust character encoding detection and fallback.
+pub fn read_subtitle_to_string<P: AsRef<Path>>(path: P) -> Result<String, SubtitleParseError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)
+        .map_err(|e| SubtitleParseError::Io(format!("{}: {}", path.display(), e)))?;
+    Ok(decode_subtitle_bytes(&bytes))
+}
+
 /// Parses a subtitle file from the filesystem into a `SubtitleTrack`.
 pub fn parse_subtitle_file<P: AsRef<Path>>(
     path: P,
@@ -145,8 +231,7 @@ pub fn parse_subtitle_file<P: AsRef<Path>>(
     media_stem: Option<&str>,
 ) -> Result<SubtitleTrack, SubtitleParseError> {
     let path = path.as_ref();
-    let content = fs::read_to_string(path)
-        .map_err(|e| SubtitleParseError::Io(format!("{}: {}", path.display(), e)))?;
+    let content = read_subtitle_to_string(path)?;
 
     let ext = path
         .extension()
@@ -306,4 +391,36 @@ mod tests {
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_decode_subtitle_bytes_encodings() {
+        // Standard UTF-8
+        let utf8_bytes = b"Hello World";
+        assert_eq!(decode_subtitle_bytes(utf8_bytes), "Hello World");
+
+        // UTF-8 with BOM
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend_from_slice(b"BOM Test");
+        assert_eq!(decode_subtitle_bytes(&utf8_bom), "BOM Test");
+
+        // UTF-16 LE with BOM
+        let mut utf16_le = vec![0xFF, 0xFE];
+        for ch in "LE Test".encode_utf16() {
+            utf16_le.extend_from_slice(&ch.to_le_bytes());
+        }
+        assert_eq!(decode_subtitle_bytes(&utf16_le), "LE Test");
+
+        // UTF-16 BE with BOM
+        let mut utf16_be = vec![0xFE, 0xFF];
+        for ch in "BE Test".encode_utf16() {
+            utf16_be.extend_from_slice(&ch.to_be_bytes());
+        }
+        assert_eq!(decode_subtitle_bytes(&utf16_be), "BE Test");
+
+        // Windows-1252 / Latin-1: e.g. 0xE9 for 'é', 0x80 for '€', 0x93 for '“'
+        let win1252 = vec![b'c', b'a', b'f', 0xE9, b' ', 0x80, b' ', 0x93, b'h', b'i'];
+        let decoded = decode_subtitle_bytes(&win1252);
+        assert_eq!(decoded, "café € “hi");
+    }
 }
+
