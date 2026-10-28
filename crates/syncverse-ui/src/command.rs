@@ -67,6 +67,8 @@ pub enum PlayerCommand {
     AdjustSubtitleDelay(i64),
     /// Cycle video aspect ratio to the next preset mode.
     CycleAspectRatio,
+    /// Load an external subtitle file (.srt, .vtt, .ass) into the active session.
+    LoadExternalSubtitle(PathBuf),
 }
 
 #[cfg(test)]

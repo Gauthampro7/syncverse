@@ -204,7 +204,8 @@ impl PlayerCoordinator {
             | PlayerCommand::CycleSubtitleTrack
             | PlayerCommand::SetSubtitleDelay(_)
             | PlayerCommand::AdjustSubtitleDelay(_)
-            | PlayerCommand::CycleAspectRatio => {
+            | PlayerCommand::CycleAspectRatio
+            | PlayerCommand::LoadExternalSubtitle(_) => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }

@@ -9,7 +9,11 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use syncverse_demux::{Demuxer, ReadSeek, TrackType, UniversalDemuxer};
 
+use std::sync::Mutex;
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
 fn ensure_fixtures() -> Vec<(&'static str, PathBuf)> {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let dir = PathBuf::from("/tmp/media_fixtures");
     if !dir.exists() {
         std::fs::create_dir_all(&dir).unwrap();
@@ -30,14 +34,16 @@ fn ensure_fixtures() -> Vec<(&'static str, PathBuf)> {
     for (name, filename, args) in specs {
         let path = dir.join(filename);
         if !path.exists() {
+            let tmp_path = dir.join(format!("{}.tmp", filename));
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.arg("-y");
             for arg in args {
                 cmd.arg(arg);
             }
-            cmd.arg(&path);
+            cmd.arg(&tmp_path);
             let status = cmd.status().expect("Failed to execute ffmpeg to generate test fixture");
             assert!(status.success(), "Failed to generate fixture for {}", name);
+            std::fs::rename(&tmp_path, &path).expect("Failed to move fixture to destination");
         }
         fixtures.push((name, path));
     }

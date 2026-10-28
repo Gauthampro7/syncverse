@@ -14,7 +14,7 @@ use crate::command::PlayerCommand;
 use crate::event::UiEvent;
 use crate::gui::controls::{ControlsBarAction, ControlsBarState, PlaybackControlsBar};
 use crate::gui::dialogs::{AboutDialog, ConnectPartyDialog, HostPartyDialog, ShortcutsDialog};
-use crate::gui::drag_drop::DragDropHandler;
+use crate::gui::drag_drop::{DragDropHandler, DroppedFileAction};
 use crate::gui::file_dialog::FileDialogManager;
 use crate::gui::recent_files::RecentFilesManager;
 use crate::gui::sidebar::SidebarState;
@@ -309,23 +309,30 @@ impl SyncplayApp {
         let track_idx = self.subtitle_track_index?;
         let effective_pts_ms = compute_effective_pts(media_position_pts, self.subtitle_delay_ms);
 
-        let res = if track_idx < self.subtitle_track_data.len() {
-            self.subtitle_track_data[track_idx].active_text_at(effective_pts_ms)
-        } else {
-            find_active_cue_text(&self.active_subtitle_cues, effective_pts_ms)
-        };
-
-        if res.is_some() {
-            return res;
+        // 1. Check pre-parsed track cues if available
+        if track_idx < self.subtitle_track_data.len() {
+            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(effective_pts_ms) {
+                return Some(text);
+            }
         }
 
-        // Fallback for callers supplying PTS directly in milliseconds
+        // 2. Check dynamically demuxed / active streaming cues
+        if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, effective_pts_ms) {
+            return Some(text);
+        }
+
+        // 3. Fallback for callers supplying PTS directly in milliseconds
         let direct_ms = media_position_pts as i64 + self.subtitle_delay_ms;
         if track_idx < self.subtitle_track_data.len() {
-            self.subtitle_track_data[track_idx].active_text_at(direct_ms)
-        } else {
-            find_active_cue_text(&self.active_subtitle_cues, direct_ms)
+            if let Some(text) = self.subtitle_track_data[track_idx].active_text_at(direct_ms) {
+                return Some(text);
+            }
         }
+        if let Some(text) = find_active_cue_text(&self.active_subtitle_cues, direct_ms) {
+            return Some(text);
+        }
+
+        None
     }
 
     /// Loads and opens a media file.
@@ -376,6 +383,91 @@ impl SyncplayApp {
             })
             .collect();
         self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+    }
+
+    /// Loads an external subtitle file (.srt, .vtt, .ass), parses its cues, registers it as active,
+    /// and dispatches `PlayerCommand::LoadExternalSubtitle` to the core playback runtime.
+    pub fn load_external_subtitle_file(&mut self, path: PathBuf, now: Instant) {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let parse_res = match ext.as_str() {
+            "srt" => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|c| syncverse_demux::subtitles::parse_srt(&c).map_err(|e| e.to_string())),
+            "vtt" => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|c| syncverse_demux::subtitles::parse_vtt(&c).map_err(|e| e.to_string())),
+            "ass" | "ssa" => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|c| syncverse_demux::subtitles::parse_ass(&c).map_err(|e| e.to_string())),
+            other => Err(format!("Unsupported subtitle format: .{other}")),
+        };
+
+        match parse_res {
+            Ok(parsed_cues) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("External Subtitle")
+                    .to_string();
+
+                let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = parsed_cues
+                    .into_iter()
+                    .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
+                        start_ms: c.start.as_millis() as i64,
+                        end_ms: c.end.as_millis() as i64,
+                        text: c.text,
+                    })
+                    .collect();
+
+                let new_track_id = self.subtitle_track_data.len();
+                let track = crate::gui::subtitle_overlay::SubtitleTrack::new(
+                    new_track_id,
+                    filename.clone(),
+                    None,
+                    ui_cues.clone(),
+                );
+
+                self.subtitle_tracks.push(filename.clone());
+                self.subtitle_track_data.push(track);
+                self.subtitle_track_index = Some(new_track_id);
+                self.active_subtitle_cues = ui_cues;
+
+                let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
+                    .subtitle_track_data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
+                        id: i,
+                        title: t.title.clone(),
+                        language: t.language.clone(),
+                        format: ext.to_uppercase(),
+                        is_external: true,
+                        file_path: Some(path.clone()),
+                    })
+                    .collect();
+                self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+                self.controls_state.subtitle_dialog.select_track(Some(new_track_id));
+
+                let _ = self.command_tx.send(PlayerCommand::LoadExternalSubtitle(path));
+
+                self.osd_overlay.show_notification(
+                    format!("Loaded Subtitles: {filename}"),
+                    now,
+                );
+            }
+            Err(err) => {
+                eprintln!("[ERROR] Failed to load external subtitle: {err}");
+                self.osd_overlay.show_notification(
+                    format!("Subtitle Error: {err}"),
+                    now,
+                );
+            }
+        }
     }
 
     /// Appends a new chat record to the local in-memory view.
@@ -512,6 +604,11 @@ impl eframe::App for SyncplayApp {
                     self.controls_state.subtitle_dialog.set_tracks(dialog_items);
                 }
                 UiEvent::SubtitleCueDemuxed(cue) => {
+                    if let Some(idx) = self.subtitle_track_index {
+                        if idx < self.subtitle_track_data.len() {
+                            self.subtitle_track_data[idx].add_cue(cue.clone());
+                        }
+                    }
                     self.active_subtitle_cues.push(cue);
                 }
             }
@@ -682,8 +779,15 @@ impl eframe::App for SyncplayApp {
         if let Some(picked_file) = self.file_dialog.poll_selected_file() {
             self.load_file(picked_file);
         }
-        if let Some(dropped) = DragDropHandler::handle_dropped_file(&ctx) {
-            self.load_file(dropped);
+        if let Some(action) = DragDropHandler::handle_dropped_file(&ctx) {
+            match action {
+                DroppedFileAction::OpenMedia(path) => {
+                    self.load_file(path);
+                }
+                DroppedFileAction::LoadSubtitle(path) => {
+                    self.load_external_subtitle_file(path, now);
+                }
+            }
         }
 
         // 6. Handle sidebar dialog requests
@@ -1201,84 +1305,7 @@ impl eframe::App for SyncplayApp {
                     let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(track_id));
                 }
                 crate::gui::SubtitleConfigAction::LoadExternal(path) => {
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-
-                    let parse_res = match ext.as_str() {
-                        "srt" => std::fs::read_to_string(&path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|c| syncverse_demux::subtitles::parse_srt(&c).map_err(|e| e.to_string())),
-                        "vtt" => std::fs::read_to_string(&path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|c| syncverse_demux::subtitles::parse_vtt(&c).map_err(|e| e.to_string())),
-                        "ass" | "ssa" => std::fs::read_to_string(&path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|c| syncverse_demux::subtitles::parse_ass(&c).map_err(|e| e.to_string())),
-                        other => Err(format!("Unsupported subtitle format: .{other}")),
-                    };
-
-                    match parse_res {
-                        Ok(parsed_cues) => {
-                            let filename = path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("External Subtitle")
-                                .to_string();
-
-                            let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = parsed_cues
-                                .into_iter()
-                                .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
-                                    start_ms: c.start.as_millis() as i64,
-                                    end_ms: c.end.as_millis() as i64,
-                                    text: c.text,
-                                })
-                                .collect();
-
-                            let new_track_id = self.subtitle_track_data.len();
-                            let track = crate::gui::subtitle_overlay::SubtitleTrack::new(
-                                new_track_id,
-                                filename.clone(),
-                                None,
-                                ui_cues.clone(),
-                            );
-
-                            self.subtitle_tracks.push(filename.clone());
-                            self.subtitle_track_data.push(track);
-                            self.subtitle_track_index = Some(new_track_id);
-                            self.active_subtitle_cues = ui_cues;
-
-                            let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
-                                .subtitle_track_data
-                                .iter()
-                                .enumerate()
-                                .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
-                                    id: i,
-                                    title: t.title.clone(),
-                                    language: t.language.clone(),
-                                    format: "SUB".to_string(),
-                                    is_external: true,
-                                    file_path: None,
-                                })
-                                .collect();
-                            self.controls_state.subtitle_dialog.set_tracks(dialog_items);
-                            self.controls_state.subtitle_dialog.select_track(Some(new_track_id));
-
-                            self.osd_overlay.show_notification(
-                                format!("Loaded Subtitle: {filename}"),
-                                now,
-                            );
-                        }
-                        Err(err) => {
-                            eprintln!("[ERROR] Failed to load external subtitle: {err}");
-                            self.osd_overlay.show_notification(
-                                format!("Subtitle Error: {err}"),
-                                now,
-                            );
-                        }
-                    }
+                    self.load_external_subtitle_file(path, now);
                 }
                 crate::gui::SubtitleConfigAction::SetDelayMs(delay_ms) => {
                     self.subtitle_delay_ms = delay_ms;

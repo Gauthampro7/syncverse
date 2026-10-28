@@ -10,6 +10,9 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "wav", "aac", "opus",
 ];
 
+/// Supported subtitle file extensions.
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa"];
+
 /// Checks if the given path is a supported media file.
 pub fn is_supported_media(path: &Path) -> bool {
     path.extension()
@@ -18,17 +21,36 @@ pub fn is_supported_media(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Checks if the given path is a supported subtitle file.
+pub fn is_supported_subtitle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| SUBTITLE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Action determined from a dropped file in the window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DroppedFileAction {
+    /// Open a new media file.
+    OpenMedia(PathBuf),
+    /// Load an external subtitle file for the current media.
+    LoadSubtitle(PathBuf),
+}
+
 /// Handler for window drag-and-drop operations and hover rendering.
 pub struct DragDropHandler;
 
 impl DragDropHandler {
-    /// Inspects egui raw input and returns the first dropped media file path, if any.
-    pub fn handle_dropped_file(ctx: &Context) -> Option<PathBuf> {
+    /// Inspects egui raw input and returns the first dropped media or subtitle file action, if any.
+    pub fn handle_dropped_file(ctx: &Context) -> Option<DroppedFileAction> {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             let path = file.path();
             if is_supported_media(path) {
-                return Some(path.to_path_buf());
+                return Some(DroppedFileAction::OpenMedia(path.to_path_buf()));
+            } else if is_supported_subtitle(path) {
+                return Some(DroppedFileAction::LoadSubtitle(path.to_path_buf()));
             }
         }
         None
@@ -72,7 +94,7 @@ impl DragDropHandler {
         painter.text(
             center + Vec2::new(0.0, 25.0),
             Align2::CENTER_CENTER,
-            "Drop Media File to Play",
+            "Drop Media to Play or Subtitles to Load",
             FontId::proportional(20.0),
             Color32::WHITE,
         );
@@ -80,7 +102,7 @@ impl DragDropHandler {
         painter.text(
             center + Vec2::new(0.0, 55.0),
             Align2::CENTER_CENTER,
-            "MKV, WebM, MP4, AVI, TS, FLV, OGG, MP3, FLAC, Opus",
+            "Video: MKV, MP4, WebM, AVI | Subtitles: SRT, VTT, ASS, SSA",
             FontId::proportional(12.0),
             Color32::from_rgb(160, 160, 175),
         );

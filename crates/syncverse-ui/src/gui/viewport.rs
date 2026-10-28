@@ -245,11 +245,9 @@ impl VideoViewport {
         now: Instant,
     ) {
         if !clock.is_playing() {
-            if self.texture.is_none() {
-                if let Some(frame) = self.pending_frame.take().or_else(|| video_ring.try_pop()) {
-                    clock.seek_to(frame.pts_ms as f64, now);
-                    self.upload_texture(ctx, &frame);
-                }
+            if let Some(frame) = self.pending_frame.take().or_else(|| video_ring.try_pop()) {
+                self.upload_texture(ctx, &frame);
+                ctx.request_repaint();
             }
             return;
         }

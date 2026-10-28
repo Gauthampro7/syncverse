@@ -462,7 +462,11 @@ impl PlaybackControlsBar {
             })
             .corner_radius(6.0);
 
-            if ui.add(play_btn).clicked() {
+            if ui
+                .add(play_btn)
+                .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
+                .clicked()
+            {
                 actions.push(ControlsBarAction::TogglePause);
             }
 
@@ -476,7 +480,11 @@ impl PlaybackControlsBar {
             .fill(style::BUTTON_BG)
             .corner_radius(6.0);
 
-            if ui.add(stop_btn).clicked() {
+            if ui
+                .add(stop_btn)
+                .on_hover_text("Stop Playback (returns to 00:00:00)")
+                .clicked()
+            {
                 actions.push(ControlsBarAction::Stop);
             }
 
@@ -498,17 +506,22 @@ impl PlaybackControlsBar {
 
             // Right-aligned settings group
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                // Fullscreen Toggle Button (F11)
+                // Fullscreen Toggle Button (F11 / F)
                 let fs_label = if state.is_fullscreen { "🗗" } else { "⛶" };
                 if ui
                     .button(RichText::new(fs_label).size(14.0))
+                    .on_hover_text("Toggle Fullscreen (F / F11 / Double-Click)")
                     .clicked()
                 {
                     actions.push(ControlsBarAction::ToggleFullscreen);
                 }
 
                 // Watch-Party Sidebar Toggle
-                if ui.button(RichText::new("💬").size(14.0)).clicked() {
+                if ui
+                    .button(RichText::new("💬").size(14.0))
+                    .on_hover_text("Toggle Watch-Party Chat & Member Panel")
+                    .clicked()
+                {
                     actions.push(ControlsBarAction::ToggleSidebar);
                 }
 

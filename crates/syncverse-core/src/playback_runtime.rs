@@ -55,6 +55,7 @@ fn run_audio_sink_worker(rx: Receiver<AudioWorkerCommand>, running: Arc<AtomicBo
                 let _ = sink.resume();
             }
             Ok(AudioWorkerCommand::Reset) => {
+                while rx.try_recv().is_ok() {}
                 sink = AutoAudioSink::new();
             }
             Err(_) => {}
@@ -104,6 +105,7 @@ struct PlaybackSession {
     subtitle_track_id: Option<u64>,
     duration_ms: u64,
     eof_reached: bool,
+    seek_min_audio_pts: Option<u64>,
 }
 
 impl PlaybackSession {
@@ -211,6 +213,7 @@ impl PlaybackSession {
             subtitle_track_id: None,
             duration_ms,
             eof_reached: false,
+            seek_min_audio_pts: None,
         })
     }
 
@@ -317,6 +320,7 @@ impl PlaybackSession {
             let _ = adec.flush();
         }
         while video_ring.try_pop().is_some() {}
+        self.seek_min_audio_pts = Some(target_ms);
         self.eof_reached = false;
     }
 }
@@ -750,6 +754,43 @@ pub fn run_playback_worker(
                         sess.seek(target_ms, &video_ring);
                         let now = Instant::now();
                         clock.seek_to(target_ms as f64, now);
+
+                        // If currently paused, decode forward to immediately show target video frame
+                        if !clock.is_playing() && sess.video_track_id.is_some() {
+                            let mut packets_read = 0;
+                            let mut best_frame: Option<VideoFrameRGBA> = None;
+                            while packets_read < 120 {
+                                match sess.demuxer.read_packet() {
+                                    Ok(Some(packet)) => {
+                                        packets_read += 1;
+                                        if Some(packet.track_id) == sess.video_track_id {
+                                            if let Some(ref mut vdec) = sess.video_decoder {
+                                                let _ = vdec.send_packet(
+                                                    &packet.data,
+                                                    packet.pts_ms,
+                                                    packet.dts_ms,
+                                                    packet.is_keyframe,
+                                                );
+                                                while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
+                                                    let reached = rgba.pts_ms >= target_ms;
+                                                    best_frame = Some(rgba);
+                                                    if reached {
+                                                        break;
+                                                    }
+                                                }
+                                                if best_frame.as_ref().is_some_and(|f| f.pts_ms >= target_ms) {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if let Some(f) = best_frame {
+                                let _ = video_ring.try_push(f);
+                            }
+                        }
                     }
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
@@ -883,6 +924,26 @@ pub fn run_playback_worker(
                             text: notif,
                             timestamp: Instant::now(),
                         });
+                    }
+                }
+                PlayerCommand::LoadExternalSubtitle(path) => {
+                    if let Some(ref mut sess) = session {
+                        let next_track_id = 1000 + sess.available_subtitle_tracks.len();
+                        if let Ok(track) = syncverse_demux::subtitles::parse_subtitle_file(&path, next_track_id, None) {
+                            let track_idx = sess.available_subtitle_tracks.len();
+                            let label = track.display_label();
+                            sess.available_subtitle_tracks.push(track);
+                            sess.selected_subtitle_track_index = Some(track_idx);
+                            sess.subtitle_track_id = None;
+                            let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
+                                track_index: Some(track_idx),
+                                name: label.clone(),
+                            });
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Subtitles: {label}"),
+                                timestamp: Instant::now(),
+                            });
+                        }
                     }
                 }
                 PlayerCommand::SetSubtitleDelay(delay_ms) => {
@@ -1179,6 +1240,15 @@ pub fn run_playback_worker(
                                 }
                                 // Audio packet decoding & asynchronous output
                                 else if Some(packet.track_id) == sess.audio_track_id {
+                                    if let Some(min_pts) = sess.seek_min_audio_pts {
+                                        let dur = packet.duration_ms.unwrap_or(25);
+                                        if packet.pts_ms + dur < min_pts {
+                                            // Discard audio packets preceding seek target to prevent audio desync
+                                            continue;
+                                        } else {
+                                            sess.seek_min_audio_pts = None;
+                                        }
+                                    }
                                     if let Some(ref mut adec) = sess.audio_decoder {
                                         let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                                         if let Ok(pcm_frames) =
