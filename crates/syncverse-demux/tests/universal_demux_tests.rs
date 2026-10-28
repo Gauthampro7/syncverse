@@ -34,7 +34,7 @@ fn ensure_fixtures() -> Vec<(&'static str, PathBuf)> {
     for (name, filename, args) in specs {
         let path = dir.join(filename);
         if !path.exists() {
-            let tmp_path = dir.join(format!("{}.tmp", filename));
+            let tmp_path = dir.join(format!("tmp_{}", filename));
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.arg("-y");
             for arg in args {
