@@ -149,6 +149,8 @@ pub fn decode_subtitle_bytes(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         if let Ok(s) = std::str::from_utf8(&bytes[3..]) {
             return s.to_string();
+        } else {
+            return String::from_utf8_lossy(&bytes[3..]).into_owned();
         }
     }
 
@@ -172,13 +174,33 @@ pub fn decode_subtitle_bytes(bytes: &[u8]) -> String {
         return decoded;
     }
 
-    // 4. Try standard UTF-8
+    // 4. Check for UTF-16 LE without BOM (common ASCII text pattern: alternate zero bytes)
+    if bytes.len() >= 4 && bytes[0] != 0 && bytes[1] == 0 && bytes[2] != 0 && bytes[3] == 0 {
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let u16_iter = chunks.iter().map(|&[b0, b1]| u16::from_le_bytes([b0, b1]));
+        let decoded: String = char::decode_utf16(u16_iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        return decoded;
+    }
+
+    // 5. Check for UTF-16 BE without BOM (common ASCII text pattern: alternate zero bytes)
+    if bytes.len() >= 4 && bytes[0] == 0 && bytes[1] != 0 && bytes[2] == 0 && bytes[3] != 0 {
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let u16_iter = chunks.iter().map(|&[b0, b1]| u16::from_be_bytes([b0, b1]));
+        let decoded: String = char::decode_utf16(u16_iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        return decoded;
+    }
+
+    // 6. Try standard UTF-8
     if let Ok(s) = std::str::from_utf8(bytes) {
         let s = s.strip_prefix('\u{feff}').unwrap_or(s);
         return s.to_string();
     }
 
-    // 5. Fallback: Windows-1252 / ISO-8859-1 decoding
+    // 7. Fallback: Windows-1252 / ISO-8859-1 decoding
     bytes.iter().map(|&b| decode_windows_1252_byte(b)).collect()
 }
 
@@ -421,6 +443,30 @@ mod tests {
         let win1252 = vec![b'c', b'a', b'f', 0xE9, b' ', 0x80, b' ', 0x93, b'h', b'i'];
         let decoded = decode_subtitle_bytes(&win1252);
         assert_eq!(decoded, "café € “hi");
+
+        // UTF-16 LE without BOM
+        let mut utf16_le_nobom = Vec::new();
+        for ch in "1\r\n00:00:01".encode_utf16() {
+            utf16_le_nobom.extend_from_slice(&ch.to_le_bytes());
+        }
+        assert_eq!(decode_subtitle_bytes(&utf16_le_nobom), "1\r\n00:00:01");
+
+        // UTF-16 BE without BOM
+        let mut utf16_be_nobom = Vec::new();
+        for ch in "1\r\n00:00:01".encode_utf16() {
+            utf16_be_nobom.extend_from_slice(&ch.to_be_bytes());
+        }
+        assert_eq!(decode_subtitle_bytes(&utf16_be_nobom), "1\r\n00:00:01");
+
+        // UTF-8 with BOM containing corrupted byte
+        let mut utf8_bom_corrupt = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom_corrupt.extend_from_slice(b"Valid prefix ");
+        utf8_bom_corrupt.push(0xFF); // Invalid UTF-8 byte
+        utf8_bom_corrupt.extend_from_slice(b" suffix");
+        let decoded_corrupt = decode_subtitle_bytes(&utf8_bom_corrupt);
+        assert!(decoded_corrupt.starts_with("Valid prefix "));
+        assert!(decoded_corrupt.ends_with(" suffix"));
+        assert!(!decoded_corrupt.contains("ï»¿"));
     }
 }
 

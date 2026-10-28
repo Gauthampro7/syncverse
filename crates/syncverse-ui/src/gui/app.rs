@@ -588,7 +588,7 @@ impl eframe::App for SyncplayApp {
                 }
                 UiEvent::SubtitleDelayChanged(ms) => {
                     self.subtitle_delay_ms = ms;
-                    self.controls_state.subtitle_dialog.delay_ms = ms;
+                    self.controls_state.subtitle_dialog.set_delay_ms(ms);
                     self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", ms), now);
                 }
                 UiEvent::TracksDiscovered {
@@ -662,10 +662,11 @@ impl eframe::App for SyncplayApp {
         let snapshot = self.exchange.poll_latest_snapshot();
 
         // 3. User activity tracking for fullscreen auto-hide & cursor visibility
-        if ctx.input(|i| i.pointer.is_moving() || i.pointer.any_click() || i.smooth_scroll_delta != egui::Vec2::ZERO) {
+        let any_modal = self.is_any_modal_open();
+        if any_modal || ctx.input(|i| i.pointer.is_moving() || i.pointer.any_click() || i.smooth_scroll_delta != egui::Vec2::ZERO) {
             self.controls_state.on_user_activity(now);
         }
-        if self.controls_state.is_fullscreen {
+        if self.controls_state.is_fullscreen && !any_modal {
             if !self.controls_state.is_visible(now) {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             } else {
@@ -861,28 +862,28 @@ impl eframe::App for SyncplayApp {
             }
             // Audio delay adjustment (J: -50ms, K: +50ms)
             if ctx.input(|i| i.key_pressed(egui::Key::J)) {
-                self.audio_delay_ms -= 50;
+                self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::K)) {
-                self.audio_delay_ms += 50;
+                self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
             // Subtitle delay adjustment (Z: -50ms, X: +50ms)
             if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
-                self.subtitle_delay_ms -= 50;
+                self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
-                self.controls_state.subtitle_dialog.delay_ms = self.subtitle_delay_ms;
+                self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::X)) {
-                self.subtitle_delay_ms += 50;
+                self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
-                self.controls_state.subtitle_dialog.delay_ms = self.subtitle_delay_ms;
+                self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
         }
@@ -1427,27 +1428,35 @@ impl eframe::App for SyncplayApp {
                     self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                 }
 
-                if action.open_file {
-                    self.file_dialog.open_file_dialog();
-                }
-                if action.toggle_fullscreen {
-                    self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
-                }
-                if action.toggle_play_pause {
-                    let _ = self.command_tx.send(PlayerCommand::TogglePause);
-                    let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
-                    self.osd_overlay.show_notification(toast.to_string(), now);
-                }
-                if action.scroll_delta != 0.0 {
-                    let step = action.scroll_delta.signum() * 0.05;
-                    let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, 1.0);
-                    self.controls_state.volume.set_volume(new_vol);
-                    let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
-                    self.osd_overlay.show_notification(
-                        format!("Volume: {}%", (new_vol * 100.0).round() as u32),
-                        now,
-                    );
+                if !self.is_any_modal_open() {
+                    if action.open_file {
+                        if self.current_file.is_none() {
+                            self.file_dialog.open_file_dialog();
+                        } else {
+                            let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                            let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                            self.osd_overlay.show_notification(toast.to_string(), now);
+                        }
+                    }
+                    if action.toggle_fullscreen {
+                        self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
+                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
+                    }
+                    if action.toggle_play_pause {
+                        let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                        let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                        self.osd_overlay.show_notification(toast.to_string(), now);
+                    }
+                    if action.scroll_delta != 0.0 {
+                        let step = action.scroll_delta.signum() * 0.05;
+                        let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, 1.0);
+                        self.controls_state.volume.set_volume(new_vol);
+                        let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                        self.osd_overlay.show_notification(
+                            format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                            now,
+                        );
+                    }
                 }
 
                 // 11a. Synchronized Subtitle Overlay (anchored strictly inside active video_rect)

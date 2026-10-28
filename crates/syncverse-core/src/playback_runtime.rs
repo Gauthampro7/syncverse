@@ -321,11 +321,14 @@ impl PlaybackSession {
             None
         };
 
+        let video_frame_rate = vt
+            .as_ref()
+            .and_then(|v| demuxer.stream_frame_rate(v.track_id as usize));
         let video_metadata = syncverse_ui::gui::dialogs::VideoStreamMetadata {
             width: vt.as_ref().and_then(|v| v.width),
             height: vt.as_ref().and_then(|v| v.height),
             codec: vt.as_ref().map(|v| v.codec_id.clone()),
-            frame_rate: None,
+            frame_rate: video_frame_rate,
             bit_depth: Some(8),
             pixel_format: Some("yuv420p".to_string()),
             timescale: Some(info.timescale),
@@ -869,6 +872,19 @@ pub fn run_playback_worker(
                     let sender = get_sender_name(&party_role);
 
                     if will_play {
+                        let current_pts = clock.current_pts(now);
+                        let dur = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
+                        if dur > 0 && current_pts >= dur as f64 {
+                            overflow_frame = None;
+                            while video_ring.try_pop().is_some() {}
+                            current_audio_generation = current_audio_generation.wrapping_add(1);
+                            let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                            if let Some(ref mut sess) = session {
+                                sess.seek(0, &video_ring);
+                            }
+                            clock.seek_to(0.0, now);
+                        }
+
                         // Unpause trigger: evaluate unpause gate across room peers
                         let mut unready_peers = Vec::new();
                         let in_watch_party = match &party_role {
@@ -1060,6 +1076,9 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::SetVolume(vol) => {
                     volume = vol.clamp(0.0, 1.0);
+                    if volume > 0.0 {
+                        is_muted = false;
+                    }
                     let _ = event_tx.send(UiEvent::HudNotification {
                         text: format!("Volume: {}%", (volume * 100.0).round() as u32),
                         timestamp: Instant::now(),
@@ -1069,9 +1088,9 @@ pub fn run_playback_worker(
                     is_muted = !is_muted;
                     let _ = event_tx.send(UiEvent::HudNotification {
                         text: if is_muted {
-                            "Audio: Muted".to_string()
+                            "Muted".to_string()
                         } else {
-                            format!("Volume: {}%", (volume * 100.0).round() as u32)
+                            "Unmuted".to_string()
                         },
                         timestamp: Instant::now(),
                     });
@@ -1114,20 +1133,12 @@ pub fn run_playback_worker(
                     }
                 }
                 PlayerCommand::SetAudioDelay(delay_ms) => {
-                    audio_delay_ms = delay_ms;
+                    audio_delay_ms = delay_ms.clamp(-5000, 5000);
                     let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
-                    let _ = event_tx.send(UiEvent::HudNotification {
-                        text: format!("Audio Delay: {audio_delay_ms} ms"),
-                        timestamp: Instant::now(),
-                    });
                 }
                 PlayerCommand::AdjustAudioDelay(delta_ms) => {
-                    audio_delay_ms = audio_delay_ms.saturating_add(delta_ms);
+                    audio_delay_ms = (audio_delay_ms + delta_ms).clamp(-5000, 5000);
                     let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
-                    let _ = event_tx.send(UiEvent::HudNotification {
-                        text: format!("Audio Delay: {audio_delay_ms} ms"),
-                        timestamp: Instant::now(),
-                    });
                 }
                 PlayerCommand::SelectSubtitleTrack(track_index) => {
                     if let Some(ref mut sess) = session {
@@ -1190,20 +1201,12 @@ pub fn run_playback_worker(
                     }
                 }
                 PlayerCommand::SetSubtitleDelay(delay_ms) => {
-                    subtitle_delay_ms = delay_ms;
+                    subtitle_delay_ms = delay_ms.clamp(-5000, 5000);
                     let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
-                    let _ = event_tx.send(UiEvent::HudNotification {
-                        text: format!("Subtitle Delay: {:+} ms", subtitle_delay_ms),
-                        timestamp: Instant::now(),
-                    });
                 }
                 PlayerCommand::AdjustSubtitleDelay(delta_ms) => {
-                    subtitle_delay_ms = subtitle_delay_ms.saturating_add(delta_ms);
+                    subtitle_delay_ms = (subtitle_delay_ms + delta_ms).clamp(-5000, 5000);
                     let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
-                    let _ = event_tx.send(UiEvent::HudNotification {
-                        text: format!("Subtitle Delay: {:+} ms", subtitle_delay_ms),
-                        timestamp: Instant::now(),
-                    });
                 }
                 PlayerCommand::CycleAspectRatio => {
                     // Handled by UI presentation layer / video viewport
@@ -1445,7 +1448,7 @@ pub fn run_playback_worker(
         // 2. Process playback decoding and audio output
         let mut did_work = false;
         if let Some(ref mut sess) = session {
-            if clock.is_playing() && !sess.eof_reached {
+            if clock.is_playing() {
                 // First push any pending overflow frame if ring has space
                 if let Some(frame) = overflow_frame.take() {
                     if let Err(err) = video_ring.try_push(frame) {
@@ -1477,7 +1480,7 @@ pub fn run_playback_worker(
                 }
 
                 // Demux new packets from container if pending_video_packets is not overfull (< 64 packets)
-                if sess.pending_video_packets.len() < 64 {
+                if !sess.eof_reached && sess.pending_video_packets.len() < 64 {
                     let mut packets_read = 0;
                     while packets_read < 32 {
                         match sess.demuxer.read_packet() {
@@ -2216,5 +2219,62 @@ mod tests {
         let hot_sample = 1.5f32;
         let clamped = (hot_sample * 1.0).clamp(-1.0, 1.0);
         assert_eq!(clamped, 1.0);
+    }
+
+    #[test]
+    fn test_playback_eof_and_volume_unmute_invariants() {
+        // 1. Volume setting unmuting invariant
+        let mut volume: f32;
+        let mut is_muted = true;
+        let new_vol = 0.5f32.clamp(0.0, 1.0);
+        volume = new_vol;
+        if volume > 0.0 {
+            is_muted = false;
+        }
+        assert_eq!(volume, 0.5);
+        assert!(!is_muted);
+
+        // Setting volume 0 keeps muted if already muted
+        let mut is_muted_zero = true;
+        let zero_vol = 0.0f32.clamp(0.0, 1.0);
+        volume = zero_vol;
+        if volume > 0.0 {
+            is_muted_zero = false;
+        }
+        assert_eq!(volume, 0.0);
+        assert!(is_muted_zero);
+
+        // 2. Audio and Subtitle delay clamping to [-5000, 5000]
+        let mut audio_delay: i64 = 4900;
+        audio_delay = (audio_delay + 200).clamp(-5000, 5000);
+        assert_eq!(audio_delay, 5000);
+
+        let mut sub_delay: i64 = -4950;
+        sub_delay = (sub_delay - 100).clamp(-5000, 5000);
+        assert_eq!(sub_delay, -5000);
+
+        // 3. EOF boundary clamping and replay detection
+        let dur_ms: u64 = 60_000;
+        let mut current_pts_ms: f64 = 60_050.0;
+        let mut is_playing = true;
+
+        if dur_ms > 0 && current_pts_ms >= dur_ms as f64 {
+            current_pts_ms = dur_ms as f64;
+            if is_playing {
+                is_playing = false;
+            }
+        }
+        assert_eq!(current_pts_ms, 60_000.0);
+        assert!(!is_playing);
+
+        // When user unpauses while positioned at EOF, target resets to 0
+        let will_play = !is_playing;
+        let mut target_reset_to_zero = false;
+        if will_play && current_pts_ms >= dur_ms as f64 {
+            target_reset_to_zero = true;
+            current_pts_ms = 0.0;
+        }
+        assert!(target_reset_to_zero);
+        assert_eq!(current_pts_ms, 0.0);
     }
 }

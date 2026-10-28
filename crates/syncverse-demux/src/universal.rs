@@ -25,6 +25,8 @@ pub struct UniversalDemuxer {
     info: Option<ContainerInfo>,
     /// Per-stream rational time bases indexed by stream index.
     time_bases: Vec<ffmpeg::Rational>,
+    /// Per-stream detected frame rates indexed by stream index.
+    frame_rates: Vec<Option<f64>>,
     /// Buffered packet retained after a keyframe seek to determine landed PTS.
     peeked_packet: Option<DemuxPacket>,
     /// Container presentation start time offset in microseconds (AV_TIME_BASE units).
@@ -47,6 +49,7 @@ impl UniversalDemuxer {
             ictx: None,
             info: None,
             time_bases: Vec::new(),
+            frame_rates: Vec::new(),
             peeked_packet: None,
             start_time_us: 0,
         }
@@ -70,11 +73,25 @@ impl UniversalDemuxer {
     ) -> Result<ContainerInfo, DemuxError> {
         let mut tracks = Vec::new();
         let mut time_bases = Vec::new();
+        let mut frame_rates = Vec::new();
 
         for s in ictx.streams() {
             let s_idx = s.index();
             let tb = s.time_base();
             time_bases.push(tb);
+
+            let r = s.avg_frame_rate();
+            let fps = if r.denominator() > 0 && r.numerator() > 0 {
+                Some(r.numerator() as f64 / r.denominator() as f64)
+            } else {
+                let r2 = s.rate();
+                if r2.denominator() > 0 && r2.numerator() > 0 {
+                    Some(r2.numerator() as f64 / r2.denominator() as f64)
+                } else {
+                    None
+                }
+            };
+            frame_rates.push(fps);
 
             let params = s.parameters();
             let track_type = match params.medium() {
@@ -191,6 +208,7 @@ impl UniversalDemuxer {
         };
 
         self.time_bases = time_bases;
+        self.frame_rates = frame_rates;
         self.info = Some(info.clone());
         self.ictx = Some(ictx);
         self.peeked_packet = None;
@@ -266,6 +284,11 @@ impl UniversalDemuxer {
     /// Returns the rational time base (numerator, denominator) for a given stream index, if available.
     pub fn stream_time_base(&self, stream_index: usize) -> Option<(i32, i32)> {
         self.time_bases.get(stream_index).map(|tb| (tb.numerator(), tb.denominator()))
+    }
+
+    /// Returns the detected frame rate (FPS) for a given stream index, if available.
+    pub fn stream_frame_rate(&self, stream_index: usize) -> Option<f64> {
+        self.frame_rates.get(stream_index).copied().flatten()
     }
 }
 

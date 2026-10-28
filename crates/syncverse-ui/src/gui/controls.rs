@@ -160,7 +160,7 @@ impl ControlsBarState {
         if !self.is_fullscreen {
             true
         } else {
-            (now - self.last_mouse_activity).as_secs_f64() < self.autohide_delay_secs
+            now.saturating_duration_since(self.last_mouse_activity).as_secs_f64() < self.autohide_delay_secs
         }
     }
 

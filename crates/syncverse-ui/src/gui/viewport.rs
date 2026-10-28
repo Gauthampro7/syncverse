@@ -218,6 +218,7 @@ pub struct VideoViewport {
     aspect_override: AspectRatioOverride,
     last_video_rect: Option<Rect>,
     pending_click: Option<(Instant, bool)>,
+    last_double_click: Option<Instant>,
 }
 
 impl Default for VideoViewport {
@@ -239,6 +240,7 @@ impl VideoViewport {
             aspect_override: AspectRatioOverride::Original,
             last_video_rect: None,
             pending_click: None,
+            last_double_click: None,
         }
     }
 
@@ -318,6 +320,7 @@ impl VideoViewport {
         self.video_height = 0;
         self.last_video_rect = None;
         self.pending_click = None;
+        self.last_double_click = None;
     }
 
     /// Uploads frame RGBA data to the `egui::TextureHandle`.
@@ -466,11 +469,18 @@ impl VideoViewport {
         if response.double_clicked() {
             // Double-click toggles fullscreen: cancel any pending single-click
             self.pending_click = None;
+            self.last_double_click = Some(Instant::now());
             action.toggle_fullscreen = true;
         } else if response.clicked() {
-            // Single-click: stage for delayed dispatch to avoid spurious toggle on double-click
-            self.pending_click = Some((Instant::now(), is_empty));
-            ui.ctx().request_repaint_after(Duration::from_millis(260));
+            let is_trailing_click = self
+                .last_double_click
+                .map(|t| t.elapsed() < Duration::from_millis(300))
+                .unwrap_or(false);
+            if !is_trailing_click {
+                // Single-click: stage for delayed dispatch to avoid spurious toggle on double-click
+                self.pending_click = Some((Instant::now(), is_empty));
+                ui.ctx().request_repaint_after(Duration::from_millis(260));
+            }
         }
 
         if let Some((click_time, empty)) = self.pending_click {
@@ -651,5 +661,29 @@ mod tests {
         let cycled = viewport.cycle_aspect_override();
         assert_eq!(cycled, AspectRatioOverride::Ratio4_3);
         assert_eq!(viewport.aspect_override(), AspectRatioOverride::Ratio4_3);
+    }
+
+    #[test]
+    fn test_video_viewport_reset_clears_all_pending_and_clicks() {
+        let mut viewport = VideoViewport::new();
+        viewport.pending_click = Some((Instant::now(), true));
+        viewport.last_double_click = Some(Instant::now());
+        viewport.video_width = 1920;
+        viewport.video_height = 1080;
+
+        viewport.reset();
+        assert!(viewport.pending_click.is_none());
+        assert!(viewport.last_double_click.is_none());
+        assert_eq!(viewport.video_width, 0);
+        assert_eq!(viewport.video_height, 0);
+    }
+
+    #[test]
+    fn test_viewport_action_defaults() {
+        let action = ViewportAction::default();
+        assert!(!action.toggle_fullscreen);
+        assert!(!action.toggle_play_pause);
+        assert!(!action.open_file);
+        assert_eq!(action.scroll_delta, 0.0);
     }
 }
