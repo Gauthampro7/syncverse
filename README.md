@@ -7,7 +7,7 @@
 
 ## 🌟 Highlights
 
-Syncverse is a standalone desktop media player and synchronized watch-party platform built from the ground up to eliminate the clunkiness, IPC wrappers, and jitter of traditional solutions.
+Syncverse is a standalone desktop media player and synchronized watch-party platform built from the ground up to eliminate the clunkiness, IPC wrappers, and jitter of traditional solutions. Born out of the frustration of watching legacy sync tools choke on transcontinental latency while trying to share an unforgettable film across opposite ends of the earth, Syncverse ensures two screens half a world away stay locked to the exact same frame in time.
 
 - **Desktop Graphical Player UI**: A modern, hardware-accelerated desktop window natively supporting **Linux (Wayland & X11)** and **Windows**. Features a GPU video viewport with aspect ratio preservation (letterboxing / pillarboxing), dark theme, and fluid vsync frame pacing.
 - **VLC-Grade Format Compatibility**: Universal container demuxing (**MKV, MP4, WebM, AVI, MOV, MPEG-TS, FLV, OGG**) and video/audio bitstream decoding (**H.264, H.265 / HEVC 10-bit, VP8, VP9, AV1, MPEG-2/4, VC-1**; **AAC, MP3, Opus, Vorbis, FLAC, AC3, DTS / DTS-HD MA, PCM**).
