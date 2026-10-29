@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 syncverse-common = { path = "../syncverse-common" }
 thiserror.workspace = true
+ring = "0.17"

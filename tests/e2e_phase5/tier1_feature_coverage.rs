@@ -400,8 +400,14 @@ fn test_f7_opcode_0x09_accepted() {
 }
 
 #[test]
-fn test_f7_opcode_0x0a_rejected() {
-    assert!(matches!(PacketType::try_from(0x0A), Err(SyncError::UnknownPacketType(0x0A))));
+fn test_f7_opcode_0x0a_accepted() {
+    let p = PacketType::try_from(0x0A).expect("0x0A must be accepted as Reaction");
+    assert_eq!(p, PacketType::Reaction);
+}
+
+#[test]
+fn test_f7_opcode_0x0b_rejected() {
+    assert!(matches!(PacketType::try_from(0x0B), Err(SyncError::UnknownPacketType(0x0B))));
 }
 
 #[test]

@@ -18,7 +18,10 @@ use syncverse_chat::{ChatRecord, RoomAnnouncement};
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncverse_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
-use syncverse_sync::{ClientNode, HostServer, PeerStatusPayload};
+use syncverse_sync::{
+    ClientNode, HostServer, MediaFingerprint, PeerStatusPayload, RoomCryptoSession,
+    UpnpMappingGuard, UpnpStatus,
+};
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
     TripleBufferSnapshotExchange, UiEvent, SNAPSHOT_FLAG_FORCE_PLAY, SNAPSHOT_FLAG_GATE_BLOCKED,
@@ -709,6 +712,8 @@ enum WatchPartyRole {
         last_state_broadcast: Instant,
         last_member_update: Instant,
         last_probe_sent: Instant,
+        _upnp_guard: Option<UpnpMappingGuard>,
+        _crypto: Option<Arc<RoomCryptoSession>>,
     },
     Client {
         client: ClientNode,
@@ -717,6 +722,7 @@ enum WatchPartyRole {
         host_username: String,
         last_probe_sent: Instant,
         last_member_update: Instant,
+        _crypto: Option<Arc<RoomCryptoSession>>,
     },
 }
 
@@ -765,6 +771,7 @@ fn broadcast_local_peer_status(
     duration_ms: u64,
     file_size_bytes: u64,
     filename: &str,
+    media_hash: [u8; 32],
     party_role: &mut WatchPartyRole,
 ) {
     match party_role {
@@ -773,15 +780,16 @@ fn broadcast_local_peer_status(
             local_username,
             ..
         } => {
-            let status = PeerStatusPayload {
-                client_id: 0,
+            let status = PeerStatusPayload::with_hash(
+                0,
                 has_media,
                 is_ready,
                 duration_ms,
                 file_size_bytes,
-                username: local_username.clone(),
-                filename: filename.to_string(),
-            };
+                local_username.clone(),
+                filename.to_string(),
+                media_hash,
+            );
             let _ = server.broadcast_peer_status(&status);
         }
         WatchPartyRole::Client {
@@ -789,13 +797,14 @@ fn broadcast_local_peer_status(
             local_username,
             ..
         } => {
-            let _ = client.send_peer_status(
+            let _ = client.send_peer_status_with_hash(
                 has_media,
                 is_ready,
                 duration_ms,
                 file_size_bytes,
                 local_username,
                 filename,
+                media_hash,
             );
         }
         WatchPartyRole::None => {}
@@ -815,6 +824,7 @@ pub fn run_playback_worker(
     let mut session: Option<PlaybackSession> = None;
     let mut current_file_name: Option<String> = None;
     let mut current_file_size: u64 = 0;
+    let mut current_media_hash: [u8; 32] = [0u8; 32];
     let mut local_ready: bool = false;
     let mut force_play: bool = false;
     let mut gate_blocked: bool = false;
@@ -846,6 +856,9 @@ pub fn run_playback_worker(
                             let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                             current_file_name = Some(filename.clone());
                             current_file_size = file_size;
+                            current_media_hash = MediaFingerprint::compute(&path, dur_ms)
+                                .map(|fp| fp.hash)
+                                .unwrap_or([0u8; 32]);
                             local_ready = true;
                             gate_blocked = false;
 
@@ -930,6 +943,7 @@ pub fn run_playback_worker(
                                 dur_ms,
                                 file_size,
                                 &filename,
+                                current_media_hash,
                                 &mut party_role,
                             );
 
@@ -974,6 +988,7 @@ pub fn run_playback_worker(
                         dur_ms,
                         current_file_size,
                         current_file_name.as_deref().unwrap_or(""),
+                        current_media_hash,
                         &mut party_role,
                     );
 
@@ -1424,7 +1439,13 @@ pub fn run_playback_worker(
 
                     let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
-                PlayerCommand::HostParty { port, room, username } => {
+                PlayerCommand::HostParty {
+                    port,
+                    room,
+                    username,
+                    password,
+                    enable_upnp,
+                } => {
                     let bind_addr = format!("0.0.0.0:{}", port);
                     match HostServer::bind(&bind_addr) {
                         Ok(mut server) => {
@@ -1432,6 +1453,22 @@ pub fn run_playback_worker(
                             let current_pts = clock.current_pts(now).max(0.0) as u64;
                             let is_paused = !clock.is_playing();
                             server.set_media_state(current_pts, speed, is_paused);
+
+                            let (upnp_st, upnp_guard) = if enable_upnp {
+                                UpnpMappingGuard::map_port(port)
+                            } else {
+                                (
+                                    UpnpStatus::Disabled {
+                                        reason: "UPnP disabled by user".to_string(),
+                                    },
+                                    None,
+                                )
+                            };
+
+                            let crypto = password
+                                .as_deref()
+                                .and_then(|pwd| RoomCryptoSession::from_password(&room, pwd).ok())
+                                .map(Arc::new);
 
                             let dur_ms = session.as_ref().map(|s| s.duration_ms);
                             let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
@@ -1449,14 +1486,38 @@ pub fn run_playback_worker(
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
+
+                            let enc_notice = if crypto.is_some() { " [E2E Encrypted 🔒]" } else { "" };
                             let rec = ChatRecord::new_text(
                                 wall_ms,
                                 current_pts,
                                 [0u8; 16],
                                 "System".to_string(),
-                                &format!("★ Hosting watch party in room '{}' on port {}", room, port),
+                                &format!("★ Hosting watch party in room '{}' on port {}{}", room, port, enc_notice),
                             );
                             let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+
+                            match &upnp_st {
+                                UpnpStatus::Active { external_ip, port } => {
+                                    let upnp_msg = format!("🌐 UPnP Port Forwarded: {}:{}", external_ip.as_deref().unwrap_or("WAN"), port);
+                                    let upnp_rec = ChatRecord::new_text(wall_ms, current_pts, [0u8; 16], "System".to_string(), &upnp_msg);
+                                    let _ = event_tx.send(UiEvent::NewChatRecord(upnp_rec));
+                                    let _ = event_tx.send(UiEvent::UpnpStatusUpdated {
+                                        is_mapped: true,
+                                        external_ip: external_ip.clone(),
+                                        port: *port,
+                                        message: "Port mapped successfully".to_string(),
+                                    });
+                                }
+                                UpnpStatus::Disabled { reason } => {
+                                    let _ = event_tx.send(UiEvent::UpnpStatusUpdated {
+                                        is_mapped: false,
+                                        external_ip: None,
+                                        port,
+                                        message: reason.clone(),
+                                    });
+                                }
+                            }
 
                             party_role = WatchPartyRole::Host {
                                 server,
@@ -1466,6 +1527,8 @@ pub fn run_playback_worker(
                                 last_state_broadcast: now,
                                 last_member_update: now,
                                 last_probe_sent: now,
+                                _upnp_guard: upnp_guard,
+                                _crypto: crypto,
                             };
 
                             broadcast_local_peer_status(
@@ -1474,6 +1537,7 @@ pub fn run_playback_worker(
                                 dur_ms.unwrap_or(0),
                                 current_file_size,
                                 current_file_name.as_deref().unwrap_or(""),
+                                current_media_hash,
                                 &mut party_role,
                             );
                         }
@@ -1494,7 +1558,12 @@ pub fn run_playback_worker(
                         }
                     }
                 }
-                PlayerCommand::ConnectParty { addr, room, username } => {
+                PlayerCommand::ConnectParty {
+                    addr,
+                    room,
+                    username,
+                    password,
+                } => {
                     let target_addr: Option<SocketAddr> = addr
                         .to_socket_addrs()
                         .ok()
@@ -1506,6 +1575,11 @@ pub fn run_playback_worker(
                             .map(|d| d.as_millis() as u32)
                             .unwrap_or(1))
                             & 0x7FFFFFFF;
+
+                        let crypto = password
+                            .as_deref()
+                            .and_then(|pwd| RoomCryptoSession::from_password(&room, pwd).ok())
+                            .map(Arc::new);
 
                         match ClientNode::bind("0.0.0.0:0", target, client_id) {
                             Ok(mut client) => {
@@ -1528,13 +1602,14 @@ pub fn run_playback_worker(
                                 let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
 
                                 let dur_ms = session.as_ref().map(|s| s.duration_ms);
-                                let _ = client.send_peer_status(
+                                let _ = client.send_peer_status_with_hash(
                                     session.is_some(),
                                     local_ready,
                                     dur_ms.unwrap_or(0),
                                     current_file_size,
                                     &username,
                                     current_file_name.as_deref().unwrap_or(""),
+                                    current_media_hash,
                                 );
 
                                 let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
@@ -1548,12 +1623,13 @@ pub fn run_playback_worker(
                                     local_ready,
                                 )]));
 
+                                let enc_notice = if crypto.is_some() { " [E2E Encrypted 🔒]" } else { "" };
                                 let rec = ChatRecord::new_text(
                                     wall_ms,
                                     current_pts,
                                     [0u8; 16],
                                     "System".to_string(),
-                                    &format!("🔗 Connected to {} (Room '{}')", addr, room),
+                                    &format!("🔗 Connected to {} (Room '{}'{})", addr, room, enc_notice),
                                 );
                                 let _ = event_tx.send(UiEvent::NewChatRecord(rec));
 
@@ -1564,6 +1640,7 @@ pub fn run_playback_worker(
                                     host_username: "Host".to_string(),
                                     last_probe_sent: now,
                                     last_member_update: now,
+                                    _crypto: crypto,
                                 };
                             }
                             Err(e) => {
@@ -1596,6 +1673,32 @@ pub fn run_playback_worker(
                             &format!("❌ Could not resolve address: {}", addr),
                         );
                         let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                    }
+                }
+                PlayerCommand::SendReaction(emoji) => {
+                    let now = Instant::now();
+                    let current_pts = clock.current_pts(now).max(0.0) as u64;
+                    match &mut party_role {
+                        WatchPartyRole::Host { server, local_username, .. } => {
+                            let _ = server.broadcast_reaction(&emoji, current_pts, local_username);
+                            let _ = event_tx.send(UiEvent::FloatingReaction {
+                                emoji,
+                                username: local_username.clone(),
+                            });
+                        }
+                        WatchPartyRole::Client { client, local_username, .. } => {
+                            let _ = client.send_reaction(&emoji, current_pts, local_username);
+                            let _ = event_tx.send(UiEvent::FloatingReaction {
+                                emoji,
+                                username: local_username.clone(),
+                            });
+                        }
+                        WatchPartyRole::None => {
+                            let _ = event_tx.send(UiEvent::FloatingReaction {
+                                emoji,
+                                username: "You".to_string(),
+                            });
+                        }
                     }
                 }
                 PlayerCommand::DisconnectParty => {
@@ -1758,6 +1861,8 @@ pub fn run_playback_worker(
                 last_state_broadcast,
                 last_member_update,
                 last_probe_sent,
+                _upnp_guard: _,
+                _crypto: _,
             } => {
                 // Poll incoming UDP datagrams
                 while let Ok(Some((_, sender_addr))) = server.poll_and_process() {
@@ -1780,6 +1885,17 @@ pub fn run_playback_worker(
                     }
                     let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
+
+                // Process pending reactions
+                for reaction in server.poll_reactions() {
+                    let _ = event_tx.send(UiEvent::FloatingReaction {
+                        emoji: reaction.emoji,
+                        username: reaction.username,
+                    });
+                }
+
+                // Prune stale / disconnected peers
+                server.prune_stale_clients(Duration::from_secs(12));
 
                 let now = Instant::now();
                 // Send NTP probes to clients (~1 Hz) to measure RTT
@@ -1804,7 +1920,12 @@ pub fn run_playback_worker(
                 if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
                     *last_member_update = now;
                     let local_dur = session.as_ref().map(|s| s.duration_ms);
-                    let mut members = vec![RoomMember::with_media(
+                    let local_hash = if current_media_hash != [0u8; 32] {
+                        Some(current_media_hash)
+                    } else {
+                        None
+                    };
+                    let mut members = vec![RoomMember::with_media_and_hash(
                         local_username.clone(),
                         true,
                         true,
@@ -1817,6 +1938,7 @@ pub fn run_playback_worker(
                             None
                         },
                         local_ready,
+                        local_hash,
                     )];
 
                     for (addr, client_session) in server.clients() {
@@ -1829,7 +1951,12 @@ pub fn run_playback_worker(
                                     .cloned()
                                     .unwrap_or_else(|| format!("Peer-{}", client_session.client_id))
                             };
-                            members.push(RoomMember::with_media(
+                            let peer_hash = if client_session.media_hash != [0u8; 32] {
+                                Some(client_session.media_hash)
+                            } else {
+                                None
+                            };
+                            members.push(RoomMember::with_media_and_hash(
                                 name,
                                 false,
                                 false,
@@ -1850,6 +1977,7 @@ pub fn run_playback_worker(
                                     None
                                 },
                                 client_session.is_user_ready,
+                                peer_hash,
                             ));
                         }
                     }
@@ -1863,6 +1991,7 @@ pub fn run_playback_worker(
                 host_username,
                 last_probe_sent,
                 last_member_update,
+                _crypto: _,
             } => {
                 // Poll incoming UDP datagrams
                 while let Ok(Some(_)) = client.poll_and_process() {
@@ -1879,6 +2008,14 @@ pub fn run_playback_worker(
                     let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
 
+                // Process pending reactions
+                for reaction in client.poll_reactions() {
+                    let _ = event_tx.send(UiEvent::FloatingReaction {
+                        emoji: reaction.emoji,
+                        username: reaction.username,
+                    });
+                }
+
                 let now = Instant::now();
                 // Send NTP probes to host (~1 Hz)
                 if now.duration_since(*last_probe_sent) >= Duration::from_millis(1000) {
@@ -1892,6 +2029,7 @@ pub fn run_playback_worker(
                     let now_nanos = client.current_local_nanos();
                     let target_pts_ms = room_state.compute_target_media_pts(now_nanos, theta_hat);
                     let local_pts_ms = clock.current_pts(now).max(0.0) as u64;
+                    client.set_local_pts_ms(local_pts_ms);
 
                     // Sync pause/play state
                     if room_state.is_paused && clock.is_playing() {
@@ -1950,7 +2088,12 @@ pub fn run_playback_worker(
                 if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
                     *last_member_update = now;
                     let local_dur = session.as_ref().map(|s| s.duration_ms);
-                    let mut members = vec![RoomMember::with_media(
+                    let local_hash = if current_media_hash != [0u8; 32] {
+                        Some(current_media_hash)
+                    } else {
+                        None
+                    };
+                    let mut members = vec![RoomMember::with_media_and_hash(
                         local_username.clone(),
                         true,
                         false,
@@ -1963,6 +2106,7 @@ pub fn run_playback_worker(
                             None
                         },
                         local_ready,
+                        local_hash,
                     )];
 
                     let peer_stats = client.peer_statuses().clone();
@@ -1982,7 +2126,12 @@ pub fn run_playback_worker(
                             } else {
                                 0.0
                             };
-                            members.push(RoomMember::with_media(
+                            let peer_hash = if status.media_hash != [0u8; 32] {
+                                Some(status.media_hash)
+                            } else {
+                                None
+                            };
+                            members.push(RoomMember::with_media_and_hash(
                                 status.username.clone(),
                                 false,
                                 is_host_peer,
@@ -2003,6 +2152,7 @@ pub fn run_playback_worker(
                                     None
                                 },
                                 status.is_ready,
+                                peer_hash,
                             ));
                         }
                     }

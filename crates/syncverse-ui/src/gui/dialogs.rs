@@ -32,6 +32,10 @@ pub struct HostPartyDialog {
     pub username: String,
     /// Detected local LAN IP address.
     pub local_ip: String,
+    /// Optional room password for ChaCha20-Poly1305 E2E encryption.
+    pub password: String,
+    /// Whether to attempt UPnP automatic port-forwarding on router.
+    pub enable_upnp: bool,
     /// Transient status message (e.g. "Copied!").
     pub status_message: Option<String>,
 }
@@ -44,6 +48,8 @@ impl Default for HostPartyDialog {
             room_name: "Watch Party".to_string(),
             username: std::env::var("USER").unwrap_or_else(|_| "Host".to_string()),
             local_ip: get_local_lan_ip(),
+            password: String::new(),
+            enable_upnp: true,
             status_message: None,
         }
     }
@@ -95,7 +101,16 @@ impl HostPartyDialog {
                         ui.label(RichText::new("Your Username:").strong());
                         ui.text_edit_singleline(&mut self.username);
                         ui.end_row();
+
+                        ui.label(RichText::new("Room Password:").strong());
+                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true))
+                            .on_hover_text("Optional password for ChaCha20-Poly1305 end-to-end encryption");
+                        ui.end_row();
                     });
+
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.enable_upnp, "Enable UPnP automatic port-forwarding on router")
+                    .on_hover_text("Allows WAN friends to connect automatically without manual router port-forwarding");
 
                 ui.add_space(8.0);
                 ui.group(|ui| {
@@ -140,10 +155,17 @@ impl HostPartyDialog {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(RichText::new("★ Start Hosting Room").strong().color(Color32::from_rgb(34, 197, 94))).clicked() {
+                            let pwd = if self.password.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.password.trim().to_string())
+                            };
                             let _ = command_tx.send(PlayerCommand::HostParty {
                                 port: self.port,
                                 room: self.room_name.clone(),
                                 username: self.username.clone(),
+                                password: pwd,
+                                enable_upnp: self.enable_upnp,
                             });
 
                             sidebar.members = vec![RoomMember::new(
@@ -175,6 +197,8 @@ pub struct ConnectPartyDialog {
     pub room_name: String,
     /// Username for the local client.
     pub username: String,
+    /// Optional room password for ChaCha20-Poly1305 E2E encryption.
+    pub password: String,
     /// Error message on validation failure.
     pub error_msg: Option<String>,
 }
@@ -186,6 +210,7 @@ impl Default for ConnectPartyDialog {
             host_addr: "127.0.0.1:18242".to_string(),
             room_name: "Watch Party".to_string(),
             username: std::env::var("USER").unwrap_or_else(|_| "Peer".to_string()),
+            password: String::new(),
             error_msg: None,
         }
     }
@@ -237,6 +262,11 @@ impl ConnectPartyDialog {
                         ui.label(RichText::new("Room Name:").strong());
                         ui.text_edit_singleline(&mut self.room_name);
                         ui.end_row();
+
+                        ui.label(RichText::new("Room Password:").strong());
+                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true))
+                            .on_hover_text("Optional password for ChaCha20-Poly1305 end-to-end encryption");
+                        ui.end_row();
                     });
 
                 if let Some(ref err) = self.error_msg {
@@ -259,10 +289,16 @@ impl ConnectPartyDialog {
                                 return;
                             }
 
+                            let pwd = if self.password.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.password.trim().to_string())
+                            };
                             let _ = command_tx.send(PlayerCommand::ConnectParty {
                                 addr: self.host_addr.clone(),
                                 room: self.room_name.clone(),
                                 username: self.username.clone(),
+                                password: pwd,
                             });
 
                             sidebar.members = vec![RoomMember::new(

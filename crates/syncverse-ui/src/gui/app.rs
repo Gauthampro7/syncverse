@@ -106,6 +106,7 @@ pub struct SyncplayApp {
     cached_subtitle: RefCell<Option<CachedSubtitleLookup>>,
     aspect_ratio_index: usize,
     current_window_title: String,
+    reaction_system: crate::gui::reactions::ReactionSystem,
 }
 
 impl Default for SyncplayApp {
@@ -157,6 +158,7 @@ impl Default for SyncplayApp {
             cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
+            reaction_system: crate::gui::reactions::ReactionSystem::new(),
         }
     }
 }
@@ -226,6 +228,7 @@ impl SyncplayApp {
             cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
+            reaction_system: crate::gui::reactions::ReactionSystem::new(),
         };
 
         if let Some(path) = initial_file {
@@ -745,6 +748,31 @@ impl eframe::App for SyncplayApp {
                     self.invalidate_subtitle_cache();
                     ctx.request_repaint();
                 }
+                UiEvent::FloatingReaction { emoji, username } => {
+                    let target_rect = self
+                        .viewport
+                        .last_video_rect()
+                        .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::new(100.0, 100.0), egui::vec2(600.0, 400.0)));
+                    self.reaction_system.spawn(emoji, Some(username), target_rect);
+                    ctx.request_repaint();
+                }
+                UiEvent::UpnpStatusUpdated {
+                    is_mapped,
+                    external_ip,
+                    port,
+                    message,
+                } => {
+                    let toast = if is_mapped {
+                        format!(
+                            "UPnP: Port {} mapped ({})",
+                            port,
+                            external_ip.as_deref().unwrap_or("Public IP")
+                        )
+                    } else {
+                        format!("UPnP: {}", message)
+                    };
+                    self.osd_overlay.show_notification(toast, now);
+                }
             }
         }
 
@@ -1034,6 +1062,27 @@ impl eframe::App for SyncplayApp {
                 self.invalidate_subtitle_cache();
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
+            }
+
+            // Floating emoji reactions (1: ❤️, 2: 😂, 3: 🔥, 4: 👏, 5: 🍿, 6: 🎉)
+            let reaction_keys = [
+                (egui::Key::Num1, "❤️"),
+                (egui::Key::Num2, "😂"),
+                (egui::Key::Num3, "🔥"),
+                (egui::Key::Num4, "👏"),
+                (egui::Key::Num5, "🍿"),
+                (egui::Key::Num6, "🎉"),
+            ];
+            for (key, emoji) in reaction_keys {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    let _ = self.command_tx.send(PlayerCommand::SendReaction(emoji.to_string()));
+                    let target_rect = self
+                        .viewport
+                        .last_video_rect()
+                        .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::new(100.0, 100.0), egui::vec2(600.0, 400.0)));
+                    self.reaction_system.spawn(emoji, Some("You".to_string()), target_rect);
+                    ctx.request_repaint();
+                }
             }
         }
 
@@ -1619,6 +1668,11 @@ impl eframe::App for SyncplayApp {
                     {
                         self.subtitle_overlay.render(ui, video_rect, &active_text);
                     }
+
+                    // 11b. Floating Emoji Reactions Particle Simulation
+                    let dt = ui.input(|i| i.stable_dt);
+                    self.reaction_system.update(dt);
+                    self.reaction_system.render(ui, video_rect);
                 }
             });
 
@@ -1679,7 +1733,7 @@ impl eframe::App for SyncplayApp {
 
         // 11c. Floating OSD HUD notification banner overlay
         self.osd_overlay.show(&ctx, now);
-        if self.osd_overlay.active_notification(now).is_some() {
+        if self.osd_overlay.active_notification(now).is_some() || self.reaction_system.has_active_particles() {
             ctx.request_repaint();
         }
 

@@ -3353,6 +3353,7 @@ dependencies = [
 name = "syncverse-sync"
 version = "0.1.9"
 dependencies = [
+ "ring",
  "syncverse-common",
  "thiserror 2.0.21",
 ]

@@ -192,6 +192,7 @@ impl PlayerCoordinator {
             }
             PlayerCommand::HostParty { .. }
             | PlayerCommand::ConnectParty { .. }
+            | PlayerCommand::SendReaction(_)
             | PlayerCommand::DisconnectParty
             | PlayerCommand::SetReady(_)
             | PlayerCommand::SetForcePlay(_)

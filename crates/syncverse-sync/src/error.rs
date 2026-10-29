@@ -58,6 +58,10 @@ pub enum SyncError {
     /// Underlying socket or I/O error.
     #[error("network I/O error: {0}")]
     Io(String),
+
+    /// Cryptographic or authentication error.
+    #[error("cryptographic error: {0}")]
+    Crypto(String),
 }
 
 impl From<std::io::Error> for SyncError {

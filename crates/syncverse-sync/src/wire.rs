@@ -4,6 +4,7 @@
 
 use syncverse_common::Crc32;
 
+use crate::crypto::RoomCryptoSession;
 use crate::error::SyncError;
 
 /// 4-byte magic signature for SyncPlay Network Transport.
@@ -18,6 +19,9 @@ pub const FLAG_NONE: u8 = 0x00;
 
 /// Flag indicating a barrier commit notification.
 pub const FLAG_BARRIER_COMMIT: u8 = 0x01;
+
+/// Flag indicating that payload is encrypted with ChaCha20-Poly1305.
+pub const FLAG_ENCRYPTED: u8 = 0x02;
 
 /// Binary wire packet types for network synchronization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,8 +41,10 @@ pub enum PacketType {
     SeekCommand = 0x06,
     /// 0x08: In-band Chat Message (`sequence: u32`, `wall_timestamp_ms: u64`, `media_timestamp_ms: u64`, `payload: Vec<u8>`)
     ChatMessage = 0x08,
-    /// 0x09: Peer Status Broadcast (`client_id: u32`, `has_media: bool`, `is_ready: bool`, `duration_ms: u64`, `file_size_bytes: u64`, `username: String`, `filename: String`)
+    /// 0x09: Peer Status Broadcast (`client_id: u32`, `has_media: bool`, `is_ready: bool`, `duration_ms: u64`, `file_size_bytes: u64`, `username: String`, `filename: String`, `media_hash: [u8; 32]`)
     PeerStatus = 0x09,
+    /// 0x0A: Floating Emoji Reaction (`client_id: u32`, `media_pts_ms: u64`, `emoji: String`, `username: String`)
+    Reaction = 0x0A,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -54,6 +60,7 @@ impl TryFrom<u8> for PacketType {
             0x06 => Ok(Self::SeekCommand),
             0x08 => Ok(Self::ChatMessage),
             0x09 => Ok(Self::PeerStatus),
+            0x0A => Ok(Self::Reaction),
             other => Err(SyncError::UnknownPacketType(other)),
         }
     }
@@ -159,7 +166,7 @@ impl ChatMessagePayload {
 
 /// Payload for `0x09` Peer Status (media metadata and user readiness state).
 ///
-/// Encapsulates loaded media diagnostics (filename, duration, size) and
+/// Encapsulates loaded media diagnostics (filename, duration, size, SHA-256 fingerprint) and
 /// persistent user watch readiness ("Ready to Watch" state).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerStatusPayload {
@@ -177,10 +184,12 @@ pub struct PeerStatusPayload {
     pub username: String,
     /// Loaded media file basename.
     pub filename: String,
+    /// SHA-256 fingerprint hash of the media file (for desync and cut mismatch detection).
+    pub media_hash: [u8; 32],
 }
 
 impl PeerStatusPayload {
-    /// Constructs a new `PeerStatusPayload`.
+    /// Constructs a new `PeerStatusPayload` with a default zeroed media hash.
     pub fn new(
         client_id: u32,
         has_media: bool,
@@ -190,6 +199,30 @@ impl PeerStatusPayload {
         username: impl Into<String>,
         filename: impl Into<String>,
     ) -> Self {
+        Self::with_hash(
+            client_id,
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username,
+            filename,
+            [0u8; 32],
+        )
+    }
+
+    /// Constructs a new `PeerStatusPayload` with an explicit SHA-256 media hash fingerprint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_hash(
+        client_id: u32,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: impl Into<String>,
+        filename: impl Into<String>,
+        media_hash: [u8; 32],
+    ) -> Self {
         Self {
             client_id,
             has_media,
@@ -198,6 +231,37 @@ impl PeerStatusPayload {
             file_size_bytes,
             username: username.into(),
             filename: filename.into(),
+            media_hash,
+        }
+    }
+}
+
+/// Payload for `0x0A` Floating Emoji Reaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionPayload {
+    /// Reporting client identifier.
+    pub client_id: u32,
+    /// Media presentation timestamp in milliseconds.
+    pub media_pts_ms: u64,
+    /// UTF-8 emoji string (e.g. "❤️", "😂", "🔥", "👏", "🍿", "🎉").
+    pub emoji: String,
+    /// Peer username who sent the reaction.
+    pub username: String,
+}
+
+impl ReactionPayload {
+    /// Constructs a new `ReactionPayload`.
+    pub fn new(
+        client_id: u32,
+        media_pts_ms: u64,
+        emoji: impl Into<String>,
+        username: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_id,
+            media_pts_ms,
+            emoji: emoji.into(),
+            username: username.into(),
         }
     }
 }
@@ -221,6 +285,8 @@ pub enum PacketPayload {
     ChatMessage(ChatMessagePayload),
     /// Peer Status Broadcast
     PeerStatus(PeerStatusPayload),
+    /// Floating Emoji Reaction
+    Reaction(ReactionPayload),
 }
 
 impl PacketPayload {
@@ -284,7 +350,7 @@ impl PacketPayload {
                 let username_len = username_bytes.len().min(u16::MAX as usize) as u16;
                 let filename_len = filename_bytes.len().min(u16::MAX as usize) as u16;
 
-                let mut buf = Vec::with_capacity(26 + username_bytes.len() + filename_bytes.len());
+                let mut buf = Vec::with_capacity(26 + username_bytes.len() + filename_bytes.len() + 32);
                 buf.extend_from_slice(&p.client_id.to_le_bytes());
                 buf.extend_from_slice(&p.duration_ms.to_le_bytes());
                 buf.extend_from_slice(&p.file_size_bytes.to_le_bytes());
@@ -294,6 +360,22 @@ impl PacketPayload {
                 buf.extend_from_slice(&username_bytes[..username_len as usize]);
                 buf.extend_from_slice(&filename_len.to_le_bytes());
                 buf.extend_from_slice(&filename_bytes[..filename_len as usize]);
+                buf.extend_from_slice(&p.media_hash);
+                buf
+            }
+            Self::Reaction(p) => {
+                let emoji_bytes = p.emoji.as_bytes();
+                let username_bytes = p.username.as_bytes();
+                let emoji_len = emoji_bytes.len().min(u16::MAX as usize) as u16;
+                let username_len = username_bytes.len().min(u16::MAX as usize) as u16;
+
+                let mut buf = Vec::with_capacity(16 + emoji_bytes.len() + username_bytes.len());
+                buf.extend_from_slice(&p.client_id.to_le_bytes());
+                buf.extend_from_slice(&p.media_pts_ms.to_le_bytes());
+                buf.extend_from_slice(&emoji_len.to_le_bytes());
+                buf.extend_from_slice(&emoji_bytes[..emoji_len as usize]);
+                buf.extend_from_slice(&username_len.to_le_bytes());
+                buf.extend_from_slice(&username_bytes[..username_len as usize]);
                 buf
             }
         }
@@ -310,6 +392,7 @@ impl PacketPayload {
             Self::SeekCommand(_) => PacketType::SeekCommand,
             Self::ChatMessage(_) => PacketType::ChatMessage,
             Self::PeerStatus(_) => PacketType::PeerStatus,
+            Self::Reaction(_) => PacketType::Reaction,
         }
     }
 }
@@ -463,10 +546,34 @@ impl WirePacket {
         username: impl Into<String>,
         filename: impl Into<String>,
     ) -> Self {
+        Self::peer_status_with_hash(
+            client_id,
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username,
+            filename,
+            [0u8; 32],
+        )
+    }
+
+    /// Constructs a Peer Status packet (`0x09`) with an explicit SHA-256 media hash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peer_status_with_hash(
+        client_id: u32,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: impl Into<String>,
+        filename: impl Into<String>,
+        media_hash: [u8; 32],
+    ) -> Self {
         Self {
             packet_type: PacketType::PeerStatus,
             flags: FLAG_NONE,
-            payload: PacketPayload::PeerStatus(PeerStatusPayload::new(
+            payload: PacketPayload::PeerStatus(PeerStatusPayload::with_hash(
                 client_id,
                 has_media,
                 is_ready,
@@ -474,6 +581,26 @@ impl WirePacket {
                 file_size_bytes,
                 username,
                 filename,
+                media_hash,
+            )),
+        }
+    }
+
+    /// Constructs a Floating Emoji Reaction packet (`0x0A`).
+    pub fn reaction(
+        client_id: u32,
+        media_pts_ms: u64,
+        emoji: impl Into<String>,
+        username: impl Into<String>,
+    ) -> Self {
+        Self {
+            packet_type: PacketType::Reaction,
+            flags: FLAG_NONE,
+            payload: PacketPayload::Reaction(ReactionPayload::new(
+                client_id,
+                media_pts_ms,
+                emoji,
+                username,
             )),
         }
     }
@@ -494,8 +621,47 @@ impl WirePacket {
         buf
     }
 
+    /// Serializes this packet into an encrypted binary byte vector using the provided room crypto session.
+    pub fn to_bytes_encrypted(&self, crypto: &RoomCryptoSession) -> Result<Vec<u8>, SyncError> {
+        let payload_bytes = self.payload.serialize();
+        let flags = self.flags | FLAG_ENCRYPTED;
+
+        // Associated Data (AAD): fixed header metadata [magic (4B), packet_type (1B), flags (1B)]
+        let mut aad = [0u8; 6];
+        aad[0..4].copy_from_slice(&WIRE_MAGIC);
+        aad[4] = self.packet_type as u8;
+        aad[5] = flags;
+
+        let (counter, ciphertext) = crypto.encrypt(&payload_bytes, &aad)?;
+
+        // Encrypted body: counter (8B) + ciphertext_with_tag
+        let body_len = (8 + ciphertext.len()) as u16;
+        let mut body = Vec::with_capacity(8 + ciphertext.len());
+        body.extend_from_slice(&counter.to_le_bytes());
+        body.extend_from_slice(&ciphertext);
+
+        let crc = Crc32::digest(&body);
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&WIRE_MAGIC);
+        buf.push(self.packet_type as u8);
+        buf.push(flags);
+        buf.extend_from_slice(&body_len.to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&body);
+        Ok(buf)
+    }
+
     /// Deserializes a binary byte buffer into a validated `WirePacket`.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, SyncError> {
+        Self::from_bytes_with_crypto(buf, None)
+    }
+
+    /// Deserializes a binary byte buffer into a validated `WirePacket`, decrypting if encrypted.
+    pub fn from_bytes_with_crypto(
+        buf: &[u8],
+        crypto: Option<&RoomCryptoSession>,
+    ) -> Result<Self, SyncError> {
         if buf.len() < HEADER_LEN {
             return Err(SyncError::PacketTooShort(buf.len()));
         }
@@ -528,6 +694,46 @@ impl WirePacket {
             });
         }
 
+        if (flags & FLAG_ENCRYPTED) != 0 {
+            let crypto_sess = crypto.ok_or_else(|| {
+                SyncError::Crypto("Received encrypted packet but room password is not configured".to_string())
+            })?;
+
+            if payload_slice.len() < 8 + crate::crypto::AEAD_TAG_LEN {
+                return Err(SyncError::MalformedPayload(
+                    "Encrypted payload too short for nonce and authentication tag".to_string(),
+                ));
+            }
+
+            let counter = u64::from_le_bytes(payload_slice[0..8].try_into().unwrap());
+            let ciphertext = &payload_slice[8..];
+
+            let mut aad = [0u8; 6];
+            aad[0..4].copy_from_slice(&WIRE_MAGIC);
+            aad[4] = packet_type_raw;
+            aad[5] = flags;
+
+            let decrypted = crypto_sess.decrypt(counter, ciphertext, &aad)?;
+            let payload = PacketPayload::deserialize(packet_type, &decrypted)?;
+            Ok(WirePacket {
+                packet_type,
+                flags: flags & !FLAG_ENCRYPTED,
+                payload,
+            })
+        } else {
+            let payload = PacketPayload::deserialize(packet_type, payload_slice)?;
+            Ok(WirePacket {
+                packet_type,
+                flags,
+                payload,
+            })
+        }
+    }
+}
+
+impl PacketPayload {
+    /// Deserializes a typed `PacketPayload` from a validated slice based on the packet type.
+    pub fn deserialize(packet_type: PacketType, payload_slice: &[u8]) -> Result<Self, SyncError> {
         let payload = match packet_type {
             PacketType::NtpProbeRequest => {
                 if payload_slice.len() != 12 {
@@ -696,15 +902,22 @@ impl WirePacket {
                         .unwrap(),
                 ) as usize;
                 let fn_bytes_offset = fn_len_offset + 2;
-                if fn_bytes_offset + filename_len != payload_slice.len() {
+                let expected_without_hash = fn_bytes_offset + filename_len;
+                let expected_with_hash = expected_without_hash + 32;
+
+                let mut media_hash = [0u8; 32];
+                if payload_slice.len() == expected_with_hash {
+                    media_hash.copy_from_slice(&payload_slice[expected_without_hash..expected_with_hash]);
+                } else if payload_slice.len() != expected_without_hash {
                     return Err(SyncError::MalformedPayload(format!(
-                        "PeerStatus declared payload length mismatch: expected total {} bytes, got {}",
-                        fn_bytes_offset + filename_len,
+                        "PeerStatus declared payload length mismatch: expected total {} or {} bytes, got {}",
+                        expected_without_hash,
+                        expected_with_hash,
                         payload_slice.len()
                     )));
                 }
                 let filename_bytes =
-                    &payload_slice[fn_bytes_offset..fn_bytes_offset + filename_len];
+                    &payload_slice[fn_bytes_offset..expected_without_hash];
                 let filename = std::str::from_utf8(filename_bytes)
                     .map_err(|e| {
                         SyncError::MalformedPayload(format!(
@@ -722,15 +935,64 @@ impl WirePacket {
                     file_size_bytes,
                     username,
                     filename,
+                    media_hash,
+                })
+            }
+            PacketType::Reaction => {
+                if payload_slice.len() < 16 {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "Reaction expected at least 16 bytes, got {}",
+                        payload_slice.len()
+                    )));
+                }
+                let client_id = u32::from_le_bytes(payload_slice[0..4].try_into().unwrap());
+                let media_pts_ms = u64::from_le_bytes(payload_slice[4..12].try_into().unwrap());
+                let emoji_len =
+                    u16::from_le_bytes(payload_slice[12..14].try_into().unwrap()) as usize;
+                if 14 + emoji_len + 2 > payload_slice.len() {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "Reaction emoji length {} exceeds buffer boundary",
+                        emoji_len
+                    )));
+                }
+                let emoji_bytes = &payload_slice[14..14 + emoji_len];
+                let emoji = std::str::from_utf8(emoji_bytes)
+                    .map_err(|e| {
+                        SyncError::MalformedPayload(format!("Reaction invalid UTF-8 emoji: {}", e))
+                    })?
+                    .to_string();
+
+                let un_len_offset = 14 + emoji_len;
+                let username_len = u16::from_le_bytes(
+                    payload_slice[un_len_offset..un_len_offset + 2]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let un_bytes_offset = un_len_offset + 2;
+                if un_bytes_offset + username_len != payload_slice.len() {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "Reaction declared payload length mismatch: expected total {} bytes, got {}",
+                        un_bytes_offset + username_len,
+                        payload_slice.len()
+                    )));
+                }
+                let username_bytes = &payload_slice[un_bytes_offset..un_bytes_offset + username_len];
+                let username = std::str::from_utf8(username_bytes)
+                    .map_err(|e| {
+                        SyncError::MalformedPayload(format!("Reaction invalid UTF-8 username: {}", e))
+                    })?
+                    .to_string();
+
+                PacketPayload::Reaction(ReactionPayload {
+                    client_id,
+                    media_pts_ms,
+                    emoji,
+                    username,
                 })
             }
         };
 
-        Ok(Self {
-            packet_type,
-            flags,
-            payload,
-        })
+        Ok(payload)
     }
 }
 
@@ -892,7 +1154,7 @@ mod tests {
     fn test_peer_status_empty_strings() {
         let pkt = WirePacket::peer_status(0, false, false, 0, 0, "", "");
         let bytes = pkt.to_bytes();
-        assert_eq!(bytes.len(), HEADER_LEN + 26);
+        assert_eq!(bytes.len(), HEADER_LEN + 26 + 32);
 
         let parsed = WirePacket::from_bytes(&bytes).expect("parse empty strings peer status");
         assert_eq!(pkt, parsed);
@@ -928,5 +1190,69 @@ mod tests {
 
         let res = WirePacket::from_bytes(&bytes);
         assert!(matches!(res, Err(SyncError::MalformedPayload(_))));
+    }
+
+    #[test]
+    fn test_reaction_roundtrip() {
+        let pkt = WirePacket::reaction(42, 12345, "🔥", "Alice");
+        let bytes = pkt.to_bytes();
+        let parsed = WirePacket::from_bytes(&bytes).expect("parse reaction packet");
+        assert_eq!(pkt, parsed);
+
+        if let PacketPayload::Reaction(r) = parsed.payload {
+            assert_eq!(r.client_id, 42);
+            assert_eq!(r.media_pts_ms, 12345);
+            assert_eq!(r.emoji, "🔥");
+            assert_eq!(r.username, "Alice");
+        } else {
+            panic!("expected Reaction payload");
+        }
+    }
+
+    #[test]
+    fn test_peer_status_with_hash_roundtrip() {
+        let hash = [0xABu8; 32];
+        let pkt = WirePacket::peer_status_with_hash(
+            1,
+            true,
+            true,
+            5000,
+            10000,
+            "Bob",
+            "sample.mkv",
+            hash,
+        );
+        let bytes = pkt.to_bytes();
+        let parsed = WirePacket::from_bytes(&bytes).expect("parse peer status with hash");
+        assert_eq!(pkt, parsed);
+
+        if let PacketPayload::PeerStatus(p) = parsed.payload {
+            assert_eq!(p.media_hash, hash);
+        } else {
+            panic!("expected PeerStatus payload");
+        }
+    }
+
+    #[test]
+    fn test_encrypted_wire_packet_roundtrip() {
+        let crypto = RoomCryptoSession::from_password("anime-room", "secret456").unwrap();
+        let original_pkt = WirePacket::seek_command(101, 75000);
+
+        let encrypted_bytes = original_pkt
+            .to_bytes_encrypted(&crypto)
+            .expect("encrypt wire packet");
+        assert_eq!(&encrypted_bytes[0..4], b"SPNT");
+        assert_eq!(encrypted_bytes[5] & FLAG_ENCRYPTED, FLAG_ENCRYPTED);
+
+        // Parsing without crypto must fail with SyncError::Crypto
+        let err_no_crypto = WirePacket::from_bytes(&encrypted_bytes);
+        assert!(err_no_crypto.is_err());
+
+        // Parsing with correct crypto succeeds and clears FLAG_ENCRYPTED
+        let decrypted_pkt = WirePacket::from_bytes_with_crypto(&encrypted_bytes, Some(&crypto))
+            .expect("decrypt wire packet");
+        assert_eq!(decrypted_pkt.packet_type, PacketType::SeekCommand);
+        assert_eq!(decrypted_pkt.flags, FLAG_NONE);
+        assert_eq!(decrypted_pkt.payload, original_pkt.payload);
     }
 }

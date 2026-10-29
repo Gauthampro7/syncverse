@@ -78,7 +78,7 @@ fn test_wire_deserialization_corrupted_magic_and_opcodes() {
     }
 
     // 2. Corrupt packet opcode (byte 4) to invalid / unassigned opcodes
-    let invalid_opcodes = [0x00, 0x07, 0x0A, 0x0B, 0x7F, 0xFF];
+    let invalid_opcodes = [0x00, 0x07, 0x0B, 0x0C, 0x7F, 0xFF];
     for &op in &invalid_opcodes {
         let mut corrupted = bytes.clone();
         corrupted[4] = op;

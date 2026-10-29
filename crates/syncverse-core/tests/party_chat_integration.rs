@@ -225,6 +225,8 @@ fn test_playback_workers_watch_party_network_and_chat_e2e() {
             port: test_port,
             room: "glupa".to_string(),
             username: "GauthamHost".to_string(),
+            password: None,
+            enable_upnp: false,
         })
         .unwrap();
 
@@ -236,6 +238,7 @@ fn test_playback_workers_watch_party_network_and_chat_e2e() {
             addr: format!("127.0.0.1:{}", test_port),
             room: "glupa".to_string(),
             username: "AliceClient".to_string(),
+            password: None,
         })
         .unwrap();
 

@@ -54,7 +54,7 @@ fn test_peer_status_wire_roundtrips() {
         &p2.filename,
     );
     let bytes2 = pkt2.to_bytes();
-    assert_eq!(bytes2.len(), 12 + 26);
+    assert_eq!(bytes2.len(), 12 + 26 + 32);
     let parsed2 = WirePacket::from_bytes(&bytes2).expect("parse empty payload");
     assert_eq!(pkt2, parsed2);
 

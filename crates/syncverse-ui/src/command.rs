@@ -31,6 +31,10 @@ pub enum PlayerCommand {
         room: String,
         /// Local username.
         username: String,
+        /// Optional room password for ChaCha20-Poly1305 E2E encryption.
+        password: Option<String>,
+        /// Whether to attempt UPnP automatic port-forwarding.
+        enable_upnp: bool,
     },
     /// Connect to a remote watch-party room.
     ConnectParty {
@@ -40,7 +44,11 @@ pub enum PlayerCommand {
         room: String,
         /// Local username.
         username: String,
+        /// Optional room password for ChaCha20-Poly1305 E2E encryption.
+        password: Option<String>,
     },
+    /// Dispatches a floating emoji reaction to the room.
+    SendReaction(String),
     /// Leave or disconnect from the current watch-party room.
     DisconnectParty,
     /// Set local user readiness state ("Ready to Watch" checkbox).

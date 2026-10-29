@@ -32,6 +32,8 @@ pub struct RoomMember {
     pub file_size_bytes: Option<u64>,
     /// Readiness state ("Ready to Watch" vs "Not Ready").
     pub is_ready: bool,
+    /// Fast SHA-256 fingerprint hash of media container chunks. None if no hash or file loaded.
+    pub media_hash: Option<[u8; 32]>,
 }
 
 impl RoomMember {
@@ -46,6 +48,7 @@ impl RoomMember {
             duration_ms: None,
             file_size_bytes: None,
             is_ready: false,
+            media_hash: None,
         }
     }
 
@@ -70,6 +73,33 @@ impl RoomMember {
             duration_ms,
             file_size_bytes,
             is_ready,
+            media_hash: None,
+        }
+    }
+
+    /// Constructs a room member with full media, readiness metadata, and cryptographic fingerprint hash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_media_and_hash(
+        username: String,
+        is_local: bool,
+        is_host: bool,
+        rtt_ms: f64,
+        file_name: Option<String>,
+        duration_ms: Option<u64>,
+        file_size_bytes: Option<u64>,
+        is_ready: bool,
+        media_hash: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            username,
+            is_local,
+            is_host,
+            rtt_ms,
+            file_name,
+            duration_ms,
+            file_size_bytes,
+            is_ready,
+            media_hash,
         }
     }
 }
@@ -93,12 +123,21 @@ pub enum FileMatchStatus {
     Mismatch,
     /// Peer has no media loaded.
     NoFileLoaded,
+    /// Exact match with identical cryptographic SHA-256 media fingerprint.
+    ExactMatch,
+    /// Duration matches within ±2000ms but different encode/remux hash.
+    Variation,
+    /// Duration differs significantly (>2s cut difference) or different media entirely.
+    DesyncAlert,
 }
 
 impl FileMatchStatus {
     /// Returns the UI display badge label for this match status.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::ExactMatch => "[Exact Match ✔]",
+            Self::Variation => "[⚠️ Variation]",
+            Self::DesyncAlert => "[❌ Desync Alert]",
             Self::Match => "[Match ✔]",
             Self::Mismatch => "[⚠️ Mismatch]",
             Self::NoFileLoaded => "[⏳ No file loaded]",
@@ -151,6 +190,44 @@ pub fn evaluate_file_match(
     } else {
         FileMatchStatus::Mismatch
     }
+}
+
+/// Evaluates file match diagnostics utilizing cryptographic fingerprint hashes where available.
+pub fn evaluate_file_match_with_hash(
+    local_file: Option<&str>,
+    local_duration_ms: Option<u64>,
+    local_hash: Option<[u8; 32]>,
+    peer_file: Option<&str>,
+    peer_duration_ms: Option<u64>,
+    peer_hash: Option<[u8; 32]>,
+) -> FileMatchStatus {
+    let peer_file = match peer_file {
+        Some(f) if !f.trim().is_empty() => f.trim(),
+        _ => return FileMatchStatus::NoFileLoaded,
+    };
+
+    let local_file = match local_file {
+        Some(f) if !f.trim().is_empty() => f.trim(),
+        _ => return FileMatchStatus::Mismatch,
+    };
+
+    // If both peers have non-zero SHA-256 fingerprints, perform instant cryptographic match
+    if let (Some(lh), Some(ph)) = (local_hash, peer_hash) {
+        if lh != [0u8; 32] && ph != [0u8; 32] {
+            if lh == ph {
+                return FileMatchStatus::ExactMatch;
+            } else if let (Some(ld), Some(pd)) = (local_duration_ms, peer_duration_ms) {
+                if ld.abs_diff(pd) <= 2000 {
+                    return FileMatchStatus::Variation;
+                } else {
+                    return FileMatchStatus::DesyncAlert;
+                }
+            }
+        }
+    }
+
+    // Fallback to name/duration heuristic
+    evaluate_file_match(Some(local_file), local_duration_ms, Some(peer_file), peer_duration_ms)
 }
 
 /// Persistent state for the watch-party sidebar panel.
@@ -511,13 +588,39 @@ impl SidebarState {
                             // Compare peer media against local media
                             if !member.is_local {
                                 if let Some(ref local) = local_member {
-                                    let match_st = evaluate_file_match(
+                                    let match_st = evaluate_file_match_with_hash(
                                         local.file_name.as_deref(),
                                         local.duration_ms,
+                                        local.media_hash,
                                         Some(fname.as_str()),
                                         member.duration_ms,
+                                        member.media_hash,
                                     );
                                     match match_st {
+                                        FileMatchStatus::ExactMatch => {
+                                            ui.label(
+                                                egui::RichText::new("[Exact Match ✔]")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(34, 197, 94)),
+                                            );
+                                        }
+                                        FileMatchStatus::Variation => {
+                                            ui.label(
+                                                egui::RichText::new("[⚠️ Variation]")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(245, 158, 11)),
+                                            );
+                                        }
+                                        FileMatchStatus::DesyncAlert => {
+                                            ui.label(
+                                                egui::RichText::new("[❌ Desync Alert]")
+                                                    .small()
+                                                    .strong()
+                                                    .color(Color32::from_rgb(239, 68, 68)),
+                                            );
+                                        }
                                         FileMatchStatus::Match => {
                                             ui.label(
                                                 egui::RichText::new("[Match ✔]")
@@ -664,6 +767,16 @@ impl SidebarState {
         snapshot: &PlayerUiSnapshot,
         command_tx: &Sender<PlayerCommand>,
     ) {
+        // Quick reaction bar
+        ui.horizontal(|ui| {
+            for &(emoji, name) in crate::gui::reactions::REACTION_PRESETS {
+                if ui.small_button(emoji).on_hover_text(format!("React: {} (Hotkey 1-6)", name)).clicked() {
+                    let _ = command_tx.send(PlayerCommand::SendReaction(emoji.to_string()));
+                }
+            }
+        });
+        ui.add_space(2.0);
+
         ui.horizontal(|ui| {
             let input_response = ui.add_sized(
                 [ui.available_width() - 55.0, 28.0],

@@ -79,6 +79,24 @@ pub enum UiEvent {
     AudioDataDiscovered(Vec<crate::gui::dialogs::AudioTrackItem>),
     /// Discovered video stream metadata including resolution, codec, and timescale.
     VideoMetadataDiscovered(crate::gui::dialogs::VideoStreamMetadata),
+    /// Floating emoji reaction arrived from a watch-party peer.
+    FloatingReaction {
+        /// Emoji string (e.g. "❤️", "😂", "🔥").
+        emoji: String,
+        /// Username of the sender.
+        username: String,
+    },
+    /// UPnP port forwarding status update.
+    UpnpStatusUpdated {
+        /// Whether port mapping is active on router.
+        is_mapped: bool,
+        /// Public WAN IP address of the router, if discoverable.
+        external_ip: Option<String>,
+        /// Forwarded UDP port.
+        port: u16,
+        /// Diagnostic message or status.
+        message: String,
+    },
 }
 
 #[cfg(test)]

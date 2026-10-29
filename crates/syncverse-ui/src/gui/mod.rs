@@ -6,6 +6,7 @@ pub mod controls;
 pub mod dialogs;
 pub mod drag_drop;
 pub mod file_dialog;
+pub mod reactions;
 pub mod recent_files;
 pub mod sidebar;
 pub mod subtitle_overlay;
@@ -25,9 +26,11 @@ pub use dialogs::{
 };
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
 pub use file_dialog::FileDialogManager;
+pub use reactions::{ReactionParticle, ReactionSystem, REACTION_PRESETS};
 pub use recent_files::RecentFilesManager;
 pub use sidebar::{
-    evaluate_file_match, format_duration_hms, FileMatchStatus, RoomMember, SidebarState,
+    evaluate_file_match, evaluate_file_match_with_hash, format_duration_hms, FileMatchStatus,
+    RoomMember, SidebarState,
 };
 pub use subtitle_overlay::{
     compute_effective_pts, find_active_cue, find_active_cue_text, find_active_cues,

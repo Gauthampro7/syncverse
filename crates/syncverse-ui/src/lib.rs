@@ -20,15 +20,15 @@ pub use debouncer::SeekDebouncer;
 pub use error::UiError;
 pub use event::UiEvent;
 pub use gui::{
-    controls_style, create_native_options, evaluate_file_match, format_duration_hms,
-    is_supported_media, run_desktop_gui, run_desktop_player, ActiveSubtitleTrack,
-    AspectRatioOverride, ControlsBarAction, ControlsBarState, DragDropHandler,
+    controls_style, create_native_options, evaluate_file_match, evaluate_file_match_with_hash,
+    format_duration_hms, is_supported_media, run_desktop_gui, run_desktop_player,
+    ActiveSubtitleTrack, AspectRatioOverride, ControlsBarAction, ControlsBarState, DragDropHandler,
     FileDialogManager, FileMatchStatus, IntoDimension, PlaybackControlsBar,
-    RecentFilesManager, RoomMember, SidebarState, SubtitleCue, SubtitleOverlay,
-    SubtitleOverlayConfig, SubtitleTrack, SyncplayApp, VideoTextureBuffer, VideoViewport,
-    ViewportAction, ViewportDisplayMode, ViewportGeometry, VolumeControlState,
-    compute_effective_pts, find_active_cue, find_active_cue_text, find_active_cues,
-    SUPPORTED_EXTENSIONS, SUPPORTED_SPEEDS,
+    ReactionParticle, ReactionSystem, RecentFilesManager, RoomMember, SidebarState,
+    SubtitleCue, SubtitleOverlay, SubtitleOverlayConfig, SubtitleTrack, SyncplayApp,
+    VideoTextureBuffer, VideoViewport, ViewportAction, ViewportDisplayMode, ViewportGeometry,
+    VolumeControlState, compute_effective_pts, find_active_cue, find_active_cue_text,
+    find_active_cues, REACTION_PRESETS, SUPPORTED_EXTENSIONS, SUPPORTED_SPEEDS,
 };
 pub use osd::{
     calculate_alpha_dwell_fade, evaluate_tight_sync_badge, render_faded_chat_comment,

@@ -13,7 +13,8 @@ use crate::ntp::{ProbeSample, Rfc5905Filter};
 use crate::pll::{PllCorrection, PllSpeedController, PllZone};
 use crate::timeline::RoomState;
 use crate::wire::{
-    ChatMessagePayload, PacketPayload, PeerStatusPayload, WirePacket, FLAG_BARRIER_COMMIT,
+    ChatMessagePayload, PacketPayload, PeerStatusPayload, ReactionPayload, WirePacket,
+    FLAG_BARRIER_COMMIT,
 };
 
 /// Non-blocking UDP transport wrapper for watch-party synchronization.
@@ -94,6 +95,8 @@ pub struct ClientSession {
     pub file_size_bytes: u64,
     /// Peer username.
     pub username: String,
+    /// SHA-256 fingerprint hash of the loaded media.
+    pub media_hash: [u8; 32],
 }
 
 /// Host watch-party server managing UDP transport, NTP timekeeping, and barrier synchronization.
@@ -110,6 +113,7 @@ pub struct HostServer {
     scheduled_unpause_server_ms: Option<u64>,
     chat_messages: Vec<ChatMessagePayload>,
     next_chat_seq: u32,
+    reactions: Vec<ReactionPayload>,
     pending_probes: HashMap<u32, (SocketAddr, u64)>,
     next_probe_id: u32,
 }
@@ -131,6 +135,7 @@ impl HostServer {
             scheduled_unpause_server_ms: None,
             chat_messages: Vec::new(),
             next_chat_seq: 1,
+            reactions: Vec::new(),
             pending_probes: HashMap::new(),
             next_probe_id: 1,
         })
@@ -169,6 +174,7 @@ impl HostServer {
                 duration_ms: 0,
                 file_size_bytes: 0,
                 username: String::new(),
+                media_hash: [0u8; 32],
             },
         );
     }
@@ -240,6 +246,7 @@ impl HostServer {
                     duration_ms: 0,
                     file_size_bytes: 0,
                     username: String::new(),
+                    media_hash: [0u8; 32],
                 });
 
             match &packet.payload {
@@ -294,8 +301,22 @@ impl HostServer {
                         client.file_size_bytes = status.file_size_bytes;
                         client.username = status.username.clone();
                         client.filename = status.filename.clone();
+                        client.media_hash = status.media_hash;
                     }
                     // Relay PeerStatus packet to all other connected peers except sender
+                    let targets: Vec<SocketAddr> = self
+                        .clients
+                        .keys()
+                        .filter(|&&c_addr| c_addr != addr)
+                        .copied()
+                        .collect();
+                    for target in targets {
+                        let _ = self.transport.send_packet(packet, target);
+                    }
+                }
+                PacketPayload::Reaction(reaction) => {
+                    self.reactions.push(reaction.clone());
+                    // Relay reaction to all other connected peers except sender
                     let targets: Vec<SocketAddr> = self
                         .clients
                         .keys()
@@ -310,6 +331,45 @@ impl HostServer {
             }
         }
         Ok(res)
+    }
+
+    /// Drains and returns all pending received reactions from connected peers.
+    pub fn poll_reactions(&mut self) -> Vec<ReactionPayload> {
+        std::mem::take(&mut self.reactions)
+    }
+
+    /// Broadcasts a floating reaction from the host to all registered client peers.
+    pub fn broadcast_reaction(
+        &mut self,
+        emoji: &str,
+        media_pts_ms: u64,
+        username: &str,
+    ) -> Result<usize, SyncError> {
+        let packet = WirePacket::reaction(0, media_pts_ms, emoji, username);
+        let mut sent_count = 0;
+        let targets: Vec<SocketAddr> = self.clients.keys().copied().collect();
+        for addr in targets {
+            if self.transport.send_packet(&packet, addr).is_ok() {
+                sent_count += 1;
+            }
+        }
+        Ok(sent_count)
+    }
+
+    /// Prunes stale client sessions that have not communicated within the specified timeout.
+    ///
+    /// Returns the client IDs of pruned peers.
+    pub fn prune_stale_clients(&mut self, timeout: std::time::Duration) -> Vec<u32> {
+        let mut pruned = Vec::new();
+        self.clients.retain(|_addr, client| {
+            if client.last_seen.elapsed() > timeout {
+                pruned.push(client.client_id);
+                false
+            } else {
+                true
+            }
+        });
+        pruned
     }
 
     /// Drains and returns all pending received chat messages from connected peers.
@@ -434,6 +494,7 @@ impl HostServer {
                 file_size_bytes: c.file_size_bytes,
                 username: c.username.clone(),
                 filename: c.filename.clone(),
+                media_hash: c.media_hash,
             })
             .collect()
     }
@@ -524,6 +585,7 @@ pub struct ClientNode {
     is_playing: bool,
     chat_messages: Vec<ChatMessagePayload>,
     next_chat_seq: u32,
+    reactions: Vec<ReactionPayload>,
     peer_statuses: HashMap<u32, PeerStatusPayload>,
     pending_peer_statuses: Vec<PeerStatusPayload>,
 }
@@ -553,6 +615,7 @@ impl ClientNode {
             is_playing: false,
             chat_messages: Vec::new(),
             next_chat_seq: 1,
+            reactions: Vec::new(),
             peer_statuses: HashMap::new(),
             pending_peer_statuses: Vec::new(),
         })
@@ -731,11 +794,62 @@ impl ClientNode {
                         let resp = WirePacket::ntp_response(req.probe_id, req.t1_client_send_ns, t2, t3);
                         let _ = self.transport.send_packet(&resp, self.host_addr);
                     }
+                    PacketPayload::Reaction(reaction) => {
+                        self.reactions.push(reaction.clone());
+                    }
                     _ => {}
                 }
             }
         }
         Ok(res.map(|(p, _)| p))
+    }
+
+    /// Drains and returns all pending received reactions from the host server.
+    pub fn poll_reactions(&mut self) -> Vec<ReactionPayload> {
+        std::mem::take(&mut self.reactions)
+    }
+
+    /// Sends a floating reaction from this client to the host server.
+    pub fn send_reaction(
+        &mut self,
+        emoji: &str,
+        media_pts_ms: u64,
+        username: &str,
+    ) -> Result<(), SyncError> {
+        let packet = WirePacket::reaction(self.client_id, media_pts_ms, emoji, username);
+        self.transport.send_packet(&packet, self.host_addr)?;
+        Ok(())
+    }
+
+    /// Broadcasts local peer media metadata, user readiness, and media hash fingerprint to the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_peer_status_with_hash(
+        &mut self,
+        has_media: bool,
+        is_ready: bool,
+        duration_ms: u64,
+        file_size_bytes: u64,
+        username: &str,
+        filename: &str,
+        media_hash: [u8; 32],
+    ) -> Result<(), SyncError> {
+        let clean_filename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(filename);
+
+        let packet = WirePacket::peer_status_with_hash(
+            self.client_id,
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username,
+            clean_filename,
+            media_hash,
+        );
+        self.transport.send_packet(&packet, self.host_addr)?;
+        Ok(())
     }
 
     /// Drains and returns all pending received chat messages from the host server.
