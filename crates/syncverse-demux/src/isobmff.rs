@@ -931,6 +931,7 @@ impl Demuxer for IsoBmffDemuxer {
             duration_ms: Some(duration_ms),
             timescale,
             tracks: tracks_info,
+            chapters: Vec::new(),
         };
 
         // Seek reader to lowest initial sample offset if available

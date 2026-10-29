@@ -281,6 +281,7 @@ struct PlaybackSession {
     pending_video_packets: VecDeque<DemuxPacket>,
     last_demuxed_video_dts: Option<u64>,
     video_metadata: syncverse_ui::gui::dialogs::VideoStreamMetadata,
+    chapters: Vec<syncverse_demux::MediaChapter>,
 }
 
 impl PlaybackSession {
@@ -389,6 +390,7 @@ impl PlaybackSession {
             pixel_format: Some("yuv420p".to_string()),
             timescale: Some(info.timescale),
         };
+        let chapters = demuxer.chapters().to_vec();
 
         Ok(Self {
             demuxer,
@@ -405,6 +407,7 @@ impl PlaybackSession {
             pending_video_packets: VecDeque::with_capacity(64),
             last_demuxed_video_dts: None,
             video_metadata,
+            chapters,
         })
     }
 
@@ -914,6 +917,7 @@ pub fn run_playback_worker(
                             let _ = event_tx.send(UiEvent::AudioDataDiscovered(audio_items));
                             let _ = event_tx.send(UiEvent::VideoMetadataDiscovered(new_session.video_metadata.clone()));
                             let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_subtitle_tracks));
+                            let _ = event_tx.send(UiEvent::ChaptersDiscovered(new_session.chapters.clone()));
                             if let Some(at) = new_session.available_audio_tracks.first() {
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                     track_id: at.track_id,
@@ -1407,8 +1411,11 @@ pub fn run_playback_worker(
                     subtitle_delay_ms = (subtitle_delay_ms + delta_ms).clamp(-5000, 5000);
                     let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
                 }
-                PlayerCommand::CycleAspectRatio => {
-                    // Handled by UI presentation layer / video viewport
+                PlayerCommand::CycleAspectRatio
+                | PlayerCommand::NextChapter
+                | PlayerCommand::PreviousChapter
+                | PlayerCommand::TakeScreenshot => {
+                    // Handled by UI presentation layer / video viewport / MPRIS
                 }
                 PlayerCommand::SendChatMessage(text) | PlayerCommand::ExecuteSlashCommand(text) => {
                     let now = Instant::now();

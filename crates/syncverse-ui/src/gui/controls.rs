@@ -120,6 +120,8 @@ pub struct ControlsBarState {
     pub subtitle_dialog: SubtitleConfigDialog,
     /// Video configuration modal dialog.
     pub video_dialog: VideoConfigDialog,
+    /// Discovered container chapter markers.
+    pub chapters: Vec<syncverse_demux::MediaChapter>,
 }
 
 impl Default for ControlsBarState {
@@ -137,6 +139,7 @@ impl Default for ControlsBarState {
             audio_dialog: AudioConfigDialog::default(),
             subtitle_dialog: SubtitleConfigDialog::default(),
             video_dialog: VideoConfigDialog::default(),
+            chapters: Vec::new(),
         }
     }
 }
@@ -229,6 +232,12 @@ pub enum ControlsBarAction {
     OpenSubtitleSettings,
     /// Open video configuration modal dialog.
     OpenVideoSettings,
+    /// Jump forward to the start of the next chapter.
+    NextChapter,
+    /// Jump backward to the start of the current or previous chapter.
+    PreviousChapter,
+    /// Capture a lossless PNG screenshot of the current video frame.
+    TakeScreenshot,
 }
 
 /// Modern sleek dark aesthetics palette for player controls bar.
@@ -351,6 +360,23 @@ impl PlaybackControlsBar {
             );
         }
 
+        // Chapter notch markers
+        if duration_ms > 0 {
+            for chapter in &state.chapters {
+                if chapter.start_ms > 0 && chapter.start_ms < duration_ms {
+                    let ch_fraction = (chapter.start_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+                    let ch_x = rect.min.x + (ch_fraction as f32 * rect.width());
+                    painter.line_segment(
+                        [
+                            egui::pos2(ch_x, y_center - (track_height * 0.85)),
+                            egui::pos2(ch_x, y_center + (track_height * 0.85)),
+                        ],
+                        Stroke::new(1.5, egui::Color32::from_rgb(250, 204, 21)),
+                    );
+                }
+            }
+        }
+
         // Seekhead thumb rendering
         if is_active {
             painter.circle_filled(
@@ -371,7 +397,7 @@ impl PlaybackControlsBar {
             );
         }
 
-        // Hover tooltip preview (HH:MM:SS)
+        // Hover tooltip preview (HH:MM:SS with Chapter title)
         if response.hovered() && duration_ms > 0 {
             if let Some(mouse_pos) = response.hover_pos() {
                 let rel_x = ((mouse_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
@@ -382,9 +408,24 @@ impl PlaybackControlsBar {
                     ui.style_mut().visuals.window_fill = style::TOOLTIP_BG;
                     ui.style_mut().visuals.window_stroke =
                         Stroke::new(1.0, style::TOOLTIP_BORDER);
+
+                    let active_chapter = state
+                        .chapters
+                        .iter()
+                        .find(|c| hover_pts >= c.start_ms && hover_pts <= c.end_ms);
+                    let tooltip_text = if let Some(ch) = active_chapter {
+                        format!(
+                            "{} — 📌 {}",
+                            ControlsBarState::format_timestamp(hover_pts),
+                            ch.title
+                        )
+                    } else {
+                        ControlsBarState::format_timestamp(hover_pts)
+                    };
+
                     ui.add(
                         egui::Label::new(
-                            RichText::new(ControlsBarState::format_timestamp(hover_pts))
+                            RichText::new(tooltip_text)
                                 .monospace()
                                 .color(style::TEXT_PRIMARY)
                                 .size(12.0),
@@ -485,6 +526,42 @@ impl PlaybackControlsBar {
                 actions.push(ControlsBarAction::Stop);
             }
 
+            // Previous Chapter Button
+            let prev_ch_btn = egui::Button::new(
+                RichText::new("⏮")
+                    .size(13.0)
+                    .color(style::TEXT_PRIMARY),
+            )
+            .min_size(Vec2::new(28.0, 32.0))
+            .fill(style::BUTTON_BG)
+            .corner_radius(6.0);
+
+            if ui
+                .add(prev_ch_btn)
+                .on_hover_text("Previous Chapter ([)")
+                .clicked()
+            {
+                actions.push(ControlsBarAction::PreviousChapter);
+            }
+
+            // Next Chapter Button
+            let next_ch_btn = egui::Button::new(
+                RichText::new("⏭")
+                    .size(13.0)
+                    .color(style::TEXT_PRIMARY),
+            )
+            .min_size(Vec2::new(28.0, 32.0))
+            .fill(style::BUTTON_BG)
+            .corner_radius(6.0);
+
+            if ui
+                .add(next_ch_btn)
+                .on_hover_text("Next Chapter (])")
+                .clicked()
+            {
+                actions.push(ControlsBarAction::NextChapter);
+            }
+
             // Timecode HUD: Monospace HH:MM:SS / HH:MM:SS
             let current_ms = state
                 .drag_pts_ms
@@ -511,6 +588,15 @@ impl PlaybackControlsBar {
                     .clicked()
                 {
                     actions.push(ControlsBarAction::ToggleFullscreen);
+                }
+
+                // Lossless Screenshot Button (📸)
+                if ui
+                    .button(RichText::new("📸").size(14.0))
+                    .on_hover_text("Take Lossless Screenshot (F8 / Ctrl+S)")
+                    .clicked()
+                {
+                    actions.push(ControlsBarAction::TakeScreenshot);
                 }
 
                 // Watch-Party Sidebar Toggle

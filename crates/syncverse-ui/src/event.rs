@@ -97,6 +97,8 @@ pub enum UiEvent {
         /// Diagnostic message or status.
         message: String,
     },
+    /// Discovered container chapter markers.
+    ChaptersDiscovered(Vec<syncverse_demux::MediaChapter>),
 }
 
 #[cfg(test)]

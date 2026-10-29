@@ -215,6 +215,7 @@ pub struct VideoViewport {
     video_width: u32,
     video_height: u32,
     pending_frame: Option<VideoFrameRGBA>,
+    last_frame: Option<VideoFrameRGBA>,
     aspect_override: AspectRatioOverride,
     last_video_rect: Option<Rect>,
     pending_click: Option<(Instant, bool)>,
@@ -237,6 +238,7 @@ impl VideoViewport {
             video_width: 0,
             video_height: 0,
             pending_frame: None,
+            last_frame: None,
             aspect_override: AspectRatioOverride::Original,
             last_video_rect: None,
             pending_click: None,
@@ -315,6 +317,7 @@ impl VideoViewport {
     pub fn reset(&mut self) {
         self.texture = None;
         self.pending_frame = None;
+        self.last_frame = None;
         self.current_pts_ms = None;
         self.video_width = 0;
         self.video_height = 0;
@@ -344,9 +347,15 @@ impl VideoViewport {
             self.texture = Some(ctx.load_texture("video_surface", color_image, TextureOptions::LINEAR));
         }
 
+        self.last_frame = Some(frame.clone());
         self.current_pts_ms = Some(frame.pts_ms);
         self.video_width = frame.width;
         self.video_height = frame.height;
+    }
+
+    /// Returns a copy of the most recently presented video frame for lossless screenshot saving.
+    pub fn capture_frame(&self) -> Option<VideoFrameRGBA> {
+        self.last_frame.clone()
     }
 
     /// Returns the currently active video dimensions `(width, height)`.

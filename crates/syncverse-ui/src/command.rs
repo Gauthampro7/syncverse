@@ -75,6 +75,12 @@ pub enum PlayerCommand {
     AdjustSubtitleDelay(i64),
     /// Cycle video aspect ratio to the next preset mode.
     CycleAspectRatio,
+    /// Jump forward to the start of the next chapter.
+    NextChapter,
+    /// Jump backward to the start of the current or previous chapter.
+    PreviousChapter,
+    /// Capture a lossless PNG screenshot of the current video frame.
+    TakeScreenshot,
     /// Load an external subtitle file (.srt, .vtt, .ass) into the active session.
     LoadExternalSubtitle(PathBuf),
 }

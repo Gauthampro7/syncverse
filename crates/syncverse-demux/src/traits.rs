@@ -43,6 +43,19 @@ pub struct TrackInfo {
     pub codec_private: Option<Vec<u8>>,
 }
 
+/// Media chapter metadata identifying structural boundaries in container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaChapter {
+    /// Container-assigned chapter identifier.
+    pub id: i64,
+    /// Chapter title or name.
+    pub title: String,
+    /// Chapter start presentation time in milliseconds.
+    pub start_ms: u64,
+    /// Chapter end presentation time in milliseconds.
+    pub end_ms: u64,
+}
+
 /// Global container information and track inventory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerInfo {
@@ -52,6 +65,8 @@ pub struct ContainerInfo {
     pub timescale: u64,
     /// Declared media tracks.
     pub tracks: Vec<TrackInfo>,
+    /// Declared media chapters.
+    pub chapters: Vec<MediaChapter>,
 }
 
 /// A demuxed raw media packet extracted from a container.

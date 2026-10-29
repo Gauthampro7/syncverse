@@ -857,6 +857,7 @@ impl Demuxer for EbmlDemuxer {
             duration_ms: self.duration_ms,
             timescale: self.timestamp_scale_ns,
             tracks: self.tracks.clone(),
+            chapters: Vec::new(),
         };
 
         self.info = Some(info.clone());

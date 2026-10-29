@@ -6,6 +6,8 @@ pub mod controls;
 pub mod dialogs;
 pub mod drag_drop;
 pub mod file_dialog;
+pub mod inhibit;
+pub mod mpris;
 pub mod reactions;
 pub mod recent_files;
 pub mod sidebar;
@@ -26,6 +28,8 @@ pub use dialogs::{
 };
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
 pub use file_dialog::FileDialogManager;
+pub use inhibit::IdleInhibitor;
+pub use mpris::MprisManager;
 pub use reactions::{ReactionParticle, ReactionSystem, REACTION_PRESETS};
 pub use recent_files::RecentFilesManager;
 pub use sidebar::{

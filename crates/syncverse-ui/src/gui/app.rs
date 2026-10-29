@@ -107,6 +107,8 @@ pub struct SyncplayApp {
     aspect_ratio_index: usize,
     current_window_title: String,
     reaction_system: crate::gui::reactions::ReactionSystem,
+    idle_inhibitor: crate::gui::inhibit::IdleInhibitor,
+    mpris_manager: crate::gui::mpris::MprisManager,
 }
 
 impl Default for SyncplayApp {
@@ -133,7 +135,7 @@ impl Default for SyncplayApp {
             exchange,
             video_ring,
             clock,
-            command_tx,
+            command_tx: command_tx.clone(),
             event_rx,
             local_event_tx,
             local_event_rx,
@@ -159,6 +161,8 @@ impl Default for SyncplayApp {
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
             reaction_system: crate::gui::reactions::ReactionSystem::new(),
+            idle_inhibitor: crate::gui::inhibit::IdleInhibitor::new(),
+            mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
         }
     }
 }
@@ -203,7 +207,7 @@ impl SyncplayApp {
             exchange,
             video_ring,
             clock,
-            command_tx,
+            command_tx: command_tx.clone(),
             event_rx,
             local_event_tx,
             local_event_rx,
@@ -229,6 +233,8 @@ impl SyncplayApp {
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
             reaction_system: crate::gui::reactions::ReactionSystem::new(),
+            idle_inhibitor: crate::gui::inhibit::IdleInhibitor::new(),
+            mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
         };
 
         if let Some(path) = initial_file {
@@ -282,6 +288,88 @@ impl SyncplayApp {
     /// Returns the slice of all discovered and loaded subtitle track labels.
     pub fn subtitle_tracks(&self) -> &[String] {
         &self.subtitle_tracks
+    }
+
+    /// Captures the current video frame losslessly to ~/Pictures/Syncverse/ as PNG.
+    pub fn take_screenshot(&mut self, now: Instant) {
+        if let Some(frame) = self.viewport.capture_frame() {
+            let pictures_dir = std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join("Pictures").join("Syncverse"))
+                .unwrap_or_else(|_| PathBuf::from("Pictures").join("Syncverse"));
+
+            if let Err(e) = std::fs::create_dir_all(&pictures_dir) {
+                self.osd_overlay.show_notification(format!("Screenshot error: {}", e), now);
+                return;
+            }
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let filename = format!("Syncverse_Snapshot_{}.png", timestamp);
+            let target_path = pictures_dir.join(&filename);
+
+            match image::save_buffer_with_format(
+                &target_path,
+                &frame.data,
+                frame.width,
+                frame.height,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            ) {
+                Ok(_) => {
+                    self.osd_overlay.show_notification(format!("📸 Saved snapshot: {}", filename), now);
+                }
+                Err(e) => {
+                    self.osd_overlay.show_notification(format!("Screenshot failed: {}", e), now);
+                }
+            }
+        } else {
+            self.osd_overlay.show_notification("No video frame available to capture".to_string(), now);
+        }
+    }
+
+    /// Navigates to the next chapter if present, seeking to its start timestamp.
+    pub fn jump_next_chapter(&mut self, current_ms: u64, now: Instant) {
+        if self.controls_state.chapters.is_empty() {
+            return;
+        }
+        let next = self
+            .controls_state
+            .chapters
+            .iter()
+            .find(|c| c.start_ms > current_ms + 1000);
+        if let Some(ch) = next {
+            let _ = self.command_tx.send(PlayerCommand::Seek(ch.start_ms));
+            let title = if ch.title.is_empty() { "Chapter" } else { ch.title.as_str() };
+            self.osd_overlay.show_notification(format!("⏭ Next Chapter: {}", title), now);
+        }
+    }
+
+    /// Navigates to the previous chapter if present, or restarts the current chapter.
+    pub fn jump_prev_chapter(&mut self, current_ms: u64, now: Instant) {
+        if self.controls_state.chapters.is_empty() {
+            return;
+        }
+        let current_idx = self
+            .controls_state
+            .chapters
+            .iter()
+            .rposition(|c| current_ms >= c.start_ms);
+
+        if let Some(idx) = current_idx {
+            let ch = &self.controls_state.chapters[idx];
+            if current_ms > ch.start_ms + 3000 || idx == 0 {
+                let _ = self.command_tx.send(PlayerCommand::Seek(ch.start_ms));
+                let title = if ch.title.is_empty() { "Chapter" } else { ch.title.as_str() };
+                self.osd_overlay.show_notification(format!("⏮ Restart Chapter: {}", title), now);
+            } else {
+                let prev_ch = &self.controls_state.chapters[idx - 1];
+                let _ = self.command_tx.send(PlayerCommand::Seek(prev_ch.start_ms));
+                let title = if prev_ch.title.is_empty() { "Chapter" } else { prev_ch.title.as_str() };
+                self.osd_overlay.show_notification(format!("⏮ Previous Chapter: {}", title), now);
+            }
+        }
     }
 
     /// Selects the active subtitle track by index (`None` for Off/Disabled).
@@ -773,6 +861,9 @@ impl eframe::App for SyncplayApp {
                     };
                     self.osd_overlay.show_notification(toast, now);
                 }
+                UiEvent::ChaptersDiscovered(chapters) => {
+                    self.controls_state.chapters = chapters;
+                }
             }
         }
 
@@ -1084,6 +1175,21 @@ impl eframe::App for SyncplayApp {
                     ctx.request_repaint();
                 }
             }
+
+            // Chapter Navigation (PageUp: Previous, PageDown: Next)
+            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                self.jump_prev_chapter(current_ms, now);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                self.jump_next_chapter(current_ms, now);
+            }
+
+            // Lossless Screenshot Snapshot (F8 or Ctrl+S)
+            if ctx.input(|i| i.key_pressed(egui::Key::F8) || (i.modifiers.ctrl && i.key_pressed(egui::Key::S))) {
+                self.take_screenshot(now);
+            }
         }
 
         // 5. Poll background native file picker & drag-and-drop
@@ -1224,6 +1330,11 @@ impl eframe::App for SyncplayApp {
 
                         ui.separator();
 
+                        if ui.button("📸 Take Snapshot (F8 / Ctrl+S)").clicked() {
+                            ui.close();
+                            self.take_screenshot(now);
+                        }
+
                         if ui.button("Close Media").clicked() {
                             ui.close();
                             self.viewport.reset();
@@ -1246,6 +1357,19 @@ impl eframe::App for SyncplayApp {
                         if ui.button("Stop (S)").clicked() {
                             ui.close();
                             let _ = self.command_tx.send(PlayerCommand::Stop);
+                        }
+
+                        ui.separator();
+
+                        if ui.button("Previous Chapter (PageUp)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.jump_prev_chapter(current_ms, now);
+                        }
+                        if ui.button("Next Chapter (PageDown)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.jump_next_chapter(current_ms, now);
                         }
 
                         ui.separator();
@@ -1480,6 +1604,17 @@ impl eframe::App for SyncplayApp {
                         }
                         ControlsBarAction::OpenVideoSettings => {
                             self.controls_state.video_dialog.open();
+                        }
+                        ControlsBarAction::NextChapter => {
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.jump_next_chapter(current_ms, now);
+                        }
+                        ControlsBarAction::PreviousChapter => {
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.jump_prev_chapter(current_ms, now);
+                        }
+                        ControlsBarAction::TakeScreenshot => {
+                            self.take_screenshot(now);
                         }
                     }
                 }
@@ -1806,7 +1941,28 @@ impl eframe::App for SyncplayApp {
             }
         }
 
-        // 13. Drag-hover visual overlay
+        // 13. Update Linux Wayland/X11 idle inhibitor and MPRIS v2 D-Bus service
+        if snapshot.is_playing() {
+            self.idle_inhibitor.inhibit();
+        } else {
+            self.idle_inhibitor.uninhibit();
+        }
+
+        let media_title = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Syncverse");
+        self.mpris_manager.update(
+            media_title,
+            snapshot.is_playing(),
+            snapshot.media_position_pts / 1_000_000,
+            snapshot.media_duration_pts / 1_000_000,
+            self.controls_state.volume.effective_volume(),
+        );
+
+        // 14. Drag-hover visual overlay
         DragDropHandler::render_hover_overlay(&ctx);
     }
 }

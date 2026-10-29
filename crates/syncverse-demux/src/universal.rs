@@ -201,10 +201,31 @@ impl UniversalDemuxer {
             }
         };
 
+        let mut chapters = Vec::new();
+        for ch in ictx.chapters() {
+            let id = ch.id();
+            let tb = ch.time_base();
+            let tb_f64 = f64::from(tb);
+            let start_ms = (ch.start() as f64 * tb_f64 * 1000.0).max(0.0) as u64;
+            let end_ms = (ch.end() as f64 * tb_f64 * 1000.0).max(0.0) as u64;
+            let title = ch
+                .metadata()
+                .get("title")
+                .map(String::from)
+                .unwrap_or_else(|| format!("Chapter {}", id));
+            chapters.push(crate::traits::MediaChapter {
+                id,
+                title,
+                start_ms,
+                end_ms,
+            });
+        }
+
         let info = ContainerInfo {
             duration_ms,
             timescale: 1_000_000,
             tracks,
+            chapters,
         };
 
         self.time_bases = time_bases;
@@ -272,6 +293,14 @@ impl UniversalDemuxer {
     /// Returns a reference to the active container metadata, if initialized.
     pub fn container_info(&self) -> Option<&ContainerInfo> {
         self.info.as_ref()
+    }
+
+    /// Returns the slice of chapters declared in this media container.
+    pub fn chapters(&self) -> &[crate::traits::MediaChapter] {
+        self.info
+            .as_ref()
+            .map(|i| i.chapters.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Returns the FFmpeg codec parameters for a given stream index, if available.

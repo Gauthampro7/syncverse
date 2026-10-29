@@ -309,7 +309,7 @@ fn http_get(host: &str, path: &str, timeout: Duration) -> Result<String, String>
     let req = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
-         User-Agent: Syncverse/0.1.9\r\n\
+         User-Agent: Syncverse/0.2.0\r\n\
          Connection: close\r\n\
          \r\n",
         path, host
@@ -331,7 +331,7 @@ fn http_post(host: &str, path: &str, soap_action: &str, body: &str, timeout: Dur
     let req = format!(
         "POST {} HTTP/1.1\r\n\
          Host: {}\r\n\
-         User-Agent: Syncverse/0.1.9\r\n\
+         User-Agent: Syncverse/0.2.0\r\n\
          Content-Type: text/xml; charset=\"utf-8\"\r\n\
          Content-Length: {}\r\n\
          SOAPAction: {}\r\n\

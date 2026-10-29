@@ -31,6 +31,9 @@ fn test_all_player_command_variants_construction_and_equality() {
         PlayerCommand::SetSubtitleDelay(200),
         PlayerCommand::AdjustSubtitleDelay(-50),
         PlayerCommand::CycleAspectRatio,
+        PlayerCommand::NextChapter,
+        PlayerCommand::PreviousChapter,
+        PlayerCommand::TakeScreenshot,
     ];
 
     for cmd in &commands {

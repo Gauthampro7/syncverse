@@ -28,7 +28,9 @@ pub use synthetic::{
     build_synthetic_full_mkv, build_synthetic_full_mp4, get_synthetic_full_mkv,
     get_synthetic_full_mp4,
 };
-pub use traits::{ContainerInfo, DemuxPacket, Demuxer, ReadSeek, TrackInfo, TrackType};
+pub use traits::{
+    ContainerInfo, DemuxPacket, Demuxer, MediaChapter, ReadSeek, TrackInfo, TrackType,
+};
 pub use universal::UniversalDemuxer;
 pub use vint::parse_vint;
 
