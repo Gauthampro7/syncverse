@@ -205,9 +205,14 @@ impl UniversalDemuxer {
         for ch in ictx.chapters() {
             let id = ch.id();
             let tb = ch.time_base();
-            let tb_f64 = f64::from(tb);
-            let start_ms = (ch.start() as f64 * tb_f64 * 1000.0).max(0.0) as u64;
-            let end_ms = (ch.end() as f64 * tb_f64 * 1000.0).max(0.0) as u64;
+            let num = tb.numerator() as i128;
+            let den = if tb.denominator() != 0 {
+                tb.denominator() as i128
+            } else {
+                1
+            };
+            let start_ms = ((ch.start() as i128 * num * 1000) / den).clamp(0, u64::MAX as i128) as u64;
+            let end_ms = ((ch.end() as i128 * num * 1000) / den).clamp(0, u64::MAX as i128) as u64;
             let title = ch
                 .metadata()
                 .get("title")

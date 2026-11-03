@@ -209,7 +209,10 @@ impl PlayerCoordinator {
             | PlayerCommand::NextChapter
             | PlayerCommand::PreviousChapter
             | PlayerCommand::TakeScreenshot
-            | PlayerCommand::LoadExternalSubtitle(_) => {
+            | PlayerCommand::LoadExternalSubtitle(_)
+            | PlayerCommand::StepFrame { .. }
+            | PlayerCommand::ToggleLoop
+            | PlayerCommand::SetLoop(_) => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }

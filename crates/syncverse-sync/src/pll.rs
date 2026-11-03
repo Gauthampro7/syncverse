@@ -41,6 +41,8 @@ pub struct PllSpeedController {
     pub deadband_secs: f64,
     /// Hard seek threshold in seconds (1.500s = 1500ms).
     pub hard_seek_threshold_secs: f64,
+    /// Commanded target playback speed ratio (default: 1.0).
+    pub r_target: f64,
     /// Running integral accumulator in seconds.
     integral: f64,
 }
@@ -55,6 +57,7 @@ impl Default for PllSpeedController {
             r_max: 1.04,
             deadband_secs: 0.015,
             hard_seek_threshold_secs: 1.500,
+            r_target: 1.0,
             integral: 0.0,
         }
     }
@@ -71,13 +74,21 @@ impl PllSpeedController {
         self.integral = 0.0;
     }
 
-    /// Evaluates current phase drift and calculates the speed correction command.
+    /// Evaluates current phase drift and calculates the speed correction command relative to target rate `r_target`.
     ///
     /// # Arguments
     /// * `target_pts_ms` - Target media presentation timestamp from room reference timeline.
     /// * `actual_pts_ms` - Actual rendered media presentation timestamp from local clock.
     /// * `dt_secs` - Evaluation sample interval in seconds (nominally 0.2s).
-    pub fn update(&mut self, target_pts_ms: u64, actual_pts_ms: u64, dt_secs: f64) -> PllCorrection {
+    /// * `r_target` - Commanded room target speed multiplier (e.g. 1.0, 1.25, 0.75).
+    pub fn update_with_target_rate(
+        &mut self,
+        target_pts_ms: u64,
+        actual_pts_ms: u64,
+        dt_secs: f64,
+        r_target: f64,
+    ) -> PllCorrection {
+        self.r_target = r_target;
         let phase_error_ms = (target_pts_ms as f64) - (actual_pts_ms as f64);
         let e = phase_error_ms / 1000.0; // convert ms to seconds
 
@@ -85,7 +96,7 @@ impl PllSpeedController {
             // Zone 1: Deadband In-Sync (|e| < 15ms)
             // Integral accumulator held constant to prevent hunting oscillations
             PllCorrection {
-                speed_multiplier: 1.0,
+                speed_multiplier: r_target,
                 hard_seek_target: None,
                 phase_error_ms,
                 zone: PllZone::Deadband,
@@ -96,7 +107,7 @@ impl PllSpeedController {
             self.integral = i_candidate.clamp(-self.i_max, self.i_max);
 
             let delta_r = self.kp * e + self.ki * self.integral;
-            let speed = (1.0 + delta_r).clamp(self.r_min, self.r_max);
+            let speed = (r_target * (1.0 + delta_r)).clamp(r_target * self.r_min, r_target * self.r_max);
 
             PllCorrection {
                 speed_multiplier: speed,
@@ -108,12 +119,24 @@ impl PllSpeedController {
             // Zone 3: Discontinuous Hard Seek (|e| > 1500ms)
             self.reset();
             PllCorrection {
-                speed_multiplier: 1.0,
+                speed_multiplier: r_target,
                 hard_seek_target: Some(target_pts_ms),
                 phase_error_ms,
                 zone: PllZone::HardSeek,
             }
         }
+    }
+
+    /// Evaluates current phase drift and calculates the speed correction command assuming a 1.0x target rate.
+    ///
+    /// Delegates to [`PllSpeedController::update_with_target_rate`] with `r_target = 1.0`.
+    ///
+    /// # Arguments
+    /// * `target_pts_ms` - Target media presentation timestamp from room reference timeline.
+    /// * `actual_pts_ms` - Actual rendered media presentation timestamp from local clock.
+    /// * `dt_secs` - Evaluation sample interval in seconds (nominally 0.2s).
+    pub fn update(&mut self, target_pts_ms: u64, actual_pts_ms: u64, dt_secs: f64) -> PllCorrection {
+        self.update_with_target_rate(target_pts_ms, actual_pts_ms, dt_secs, 1.0)
     }
 }
 
@@ -160,5 +183,63 @@ mod tests {
             t_entered
         );
         assert!(!overshoot, "Critically damped controller must not overshoot past -15ms");
+    }
+
+    #[test]
+    fn test_pll_target_rates_scaling() {
+        let mut controller = PllSpeedController::new();
+
+        // 1.25x target rate
+        let r_125 = 1.25;
+        // Zone 1: Deadband (|e| < 15ms)
+        let c_dead = controller.update_with_target_rate(10_005, 10_000, 0.2, r_125);
+        assert_eq!(c_dead.zone, PllZone::Deadband);
+        assert!((c_dead.speed_multiplier - 1.25).abs() < 1e-9);
+
+        // Zone 2: Micro-speed steering positive error (+200ms)
+        let c_pos = controller.update_with_target_rate(10_200, 10_000, 0.2, r_125);
+        assert_eq!(c_pos.zone, PllZone::MicroSpeed);
+        assert!(c_pos.speed_multiplier > 1.25);
+        assert!(c_pos.speed_multiplier <= 1.25 * 1.04);
+        assert!(c_pos.speed_multiplier >= 1.25 * 0.96);
+
+        // Zone 2: Micro-speed steering negative error (-200ms)
+        controller.reset();
+        let c_neg = controller.update_with_target_rate(9_800, 10_000, 0.2, r_125);
+        assert_eq!(c_neg.zone, PllZone::MicroSpeed);
+        assert!(c_neg.speed_multiplier < 1.25);
+        assert!(c_neg.speed_multiplier >= 1.25 * 0.96);
+        assert!(c_neg.speed_multiplier <= 1.25 * 1.04);
+
+        // Zone 3: Hard seek (|e| > 1500ms)
+        let c_seek = controller.update_with_target_rate(12_000, 10_000, 0.2, r_125);
+        assert_eq!(c_seek.zone, PllZone::HardSeek);
+        assert_eq!(c_seek.hard_seek_target, Some(12_000));
+        assert!((c_seek.speed_multiplier - 1.25).abs() < 1e-9);
+
+        // 1.5x target rate
+        let r_150 = 1.50;
+        let c_150_dead = controller.update_with_target_rate(10_000, 10_000, 0.2, r_150);
+        assert_eq!(c_150_dead.zone, PllZone::Deadband);
+        assert!((c_150_dead.speed_multiplier - 1.50).abs() < 1e-9);
+
+        let c_150_pos = controller.update_with_target_rate(10_500, 10_000, 0.2, r_150);
+        assert!(c_150_pos.speed_multiplier <= 1.50 * 1.04 && c_150_pos.speed_multiplier >= 1.50 * 0.96);
+
+        // 0.75x target rate
+        let r_075 = 0.75;
+        let c_075_dead = controller.update_with_target_rate(10_000, 10_000, 0.2, r_075);
+        assert_eq!(c_075_dead.zone, PllZone::Deadband);
+        assert!((c_075_dead.speed_multiplier - 0.75).abs() < 1e-9);
+
+        let c_075_neg = controller.update_with_target_rate(9_600, 10_000, 0.2, r_075);
+        assert!(c_075_neg.speed_multiplier <= 0.75 * 1.04 && c_075_neg.speed_multiplier >= 0.75 * 0.96);
+
+        // Backward compatibility
+        let mut ctrl1 = PllSpeedController::new();
+        let mut ctrl2 = PllSpeedController::new();
+        let res1 = ctrl1.update(10_200, 10_000, 0.2);
+        let res2 = ctrl2.update_with_target_rate(10_200, 10_000, 0.2, 1.0);
+        assert_eq!(res1, res2);
     }
 }

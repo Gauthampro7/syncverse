@@ -66,10 +66,16 @@ impl RecentFilesManager {
         }
     }
 
-    /// Resolves `$XDG_CONFIG_HOME/syncverse/recent_files.txt`.
+    /// Resolves `$XDG_CONFIG_HOME/syncverse/recent_files.txt` on Linux,
+    /// or `%APPDATA%/syncverse/recent_files.txt` / `%USERPROFILE%/AppData/Roaming/syncverse/recent_files.txt` on Windows.
     fn config_path() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|up| PathBuf::from(up).join("AppData").join("Roaming"))
+            })
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
         Some(base.join("syncverse").join("recent_files.txt"))
     }
@@ -90,5 +96,17 @@ mod tests {
         manager.add_file(PathBuf::from("/movie_99.mkv"));
         assert_eq!(manager.recent_paths.len(), RecentFilesManager::MAX_ENTRIES);
         assert_eq!(manager.recent_paths[0], PathBuf::from("/movie_99.mkv"));
+    }
+
+    #[test]
+    fn test_config_path_resolution() {
+        let p = RecentFilesManager::config_path();
+        assert!(p.is_some(), "config_path must resolve on standard OS environments");
+        let path = p.unwrap();
+        assert!(
+            path.ends_with("syncverse/recent_files.txt")
+                || path.ends_with("syncverse\\recent_files.txt"),
+            "Path must terminate with syncverse/recent_files.txt"
+        );
     }
 }

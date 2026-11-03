@@ -1,4 +1,4 @@
-//! Long-distance high-RTT network synchronization engine for Syncplay-Alt.
+//! Long-distance high-RTT network synchronization engine for Syncverse.
 
 #![deny(warnings)]
 #![deny(missing_docs)]

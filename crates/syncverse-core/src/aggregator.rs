@@ -29,7 +29,7 @@ pub struct SubsystemMetrics {
     pub room_sequence: u64,
 }
 
-/// Centralized Telemetry Aggregator publishing unified snapshots to `syncplay-ui`.
+/// Centralized Telemetry Aggregator publishing unified snapshots to `syncverse-ui`.
 pub struct TelemetryAggregator<'a> {
     exchange: &'a TripleBufferSnapshotExchange,
 }

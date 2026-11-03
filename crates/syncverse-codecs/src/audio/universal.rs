@@ -1,4 +1,4 @@
-//! Universal Audio Decoder for `syncplay-codecs`.
+//! Universal Audio Decoder for `syncverse-codecs`.
 //!
 //! Powered by `ffmpeg-next` (`libavcodec` and `libswresample`).
 //! Decodes all standard audio codecs: AAC, MP3, Opus, Vorbis, FLAC, AC3, E-AC3, DTS, and PCM.
@@ -11,10 +11,11 @@ use ffmpeg_next::frame::Audio as AudioFrame;
 use ffmpeg_next::software::resampling::Context as ResamplerContext;
 use ffmpeg_next::{ChannelLayout, Error as FfmpegError, Packet, Rational};
 
+use super::soft_clip_sample;
 use crate::error::CodecError;
 use crate::frame::AudioFramePCM;
 
-/// Target audio sampling rate across the entire Syncplay-Alt presentation pipeline (48 kHz).
+/// Target audio sampling rate across the entire Syncverse presentation pipeline (48 kHz).
 pub const TARGET_AUDIO_SAMPLE_RATE: u32 = 48_000;
 
 /// Target audio channel count (Stereo = 2).
@@ -323,7 +324,7 @@ impl UniversalAudioDecoder {
 
         let out_samples_count = out_frame.samples();
         let plane = out_frame.plane::<f32>(0);
-        let samples: Vec<f32> = plane.iter().map(|&s| s.clamp(-1.0, 1.0)).collect();
+        let samples: Vec<f32> = plane.iter().map(|&s| soft_clip_sample(s)).collect();
 
         // Calculate PTS with millisecond precision anchored to container packet timestamp
         let frame_pts_ms = self.current_packet_pts_ms

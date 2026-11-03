@@ -139,3 +139,31 @@ python3 scripts/intent_harness.py
 # 7. End-to-End Automated Verification Script
 ./scripts/verify_phase1.sh
 ```
+
+---
+
+## 6. Autonomous Release Lifecycle, Versioning, Building & Git Deployment Protocol
+
+When any feature addition, milestone, or remediation cycle is completed, agents MUST execute the full release and deployment lifecycle automatically without requiring manual reminders:
+
+1. **Version Bumping**:
+   - Increment the workspace package version according to SemVer in:
+     - `Cargo.toml`: `[workspace.package] version = "X.Y.Z"`
+     - `crates/syncverse-sync/src/upnp.rs`: `User-Agent: Syncverse/X.Y.Z`
+     - `packaging/windows/build_installer.ps1`: `$version = "X.Y.Z"`
+     - `packaging/windows/installer.iss`: `#define MyAppVersion "X.Y.Z"`
+   - Run `cargo check --workspace --all-targets` to synchronize `Cargo.lock`.
+
+2. **Full Verification Pipeline**:
+   - All 7 verification commands in Section 5 MUST pass with 100% success, zero warnings (`#![deny(warnings)]`), zero clippy lints, and zero intent drift.
+
+3. **Optimized Release Binary Build & System Deployment**:
+   - Compile optimized release binary: `cargo build --release --workspace`
+   - Install system binary and desktop assets: `./scripts/install_linux.sh` (installs `~/.local/bin/syncverse`, updates desktop file and icon cache).
+   - Verify binary executes cleanly: `~/.local/bin/syncverse --version`.
+
+4. **Git Commit, Tag & Push**:
+   - Stage all modified files, newly added modules, tests, and metadata: `git add <files>`
+   - Create a clean semantic commit: `git commit -m "<type>(<scope>): <summary> (vX.Y.Z)"`
+   - Tag the release: `git tag vX.Y.Z`
+   - Push to remote: `git push origin main && git push origin --tags`

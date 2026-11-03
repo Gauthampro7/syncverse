@@ -1,69 +1,63 @@
-# Dispatch: Worker M1 (Auto-Update Detection & Notification)
+## 2026-10-30T22:05:04Z
+You are worker_m1, a teamwork_worker.
 
-## Objective
-Implement Milestone 1 of Syncplay-Alt Phase 5:
-1. Add `ureq` (with `tls`, `json`) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`.
-2. Implement `crates/syncplay-ui/src/gui/updater.rs`:
-   - Query GitHub Releases API asynchronously in background thread: `https://api.github.com/repos/Gauthampro7/syncplay-desktop-preview/releases/latest`.
-   - Set 5.0 second timeout and User-Agent: `syncplay-alt/<version>`.
-   - Semver parsing and normalization (`v0.1.2` -> `0.1.2`), compare against `CARGO_PKG_VERSION` (`0.1.1`).
-   - Rate limit (HTTP 403/429 with reset time), timeout, offline error handling without panicking.
-   - Action handler to open browser to download URL or release page (`open_browser_url` / `ctx.open_url`).
-3. In `crates/syncplay-ui/src/event.rs`:
-   - Add `UpdateAvailable { latest_version: String, release_url: String, download_url: Option<String> }`.
-   - Add `UpdateChecked { is_latest: bool, current_version: String }`.
-4. In `crates/syncplay-ui/src/gui/app.rs`:
-   - Top notification banner: render when `update_info` is Some and not dismissed:
-     - Title `"🚀 Update Available: v{latest}"`
-     - Action buttons: `"📥 Download"` (opens direct installer or release page), `"Release Page"`
-     - `"✖ Dismiss"` button to hide banner
-   - Help menu: add `"🔄 Check for Updates..."` item triggering manual check.
-5. Unit tests:
-   - Semver tag normalization & comparison (`v0.1.2` > `0.1.1`, `0.2.0` > `0.1.9`, invalid tags).
-   - Rate limiting and offline error handling.
+Your assigned working directory is:
+/home/gautham/syncverse/.agents/teamwork/worker_m1/
 
-## Files Owned Exclusively
-- `crates/syncplay-ui/Cargo.toml`
-- `crates/syncplay-ui/src/gui/updater.rs`
-- `crates/syncplay-ui/src/gui/app.rs`
-- `crates/syncplay-ui/src/gui/mod.rs`
-- `crates/syncplay-ui/src/event.rs`
-
-## References
-- User request: `/home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md` (read section `## 2026-10-26T11:12:06Z`)
-- Project spec: `/home/gautham/syncplay-alt/PROJECT.md`
-- Survey report: `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md`
-- Survey report: `/home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_2/handoff.md`
-
-## Invariants & Warnings
-- Zero compiler warnings (`#![deny(warnings)]`).
-- Clippy clean: `cargo clippy -p syncplay-ui -- -D warnings`.
-- Zero banned dependencies (no `mpv`, `vlc`, `sqlite`, `rocksdb`).
-- Non-blocking: NEVER execute blocking network I/O on UI rendering thread.
+MANDATORY FIRST STEP:
+Read /home/gautham/syncverse/.agents/teamwork/ORIGINAL_REQUEST.md and /home/gautham/syncverse/AGENTS.md before starting any work.
 
 MANDATORY INTEGRITY WARNING:
-DO NOT CHEAT. All implementations must be genuine. DO NOT hardcode test results, create dummy/facade implementations, or circumvent the intended task. A teamwork_preview_auditor will independently verify your work. Integrity violations WILL be detected and your work WILL be rejected.
+DO NOT CHEAT. All implementations must be genuine. DO NOT hardcode test results, create dummy/facade implementations, or circumvent the intended task. A teamwork_auditor will independently verify your work. Integrity violations WILL be detected and your work WILL be rejected.
 
-## Completion Criteria
-Run `cargo check -p syncplay-ui`, `cargo test -p syncplay-ui`, and `cargo clippy -p syncplay-ui -- -D warnings`. All must pass with 0 warnings.
-Write your completion report in `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md` and message back.
+TASK SCOPE (Milestone 1: Architectural Invariants, Standards Compliance & Mathematical Precision):
+Review the detailed survey blueprints at:
+- /home/gautham/syncverse/.agents/teamwork/explorer_p5_survey_1/handoff.md
+- /home/gautham/syncverse/.agents/teamwork/explorer_p5_survey_2/handoff.md
+- /home/gautham/syncverse/.agents/teamwork/orchestrator/PROJECT.md
 
+Implement the following genuine, high-precision improvements across the workspace:
+1. `crates/syncverse-sync/src/pll.rs` & `crates/syncverse-core/src/playback_runtime.rs`:
+   - In `pll.rs`: Extend `PllSpeedController` to track target rate `r_target`. Add `pub fn update_with_target_rate(&mut self, target_pts_ms: u64, actual_pts_ms: u64, dt_secs: f64, r_target: f64) -> PllCorrection`.
+     Scale micro-speed steering range relative to `r_target`: `(r_target * (1.0 + delta_r)).clamp(r_target * 0.96, r_target * 1.04)`.
+     In Zone 1 (Deadband), return `speed_multiplier: r_target`. Keep `pub fn update(&mut self, ...)` delegating to `update_with_target_rate(..., 1.0)` for backward compatibility. Add unit tests for non-1.0x target rates (e.g. 1.25x, 1.5x, 0.75x).
+   - In `crates/syncverse-core/src/playback_runtime.rs`: In Zone 1 (Deadband, `drift_ms <= 15`), reanchor client clock to `room_state.r_target`:
+     `let target_speed = room_state.r_target; if (speed - target_speed).abs() > 1e-4 { speed = target_speed; clock.reanchor(now, target_speed); }`
+2. `crates/syncverse-demux/src/universal.rs`:
+   - In `UniversalDemuxer::init_from_context` (around lines 207-210), replace `f64` chapter timescale math with 128-bit integer rational conversion per AGENTS.md Section 4 Rule 6:
+     `let num = tb.numerator() as i128; let den = if tb.denominator() != 0 { tb.denominator() as i128 } else { 1 };`
+     `let start_ms = ((ch.start() as i128 * num * 1000) / den).max(0) as u64;`
+     `let end_ms = ((ch.end() as i128 * num * 1000) / den).max(0) as u64;`
+3. `crates/syncverse-demux/src/subtitles/scanner.rs`:
+   - In `scan_external_subtitles`, check standard subtitle subdirectories in media directory: `subtitles/`, `Subtitles/`, `subs/`, `Subs/` for matching base names with supported extensions. Add unit tests.
+4. `crates/syncverse-codecs/src/audio/`:
+   - Implement `soft_clip_sample(s: f32) -> f32` with smooth `tanh` saturation for $|s| > 0.85$ (zero allocations).
+   - Use `soft_clip_sample` in `universal.rs` downmixed audio and in `playback_runtime.rs` volume scaling to prevent digital clipping buzz. Add unit tests verifying smooth limiting and zero distortion below 0.85.
+5. `crates/syncverse-clock/src/master_clock.rs`:
+   - Add formal `// SAFETY:` justification comments for unsafe blocks at lines 186 and 202 (proving exclusive mutable access guaranteed by writer holding `writer_lock`).
+6. `crates/syncverse-chat/src/commands.rs`:
+   - Fix panic vulnerability at line 184 in `/poll` command: safely slice remaining arguments without `.find("poll").unwrap()`. Add unit test verifying `/POLL` and `/Poll` parse without panic.
+7. `crates/syncverse-common/src/time.rs` & `path.rs`:
+   - In `time.rs`: Implement `MediaTime::from_timecode_str(s: &str) -> Result<Self, CommonError>` and `impl std::str::FromStr for MediaTime`. Add unit tests.
+   - In `path.rs`: Strip leading `/` before Windows drive letters (e.g. `/C:/...` -> `C:/...`).
+   - Clean legacy "Syncplay-Alt" docstrings in `common/src/lib.rs`, `common/src/path.rs`, `common/src/error.rs`, `sync/src/lib.rs`, `core/src/aggregator.rs`.
+8. `crates/syncverse-core/src/error.rs` & `playback_runtime.rs`:
+   - Add `Common(#[from] syncverse_common::CommonError)` to `CoreError`.
+   - Replace untyped `String` and `Box<dyn Error>` in `playback_runtime.rs` with strongly typed `CoreError`.
 
-## 2026-10-26T11:27:33Z
-You are Worker M1 for Phase 5 Milestone 1 (Auto-Update Detection & Notification).
-Your identity: worker_m1
-Your working directory: /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/
-Read your dispatch assignment in /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/DISPATCH.md and the authoritative user request in /home/gautham/syncplay-alt/.agents/teamwork/ORIGINAL_REQUEST.md (under section `## 2026-10-26T11:12:06Z`). Also read the survey report in /home/gautham/syncplay-alt/.agents/teamwork/explorer_survey_3/handoff.md.
+STANDARDS & VERIFICATION:
+- Must maintain `#![deny(warnings)]`, `#![deny(missing_docs)]` with thorough docstrings on all public items.
+- Run:
+  1. `./scripts/audit_dependencies.sh`
+  2. `cargo check --workspace --all-targets`
+  3. `cargo clippy --workspace --all-targets -- -D warnings`
+  4. `cargo test --workspace -- --nocapture`
+- Write your comprehensive completion report to:
+  /home/gautham/syncverse/.agents/teamwork/worker_m1/handoff.md
+- When finished, send a message to your parent.
 
-Implement Milestone 1:
-- Add `ureq` (with `tls`, `json`) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`.
-- Implement `crates/syncplay-ui/src/gui/updater.rs`: async background querying of GitHub Releases API, semver normalization & comparison, rate-limit/offline/timeout error handling, URL launcher.
-- Implement top notification banner in `crates/syncplay-ui/src/gui/app.rs` with 1-click download/release page button and Dismiss button.
-- Add "Check for Updates..." to Help menu.
-- Unit tests for semver comparison, update checking, error handling.
+## 2026-10-30T22:21:09Z
+**Context**: Milestone 1 Implementation Verification
+**Content**: `test_writer_core` noted a clippy warning: `collapsible_if` in `crates/syncverse-common/src/path.rs:67`.
+**Action**: Please ensure this `if` is collapsed so `cargo clippy --workspace --all-targets -- -D warnings` passes with zero warnings.
 
-MANDATORY INTEGRITY WARNING:
-DO NOT CHEAT. All implementations must be genuine. DO NOT hardcode test results, create dummy/facade implementations, or circumvent the intended task. A teamwork_preview_auditor will independently verify your work. Integrity violations WILL be detected and your work WILL be rejected.
-
-Run builds and tests: `cargo check -p syncplay-ui`, `cargo test -p syncplay-ui`, and `cargo clippy -p syncplay-ui -- -D warnings`.
-Produce your handoff report at /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md and message back when complete.

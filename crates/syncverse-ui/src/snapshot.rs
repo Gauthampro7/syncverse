@@ -53,6 +53,10 @@ pub const SNAPSHOT_FLAG_FORCE_PLAY: u64 = 0x0200;
 pub const SNAPSHOT_FLAG_LOCAL_READY: u64 = 0x0400;
 /// Status bitflag indicating a peer's loaded media mismatches local media.
 pub const SNAPSHOT_FLAG_HAS_MISMATCH: u64 = 0x0800;
+/// Status bitflag indicating audio output is currently muted.
+pub const SNAPSHOT_FLAG_MUTED: u64 = 0x1000;
+/// Status bitflag indicating loop / repeat playback mode is enabled.
+pub const SNAPSHOT_FLAG_LOOP_ENABLED: u64 = 0x2000;
 
 impl PlayerUiSnapshot {
     /// Returns true if the snapshot is internally consistent (used in concurrency audit).
@@ -89,6 +93,18 @@ impl PlayerUiSnapshot {
     #[inline]
     pub fn has_media_mismatch(&self) -> bool {
         (self.playback_state & SNAPSHOT_FLAG_HAS_MISMATCH) != 0
+    }
+
+    /// Returns true if audio output is currently muted.
+    #[inline]
+    pub fn is_muted(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_MUTED) != 0
+    }
+
+    /// Returns true if loop / repeat playback mode is active.
+    #[inline]
+    pub fn is_loop_enabled(&self) -> bool {
+        (self.playback_state & SNAPSHOT_FLAG_LOOP_ENABLED) != 0
     }
 }
 
@@ -284,5 +300,25 @@ mod tests {
         let (reads, bad) = consumer.join().unwrap();
         assert!(reads > 0);
         assert_eq!(bad, 0, "Triple buffer must exhibit zero torn reads");
+    }
+
+    #[test]
+    fn test_snapshot_status_bitflags_and_helpers() {
+        let mut snap = PlayerUiSnapshot::default();
+        assert_eq!(std::mem::size_of::<PlayerUiSnapshot>(), 72);
+        assert!(!snap.is_muted());
+        assert!(!snap.is_loop_enabled());
+
+        snap.playback_state |= SNAPSHOT_FLAG_MUTED;
+        assert!(snap.is_muted());
+        assert!(!snap.is_loop_enabled());
+
+        snap.playback_state |= SNAPSHOT_FLAG_LOOP_ENABLED;
+        assert!(snap.is_muted());
+        assert!(snap.is_loop_enabled());
+
+        snap.playback_state &= !SNAPSHOT_FLAG_MUTED;
+        assert!(!snap.is_muted());
+        assert!(snap.is_loop_enabled());
     }
 }

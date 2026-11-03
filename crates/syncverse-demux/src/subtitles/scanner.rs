@@ -1,17 +1,19 @@
-//! Filesystem scanner and language detector for external subtitles (.srt, .vtt, .ass, .ssa).
+//! Filesystem scanner and language detector for external subtitles (.srt, .vtt, .ass, .ssa, .sub).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack};
 
 use crate::subtitles::ass::parse_ass;
+use crate::subtitles::microdvd::parse_microdvd;
 use crate::subtitles::srt::parse_srt;
 use crate::subtitles::vtt::parse_vtt;
 use crate::subtitles::SubtitleParseError;
 
 /// Supported external subtitle file extensions.
-pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa"];
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa", "sub"];
 
 /// Maps ISO 639-1 / ISO 639-2 codes and common language names to normalized (code, title).
 pub fn lookup_language(token: &str) -> Option<(&'static str, &'static str)> {
@@ -265,6 +267,7 @@ pub fn parse_subtitle_file<P: AsRef<Path>>(
         "srt" => (parse_srt(&content)?, "srt".to_string()),
         "vtt" => (parse_vtt(&content)?, "vtt".to_string()),
         "ass" | "ssa" => (parse_ass(&content)?, ext),
+        "sub" => (parse_microdvd(&content, None)?, "sub".to_string()),
         other => {
             return Err(SubtitleParseError::InvalidFormat(format!(
                 "Unsupported subtitle extension: .{other}"
@@ -290,10 +293,11 @@ pub fn parse_subtitle_file<P: AsRef<Path>>(
     ))
 }
 
-/// Automatically scans the directory of `media_path` for matching external subtitles.
+/// Automatically scans the directory of `media_path` and standard subtitle subdirectories
+/// (`subtitles/`, `Subtitles/`, `subs/`, `Subs/`) for matching external subtitles.
 ///
-/// Matches any file in the same directory where the filename starts with the media
-/// file stem and has a supported extension (`.srt`, `.vtt`, `.ass`, `.ssa`).
+/// Matches any file where the filename starts with the media file stem and has a supported
+/// extension (`.srt`, `.vtt`, `.ass`, `.ssa`).
 pub fn scan_external_subtitles<P: AsRef<Path>>(media_path: P) -> Vec<SubtitleTrack> {
     let media_path = media_path.as_ref();
     let parent_dir = match media_path.parent() {
@@ -306,45 +310,65 @@ pub fn scan_external_subtitles<P: AsRef<Path>>(media_path: P) -> Vec<SubtitleTra
         None => return Vec::new(),
     };
 
+    let mut dirs_to_scan = vec![parent_dir.to_path_buf()];
+    let mut visited_dirs = HashSet::new();
+    if let Ok(canon) = parent_dir.canonicalize() {
+        visited_dirs.insert(canon);
+    }
+
+    // Standard subtitle subdirectory names commonly used in media collections
+    for sub in &["subtitles", "Subtitles", "subs", "Subs"] {
+        let sub_path = parent_dir.join(sub);
+        if sub_path.is_dir() {
+            let canon = sub_path.canonicalize().unwrap_or_else(|_| sub_path.clone());
+            if visited_dirs.insert(canon) {
+                dirs_to_scan.push(sub_path);
+            }
+        }
+    }
+
     let mut tracks = Vec::new();
-    let read_dir = match fs::read_dir(parent_dir) {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
-    // Sort entries alphabetically for deterministic track order
-    entries.sort_by_key(|e| e.file_name());
-
     let mut track_id = 1000; // Start external tracks at 1000 to avoid ID collisions with embedded tracks
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
 
-        let fname = match path.file_name().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
+    for dir in dirs_to_scan {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
         };
 
-        let ext = match path.extension().and_then(|s| s.to_str()) {
-            Some(ext) => ext.to_ascii_lowercase(),
-            None => continue,
-        };
+        let mut entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+        // Sort entries alphabetically for deterministic track order
+        entries.sort_by_key(|e| e.file_name());
 
-        if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
 
-        // Check if filename matches media stem prefix
-        if !fname.to_ascii_lowercase().starts_with(&media_stem.to_ascii_lowercase()) {
-            continue;
-        }
+            let fname = match path.file_name().and_then(|s| s.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
 
-        if let Ok(track) = parse_subtitle_file(&path, track_id, Some(media_stem)) {
-            tracks.push(track);
-            track_id += 1;
+            let ext = match path.extension().and_then(|s| s.to_str()) {
+                Some(ext) => ext.to_ascii_lowercase(),
+                None => continue,
+            };
+
+            if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
+                continue;
+            }
+
+            // Check if filename matches media stem prefix
+            if !fname.to_ascii_lowercase().starts_with(&media_stem.to_ascii_lowercase()) {
+                continue;
+            }
+
+            if let Ok(track) = parse_subtitle_file(&path, track_id, Some(media_stem)) {
+                tracks.push(track);
+                track_id += 1;
+            }
         }
     }
 
@@ -409,6 +433,44 @@ mod tests {
         assert_eq!(discovered[1].language.as_deref(), Some("fr"));
         assert_eq!(discovered[1].title, "French");
         assert_eq!(discovered[1].cues.len(), 1);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_external_subtitles_subdirectories() {
+        let temp_dir = std::env::temp_dir().join(format!("syncverse_scan_subdirs_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let movie_path = temp_dir.join("matrix.mkv");
+        fs::write(&movie_path, b"fake video").unwrap();
+
+        let subtitles_dir = temp_dir.join("subtitles");
+        let subs_dir = temp_dir.join("subs");
+        fs::create_dir_all(&subtitles_dir).unwrap();
+        fs::create_dir_all(&subs_dir).unwrap();
+
+        let srt_content = "1\n00:00:01,000 --> 00:00:03,000\nHello\n";
+        let vtt_content = "WEBVTT\n\n00:00:02.000 --> 00:00:04.000\nHallo Welt\n";
+
+        // Direct parent file
+        fs::write(temp_dir.join("matrix.en.srt"), srt_content).unwrap();
+        // File in subtitles/
+        fs::write(subtitles_dir.join("matrix.es.vtt"), vtt_content).unwrap();
+        // File in subs/
+        fs::write(subs_dir.join("matrix.de.srt"), srt_content).unwrap();
+        // Unrelated file in subtitles/
+        fs::write(subtitles_dir.join("unrelated.fr.srt"), srt_content).unwrap();
+
+        let discovered = scan_external_subtitles(&movie_path);
+        assert_eq!(discovered.len(), 3);
+
+        let languages: Vec<Option<&str>> = discovered.iter().map(|t| t.language.as_deref()).collect();
+        assert!(languages.contains(&Some("en")));
+        assert!(languages.contains(&Some("es")));
+        assert!(languages.contains(&Some("de")));
+        assert!(!languages.contains(&Some("fr")));
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);

@@ -60,8 +60,11 @@ fn test_triple_buffer_high_concurrency_stress_10khz_120hz() {
             total_pub_clone.fetch_add(1, Ordering::Relaxed);
             seq += 1;
 
-            // Target ~10 kHz pacing: sleep 100 µs (or spin/yield)
-            thread::sleep(Duration::from_micros(100));
+            // Target ~10 kHz pacing: spin/yield for ~100 µs
+            let step_start = Instant::now();
+            while step_start.elapsed() < Duration::from_micros(100) {
+                std::hint::spin_loop();
+            }
         }
 
         stop_flag.store(true, Ordering::Release);

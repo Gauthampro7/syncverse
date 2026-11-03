@@ -397,6 +397,26 @@ impl ShortcutsDialog {
                             ui.label("Seek Forward 30 seconds");
                             ui.end_row();
 
+                            ui.label(RichText::new("Ctrl + Left Arrow").monospace().strong());
+                            ui.label("Seek Backward 60 seconds");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + Right Arrow").monospace().strong());
+                            ui.label("Seek Forward 60 seconds");
+                            ui.end_row();
+
+                            ui.label(RichText::new(", (Comma) / . (Period)").monospace().strong());
+                            ui.label("Step 1 Frame Backward / Forward (~42ms) while Paused");
+                            ui.end_row();
+
+                            ui.label(RichText::new("L / Ctrl + L").monospace().strong());
+                            ui.label("Toggle Repeat / Loop Playback Mode");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + V").monospace().strong());
+                            ui.label("Open Media File Path or URI from Clipboard");
+                            ui.end_row();
+
                             ui.label(RichText::new("S").monospace().strong());
                             ui.label("Stop Playback & Rewind to 00:00:00");
                             ui.end_row();
@@ -1214,6 +1234,8 @@ pub enum SubtitleConfigAction {
     LoadExternal(PathBuf),
     /// Set subtitle presentation delay offset in milliseconds [-5000, 5000].
     SetDelayMs(i64),
+    /// Update subtitle styling and appearance configuration.
+    UpdateConfig(crate::gui::subtitle_overlay::SubtitleOverlayConfig),
 }
 
 /// Modal dialog for subtitle track selection, external file loading, and sync timing.
@@ -1232,11 +1254,19 @@ pub struct SubtitleConfigDialog {
     is_file_dialog_active: bool,
     /// Transient status message (e.g. "Loaded external subtitle: movie.en.srt").
     pub status_message: Option<String>,
+    /// Subtitle appearance and overlay styling configuration.
+    pub overlay_config: crate::gui::subtitle_overlay::SubtitleOverlayConfig,
+    /// Font scaling percentage [50.0, 200.0] relative to default baseline (100% = 0.035).
+    pub font_scale_percent: f32,
+    /// Background pill fill opacity percentage [0.0, 100.0].
+    pub background_opacity_percent: f32,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for SubtitleConfigDialog {
     fn default() -> Self {
+        let overlay_config = crate::gui::subtitle_overlay::SubtitleOverlayConfig::default();
+        let background_opacity_percent =
+            (overlay_config.pill_background_color.a() as f32 / 255.0) * 100.0;
         Self {
             is_open: false,
             tracks: Vec::new(),
@@ -1245,6 +1275,9 @@ impl Default for SubtitleConfigDialog {
             file_dialog_rx: None,
             is_file_dialog_active: false,
             status_message: None,
+            overlay_config,
+            font_scale_percent: 100.0,
+            background_opacity_percent,
         }
     }
 }
@@ -1258,11 +1291,37 @@ impl std::fmt::Debug for SubtitleConfigDialog {
             .field("delay_ms", &self.delay_ms)
             .field("is_file_dialog_active", &self.is_file_dialog_active)
             .field("status_message", &self.status_message)
+            .field("overlay_config", &self.overlay_config)
+            .field("font_scale_percent", &self.font_scale_percent)
+            .field("background_opacity_percent", &self.background_opacity_percent)
             .finish()
     }
 }
 
 impl SubtitleConfigDialog {
+    /// Sets the subtitle overlay configuration and synchronizes internal slider percentages.
+    pub fn set_overlay_config(
+        &mut self,
+        config: crate::gui::subtitle_overlay::SubtitleOverlayConfig,
+    ) {
+        self.font_scale_percent =
+            (config.font_scale_ratio / 0.035 * 100.0).clamp(50.0, 200.0);
+        self.background_opacity_percent =
+            (config.pill_background_color.a() as f32 / 255.0 * 100.0).clamp(0.0, 100.0);
+        self.overlay_config = config;
+    }
+
+    /// Returns a reference to the active subtitle overlay configuration.
+    pub fn overlay_config(&self) -> &crate::gui::subtitle_overlay::SubtitleOverlayConfig {
+        &self.overlay_config
+    }
+
+    /// Returns a mutable reference to the active subtitle overlay configuration.
+    pub fn overlay_config_mut(
+        &mut self,
+    ) -> &mut crate::gui::subtitle_overlay::SubtitleOverlayConfig {
+        &mut self.overlay_config
+    }
     /// Constructs a new `SubtitleConfigDialog`.
     pub fn new() -> Self {
         Self::default()
@@ -1523,6 +1582,67 @@ impl SubtitleConfigDialog {
                     actions.push(SubtitleConfigAction::SetDelayMs(self.delay_ms));
                 }
 
+                ui.add_space(8.0);
+                ui.separator();
+
+                // 4. Subtitle Typography & Appearance Styling Controls
+                ui.heading("Subtitle Appearance & Styling");
+                ui.label(
+                    RichText::new("Customize subtitle font scaling, color, translucent pill opacity, and drop shadow.")
+                        .small()
+                        .color(Color32::from_rgb(148, 163, 184)),
+                );
+
+                let mut config_changed = false;
+
+                // Font scale slider (50% to 200%)
+                ui.horizontal(|ui| {
+                    ui.label("Font Scale:");
+                    let prev_scale = self.font_scale_percent;
+                    let scale_slider = egui::Slider::new(&mut self.font_scale_percent, 50.0..=200.0)
+                        .suffix("%")
+                        .custom_formatter(|n, _| format!("{:.0}%", n));
+                    if ui.add(scale_slider).changed() || (self.font_scale_percent - prev_scale).abs() > 0.01 {
+                        let factor = self.font_scale_percent / 100.0;
+                        self.overlay_config.font_scale_ratio = 0.035 * factor;
+                        self.overlay_config.min_font_size = 14.0 * factor;
+                        self.overlay_config.max_font_size = 36.0 * factor;
+                        config_changed = true;
+                    }
+                });
+
+                // Text color edit button & Outline shadow toggle
+                ui.horizontal(|ui| {
+                    ui.label("Text Color:");
+                    if ui.color_edit_button_srgba(&mut self.overlay_config.text_color).changed() {
+                        config_changed = true;
+                    }
+
+                    ui.add_space(16.0);
+
+                    if ui.checkbox(&mut self.overlay_config.enable_shadow, "Outline / Drop Shadow").changed() {
+                        config_changed = true;
+                    }
+                });
+
+                // Background fill opacity slider (0% to 100%)
+                ui.horizontal(|ui| {
+                    ui.label("Background Fill Opacity:");
+                    let opacity_slider = egui::Slider::new(&mut self.background_opacity_percent, 0.0..=100.0)
+                        .suffix("%")
+                        .custom_formatter(|n, _| format!("{:.0}%", n));
+                    if ui.add(opacity_slider).changed() {
+                        let alpha_u8 = ((self.background_opacity_percent / 100.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+                        let [r, g, b, _] = self.overlay_config.pill_background_color.to_array();
+                        self.overlay_config.pill_background_color = Color32::from_rgba_unmultiplied(r, g, b, alpha_u8);
+                        config_changed = true;
+                    }
+                });
+
+                if config_changed {
+                    actions.push(SubtitleConfigAction::UpdateConfig(self.overlay_config.clone()));
+                }
+
                 ui.add_space(10.0);
                 ui.separator();
 
@@ -1717,5 +1837,23 @@ mod tests {
             let _ = sub_dlg.show(ctx);
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_subtitle_styling_controls() {
+        let mut dlg = SubtitleConfigDialog::new();
+        assert_eq!(dlg.font_scale_percent, 100.0);
+        assert!(dlg.overlay_config.enable_shadow);
+
+        let custom = crate::gui::subtitle_overlay::SubtitleOverlayConfig {
+            font_scale_ratio: 0.070, // 200%
+            enable_shadow: false,
+            ..Default::default()
+        };
+        dlg.set_overlay_config(custom);
+
+        assert!((dlg.font_scale_percent - 200.0).abs() < 1e-2);
+        assert!(!dlg.overlay_config.enable_shadow);
+        assert_eq!(dlg.overlay_config().font_scale_ratio, 0.070);
     }
 }

@@ -503,9 +503,9 @@ class NaiveDisjointClock:
         new_pts = self.current_pts(now)
         # Step 2: sequential non-atomic write
         self.anchor_pts = new_pts
-        time.sleep(0.001)  # Context switch / interleaving window
+        time.sleep(0.005)  # Context switch / interleaving window
         self.anchor_wall = now
-        time.sleep(0.001)
+        time.sleep(0.005)
         self.speed = new_speed
 
 class SeqLockSnapshotClock:

@@ -1,77 +1,80 @@
-# BRIEFING — 2026-10-26T11:40:00Z
+# BRIEFING — 2026-10-31T03:58:30+05:30
 
 ## Mission
-Phase 5 Milestone 1: Auto-Update Detection & Notification (GitHub Releases API, semver comparison, non-blocking background check, UI banner & Help menu action).
+Implement Milestone 1 improvements across the Syncverse workspace: PLL target rate tracking, chapter timescale 128-bit math, subtitle subfolder scanning, audio soft-clipping with tanh saturation, MasterClock safety docs, /poll command case-insensitive parsing, MediaTime timecode parsing & Windows path fix & legacy docstring cleanup, and strongly typed CoreError in playback runtime.
 
 ## 🔒 My Identity
-- Archetype: teamwork_preview_worker
-- Roles: implementer, qa, specialist
-- Working directory: /home/gautham/syncplay-alt/.agents/teamwork/worker_m1/
-- Original parent: 1a21f3c9-f57a-4ad4-b306-97b4ba0e698e
-- Milestone: milestone_1 (Foundation Specifications & OpenSpec Architecture)
-- Phase 5 Parent: ad8bd8cc-722a-48fc-97f9-4ff7f3c97d5d
-- Phase 5 Milestone: Phase 5 Milestone 1 (Auto-Update Detection & Notification)
+- Archetype: teamwork_worker
+- Roles: implementer, qa
+- Working directory: /home/gautham/syncverse/.agents/teamwork/worker_m1/
+- Original parent: 3feda53a-5598-4b7c-86b8-98dbeb7556bd
+- Milestone: Milestone 1: Architectural Invariants, Standards Compliance & Mathematical Precision
 
 ## 🔒 Key Constraints
-- Pure-Rust implementation principles: zero external C/C++ codec dependencies (no FFmpeg, no libav, no GStreamer).
-- All specifications in `openspec/specs/<subsystem>/spec.md` must use RFC-2119 keywords in `### Requirement: <Name>` blocks and testable `#### Scenario: <Name>` blocks with concrete Given/When/Then criteria.
-- Change proposals in `openspec/changes/` must contain ordered dependency graphs, deliverables, affected crates, and verification commands.
-- Absolute integrity: no dummy implementations, no hardcoded strings or verification shortcuts.
-- Phase 5 constraints:
-  - Zero banned dependencies (no mpv, vlc, sqlite, rocksdb).
-  - Pure non-blocking network I/O: NEVER execute blocking HTTP or socket I/O on UI rendering thread.
-  - Deny compiler warnings and clippy warnings: `#![deny(warnings)]` and `cargo clippy -p syncplay-ui -- -D warnings`.
-  - Genuine implementations: real semver parsing, real error types, real GitHub Release schema parsing, real browser URL launcher.
+- Must maintain `#![deny(warnings)]`, `#![deny(missing_docs)]` with thorough docstrings on all public items.
+- Strict adherence to AGENTS.md: zero banned dependencies, no external players/databases, strongly typed errors.
+- Genuine implementations only: no hardcoding, no facades, no circumventing tasks.
+- All public items documented; all unsafe blocks formally justified with `// SAFETY:`.
 
 ## Current Parent
-- Conversation ID: ad8bd8cc-722a-48fc-97f9-4ff7f3c97d5d
-- Updated: 2026-10-26T11:40:00Z
+- Conversation ID: 3feda53a-5598-4b7c-86b8-98dbeb7556bd
+- Updated: 2026-10-30T22:21:09Z
 
 ## Task Summary
-- **What to build**:
-  1. Add `ureq` (features `["tls", "json"]`) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`.
-  2. Implement `crates/syncplay-ui/src/gui/updater.rs`: async background query to GitHub Releases API, 5s timeout, User-Agent header, semver tag parsing/normalization, rate-limit / timeout / offline handling, browser URL launch.
-  3. Extend `crates/syncplay-ui/src/event.rs` with update events (`UpdateAvailable`, `UpdateChecked`, `UpdateFailed`).
-  4. Top notification banner in `crates/syncplay-ui/src/gui/app.rs` with 1-click Download / Release Page button and Dismiss button.
-  5. Help menu item: `"🔄 Check for Updates..."`.
-  6. Comprehensive unit tests for semver normalization, update comparison, rate limiting, and error handling.
-- **Success criteria**:
-  - `cargo check -p syncplay-ui` passes cleanly (0 warnings).
-  - `cargo test -p syncplay-ui` passes cleanly (all 71 tests passing).
-  - `cargo clippy -p syncplay-ui -- -D warnings` passes with 0 warnings.
-  - `./scripts/audit_dependencies.sh` passes with 0 violations.
-  - `python3 scripts/intent_harness.py` passes 100.0%.
+- **What to build**: Implement 8 genuine, high-precision improvements across the workspace as detailed in DISPATCH.md.
+- **Success criteria**: Zero compiler warnings, zero clippy violations, `./scripts/audit_dependencies.sh` passes, `cargo test --workspace` passes with new unit tests.
+- **Interface contracts**: `PROJECT.md`, `AGENTS.md`
+- **Code layout**: `crates/syncverse-*`
 
 ## Key Decisions Made
-- Used `ureq` (features tls, json) with 5.0s timeout and User-Agent: `syncplay-alt/<version>`.
-- Integrated background thread worker with `egui::Context::request_repaint()` wakeup.
-- Extracted `check_rate_limit` and tested with real local mock TCP HTTP server.
-- Supported both Linux (`xdg-open`), Windows (`cmd /c start`), macOS (`open`), and `ctx.open_url`.
+- `pll.rs`: Extended `PllSpeedController` with `r_target: f64` and `update_with_target_rate(..., r_target)`. Scaled steering range: `(r_target * (1.0 + delta_r)).clamp(r_target * self.r_min, r_target * self.r_max)`.
+- `playback_runtime.rs`: In Zone 1 (Deadband, `drift_ms <= 15`), reanchored client clock to `room_state.r_target` when `(speed - target_speed).abs() > 1e-4`. Scaled Zone 2 micro-speed clamp by `target_speed`.
+- `universal.rs`: Replaced `f64` chapter timescale math with 128-bit integer rational conversion `((ch.start() as i128 * num * 1000) / den).max(0) as u64`.
+- `subtitles/scanner.rs`: Added search paths for `subtitles/`, `Subtitles/`, `subs/`, `Subs/` relative to media directory.
+- `audio/mod.rs`: Implemented `soft_clip_sample(s: f32) -> f32` with smooth `tanh` saturation for $|s| > 0.85$ ($0.85 + 0.15 \cdot \tanh((|s|-0.85)/0.15)$) with sign restoration. Integrated into `universal.rs` downmixer and `playback_runtime.rs` volume scaling.
+- `master_clock.rs`: Documented formal `// SAFETY:` proofs for `UnsafeCell` access under `writer_lock`.
+- `commands.rs`: Case-insensitive `/poll` prefix parsing using command length slice without unwrap.
+- `time.rs` & `path.rs`: Implemented `MediaTime::from_timecode_str` and `FromStr`. Normalized Windows drive letters in `normalize_target_path`. Collapsed nested if to satisfy clippy.
+- `error.rs` & `playback_runtime.rs`: Added `Common(#[from] CommonError)` to `CoreError`. Removed untyped `String` and `Box<dyn Error>`.
 
 ## Artifact Index
-- `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/DISPATCH.md` — Ingested dispatch instructions.
-- `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/progress.md` — Live progress heartbeat.
-- `/home/gautham/syncplay-alt/.agents/teamwork/worker_m1/handoff.md` — Final 5-component handoff report.
-- `crates/syncplay-ui/Cargo.toml` — Added `ureq`, `semver`, `serde`, `serde_json`.
-- `crates/syncplay-ui/src/gui/updater.rs` — Updater module implementation and tests.
-- `crates/syncplay-ui/src/event.rs` — `UiEvent` update variants.
-- `crates/syncplay-ui/src/gui/app.rs` — Top notification banner and Help menu integration.
-- `crates/syncplay-ui/src/gui/mod.rs` — Export updater module.
+- `DISPATCH.md` — Task assignment & updates
+- `BRIEFING.md` — Persistent agent memory
+- `progress.md` — Liveness heartbeat and progress tracking
+- `handoff.md` — 5-component completion report
 
 ## Change Tracker
 - **Files modified**:
-  - `crates/syncplay-ui/Cargo.toml`: Added `ureq = { version = "2.12", features = ["tls", "json"] }`, `semver = "1.0"`, `serde`, `serde_json`.
-  - `crates/syncplay-ui/src/event.rs`: Added `UpdateAvailable`, `UpdateChecked`, `UpdateFailed`.
-  - `crates/syncplay-ui/src/gui/updater.rs`: Created updater module with full implementation and unit tests.
-  - `crates/syncplay-ui/src/gui/mod.rs`: Exported `updater` and its types.
-  - `crates/syncplay-ui/src/gui/app.rs`: Integrated `UpdateBannerInfo`, top notification banner, transient toast, startup check, and Help menu item.
-- **Build status**: Clean (0 errors, 0 warnings).
-- **Pending issues**: None.
+  - `crates/syncverse-sync/src/pll.rs`: Target rate tracking and tests
+  - `crates/syncverse-sync/src/transport.rs`: Wired `r_target` from room state to PLL
+  - `crates/syncverse-core/src/playback_runtime.rs`: Zone 1 clock reanchoring, CoreError migration, soft clipping
+  - `crates/syncverse-core/src/coordinator.rs`: StepFrame and Loop command handling
+  - `crates/syncverse-core/src/error.rs`: Added CommonError variant
+  - `crates/syncverse-demux/src/universal.rs`: 128-bit integer chapter timescale conversion
+  - `crates/syncverse-demux/src/subtitles/scanner.rs`: Subtitle subfolders scanning and tests
+  - `crates/syncverse-codecs/src/audio/mod.rs`: `soft_clip_sample` function and tests
+  - `crates/syncverse-codecs/src/audio/universal.rs`: Applied `soft_clip_sample` to downmixing
+  - `crates/syncverse-codecs/src/lib.rs`: Re-exported `soft_clip_sample`
+  - `crates/syncverse-clock/src/master_clock.rs`: Added formal `// SAFETY:` comments
+  - `crates/syncverse-chat/src/commands.rs`: Fixed `/poll` case handling and tests
+  - `crates/syncverse-common/src/time.rs`: Added `from_timecode_str` and `FromStr`
+  - `crates/syncverse-common/src/path.rs`: Windows drive prefix normalization and clippy collapsible_if fix
+  - `crates/syncverse-common/src/lib.rs`: Cleaned legacy docstrings
+  - `crates/syncverse-common/src/error.rs`: Cleaned legacy docstrings
+  - `crates/syncverse-sync/src/lib.rs`: Cleaned legacy docstrings
+  - `crates/syncverse-core/src/aggregator.rs`: Cleaned legacy docstrings
+- **Build status**: PASS (`cargo check`, `cargo clippy`, `cargo test`, `intent_harness`, `verify_phase1`)
+- **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: Passed. 71/71 tests in `syncplay-ui` pass. Workspace check & test pass.
-- **Lint status**: Passed with 0 warnings (`cargo clippy -p syncplay-ui -- -D warnings`).
-- **Tests added/modified**: 11 unit tests in `crates/syncplay-ui/src/gui/updater.rs` covering semver normalization, comparisons, JSON parsing, rate limiting conditions, end-to-end mock HTTP server, and offline handling.
+- **Build/test result**: PASS (100% of workspace tests passing)
+- **Lint status**: PASS (0 clippy warnings with `-D warnings`)
+- **Tests added/modified**:
+  - `crates/syncverse-sync/src/pll.rs`: `test_pll_target_rates_scaling`
+  - `crates/syncverse-demux/src/subtitles/scanner.rs`: `test_scan_external_subtitles_subdirectories`
+  - `crates/syncverse-codecs/src/audio/mod.rs`: `test_soft_clip_passthrough_linear`, `test_soft_clip_saturation_and_bounds`, `test_soft_clip_symmetry_and_monotonicity`
+  - `crates/syncverse-chat/src/commands.rs`: `test_parse_poll_case_insensitivity_and_empty`
+  - `crates/syncverse-common/src/time.rs`: `test_from_timecode_str_and_from_str`
 
 ## Loaded Skills
-- None configured.
+None

@@ -419,3 +419,43 @@ fn test_render_hotkeys_footer_narrow_terminal() {
         assert!(!footer.is_empty());
     }
 }
+
+#[test]
+fn test_interactive_player_slash_command_mute_handling() {
+    let mut player = InteractivePlayer::new("synthetic-full-mkv");
+    let now = Instant::now();
+
+    assert!(!player.is_muted);
+
+    // /mute on
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/mute on\n", now);
+    assert!(player.is_muted);
+    assert!(player.status_message.as_ref().unwrap().0.contains("muted"));
+
+    // /mute on again (idempotent, remains muted)
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/mute on\n", now);
+    assert!(player.is_muted);
+
+    // /mute off
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/mute off\n", now);
+    assert!(!player.is_muted);
+    assert!(player.status_message.as_ref().unwrap().0.contains("unmuted"));
+
+    // /unmute
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/unmute\n", now);
+    assert!(!player.is_muted);
+
+    // /mute (toggle)
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/mute\n", now);
+    assert!(player.is_muted);
+
+    // /mute (toggle again)
+    player.input_mode = PlayerInputMode::CommandBar;
+    player.handle_command_bar_input(b"/mute\n", now);
+    assert!(!player.is_muted);
+}

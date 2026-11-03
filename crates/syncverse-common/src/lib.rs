@@ -1,4 +1,4 @@
-//! Common foundational types, readers, CRC32, and error definitions for Syncplay-Alt.
+//! Common foundational types, readers, CRC32, and error definitions for Syncverse.
 
 #![deny(warnings)]
 #![deny(missing_docs)]

@@ -18,9 +18,9 @@ pub use announcements::{
 };
 
 pub use commands::{
-    format_sync_status_report, parse_time_to_ms, ActivePoll, Bookmark, ClipDefinition,
-    DispatchAction, ParsedCommand, ParsedSlashCommand, SlashCommandDispatcher, SlashCommandParser,
-    SyncDiagnostics,
+    format_help, format_sync_status_report, format_who_report, parse_delay_ms, parse_time_to_ms,
+    ActivePoll, Bookmark, ClipDefinition, DispatchAction, ParsedCommand, ParsedSlashCommand,
+    RoomMemberSummary, SlashCommandDispatcher, SlashCommandParser, SyncDiagnostics,
 };
 pub use error::ChatError;
 pub use export::{export_history_json, export_transcript_markdown, TranscriptFormat};

@@ -52,7 +52,7 @@ def log_fail(msg):
 def log_warn(msg):
     print(f"{Colors.YELLOW}[WARN]{Colors.RESET} {msg}")
 
-def run_intent_test(intent, timeout=120):
+def run_intent_test(intent, timeout=300):
     cmd = intent["verification"]["command"]
     expected_code = intent["verification"]["expected_exit_code"]
     

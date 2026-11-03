@@ -1,34 +1,35 @@
 # Progress Tracking — Orchestrator
 
 ## Current Status
-Last visited: 2026-10-27T20:16:00Z
-- [x] Phase 1: Feature Audit and Discovery (Single subagent survey) [DONE]
-- [x] Phase 2: Parallel Implementation & Verification Panel (Iteration 1) [COMPLETED]
-- [x] Phase 3: Gate Evaluation (Iteration 1) [FAIL - VICTORY REJECTED by Forensic/Victory Auditor]
-- [x] Phase 4 (Iteration 2): Remediation of End-to-End Subtitle Wiring, Demuxing, Scanning, Manual Loading & Hotkey Presentation [DONE - PASS]
-  - [x] explorer_remediation: Architectural mapping and blueprint completed [DONE]
-  - [x] worker_e2e_remediation: All 6 points implemented and verified [DONE]
-  - [x] reviewer_remediation: Independent code review and workspace verification [APPROVE]
-  - [x] challenger_remediation: Adversarial edge cases and stress testing [APPROVE / VERIFIED]
-  - [x] auditor_remediation: Forensic integrity audit of all 6 points [CLEAN]
-- [x] Phase 5: Final Gate Evaluation & Milestone Completion [DONE - ALL PASS]
+Last visited: 2026-10-30T23:00:00Z
+- [x] Phase 0: Multi-Angle Codebase & Commit History Survey [DONE]
+- [x] Phase 1: Survey Synthesis & Feature Inventory Update in PROJECT.md [DONE]
+- [x] Phase 2: Parallel High-Velocity Execution [DONE]
+  - [x] worker_m1: Non-UI core crates implementation [DONE]
+  - [x] worker_p5_ui: Desktop UI & snapshot implementation [DONE]
+  - [x] test_writer_core: Core & invariants test suite [DONE - 28/28 tests passing]
+  - [x] test_writer_ui: UI & snapshot test suite [DONE - 22/22 tests passing]
+- [x] Phase 3: Parallel Verification Panel (Iteration 1) [EVALUATED]
+  - [x] reviewer_p5_1: Core subsystems review [VERDICT: APPROVE]
+  - [x] reviewer_p5_2: UI & controls review [VERDICT: APPROVE]
+  - [x] challenger_p5_1: Core adversarial testing [VERDICT: REQUEST_CHANGES - /seek multiplication overflow panic]
+  - [x] challenger_p5_2: UI adversarial testing [VERDICT: APPROVE]
+  - [x] auditor_p5_1: Full forensic integrity audit [VERDICT: CLEAN]
+- [x] Phase 4: Targeted Remediation & Re-Verification Gate (Iteration 2) [DONE]
+  - [x] worker_remediation_p5: Implemented /seek overflow bounds, deadband reanchor, timescale saturation, and NaN audio handling [DONE]
+  - [x] challenger_remediation_p5 (d9cbcac0-5508-40eb-97a4-d949488c4afa): Re-running adversarial challenges [VERDICT: APPROVE]
+  - [x] auditor_remediation_p5 (9e9df5bc-a60b-467f-8204-334f084572dd): Re-running forensic integrity audit [VERDICT: CLEAN]
 
 ## Iteration Status
-Current iteration: 2 / 32 (Passed on Iteration 2)
+Current iteration: 2 / 32
 
-## Milestones
-- [x] Milestone 1: Baseline Architecture & Parallel Module Implementation [DONE]
-- [x] Milestone 2: Remediation of End-to-End Subtitle Detection, Manual Loading, and Cycling Wiring [DONE]
-- [x] Milestone 3: Full-Spectrum Gate Verification & Forensic Audit [DONE - PASS]
+## Gate Status
+- Iteration 1 Gate Result: **FAIL** (challenger_p5_1 REQUEST_CHANGES)
+- Iteration 2 Gate Result: **PASS** (reviewer_p5_1 APPROVE, reviewer_p5_2 APPROVE, challenger_p5_2 APPROVE, challenger_remediation_p5 APPROVE, auditor_remediation_p5 CLEAN)
 
 ## Active Spawns
-- None. All 16 subagents completed and retired.
+- None (All 15 subagents completed)
 
 ## Retrospective Notes
-- Iteration 2 successfully resolved all 6 defects raised by `victory_auditor_7`:
-  1. `playback_runtime.rs`: `subtitle_tracks: Vec::new()` was eliminated and replaced with genuine discovered subtitle track labels and cue structures.
-  2. `PlaybackSession::open`: discovers container embedded tracks and scans external files with `scan_external_subtitles`.
-  3. `app.rs`: `load_file` synchronously scans external subtitles; `SubtitleConfigAction::LoadExternal` genuinely parses `.srt`, `.vtt`, `.ass`.
-  4. `V`/`C` cycling hotkey sequentially advances through all tracks and Off state, updating `active_subtitle_cues` and OSD notifications.
-  5. Replaced mock closure test with authentic integration test `test_end_to_end_media_playback_with_subtitles` and edge-case stress tests.
-- All 16 subagents across both iterations have delivered comprehensive evidence with zero warnings under `#![deny(warnings)]`, zero clippy warnings, zero banned dependencies, and a clean audit verdict.
+- Remediation fixes completed and verified by worker. Dispatched fresh challenger and auditor to verify Iteration 2.
+- Both challenger_remediation_p5 and auditor_remediation_p5 verified 100% pass across all empirical test suites, zero banned dependencies, zero warnings, zero clippy lints, and 100% intent harness compliance.

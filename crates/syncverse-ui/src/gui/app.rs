@@ -67,8 +67,8 @@ pub struct UnpauseBlockedBanner {
     pub timestamp: Instant,
 }
 
-/// Desktop application state implementing `eframe::App`.
-pub struct SyncplayApp {
+/// Canonical desktop player graphical application state implementing `eframe::App`.
+pub struct SyncverseApp {
     viewport: VideoViewport,
     controls_state: ControlsBarState,
     sidebar_state: SidebarState,
@@ -109,9 +109,14 @@ pub struct SyncplayApp {
     reaction_system: crate::gui::reactions::ReactionSystem,
     idle_inhibitor: crate::gui::inhibit::IdleInhibitor,
     mpris_manager: crate::gui::mpris::MprisManager,
+    loop_enabled: bool,
+    cached_clipboard: Option<String>,
 }
 
-impl Default for SyncplayApp {
+/// Backwards-compatible type alias for [`SyncverseApp`].
+pub type SyncplayApp = SyncverseApp;
+
+impl Default for SyncverseApp {
     fn default() -> Self {
         let exchange = Arc::new(TripleBufferSnapshotExchange::new());
         let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
@@ -122,7 +127,7 @@ impl Default for SyncplayApp {
         let (bg_subtitle_tx, bg_subtitle_rx) =
             channel::<(PathBuf, Result<SubtitleTrack, String>)>();
 
-        Self {
+        let mut app = Self {
             viewport: VideoViewport::new(),
             controls_state: ControlsBarState::default(),
             sidebar_state: SidebarState::default(),
@@ -163,17 +168,44 @@ impl Default for SyncplayApp {
             reaction_system: crate::gui::reactions::ReactionSystem::new(),
             idle_inhibitor: crate::gui::inhibit::IdleInhibitor::new(),
             mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
-        }
+            loop_enabled: false,
+            cached_clipboard: None,
+        };
+        app.controls_state
+            .subtitle_dialog
+            .set_overlay_config(app.subtitle_overlay.config().clone());
+        app
     }
 }
 
-impl SyncplayApp {
-    /// Constructs a new standalone or headless `SyncplayApp` instance with default channels.
+impl SyncverseApp {
+    /// Constructs a new standalone or headless `SyncverseApp` instance with default channels.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Constructs a `SyncplayApp` with explicit presentation subsystems and eframe context.
+    /// Returns true if repeat / loop playback mode is currently enabled.
+    pub fn is_loop_enabled(&self) -> bool {
+        self.loop_enabled
+    }
+
+    /// Sets repeat / loop playback mode.
+    pub fn set_loop_enabled(&mut self, enabled: bool) {
+        self.loop_enabled = enabled;
+        let _ = self.command_tx.send(PlayerCommand::SetLoop(enabled));
+    }
+
+    /// Returns cached clipboard text if present.
+    pub fn cached_clipboard(&self) -> Option<&str> {
+        self.cached_clipboard.as_deref()
+    }
+
+    /// Manually sets or injects cached clipboard text (used in automated tests and URI opening).
+    pub fn set_cached_clipboard(&mut self, text: impl Into<String>) {
+        self.cached_clipboard = Some(text.into());
+    }
+
+    /// Constructs a `SyncverseApp` with explicit presentation subsystems and eframe context.
     pub fn with_subsystems(
         _cc: &eframe::CreationContext<'_>,
         exchange: Arc<TripleBufferSnapshotExchange>,
@@ -235,7 +267,12 @@ impl SyncplayApp {
             reaction_system: crate::gui::reactions::ReactionSystem::new(),
             idle_inhibitor: crate::gui::inhibit::IdleInhibitor::new(),
             mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
+            loop_enabled: false,
+            cached_clipboard: None,
         };
+        app.controls_state
+            .subtitle_dialog
+            .set_overlay_config(app.subtitle_overlay.config().clone());
 
         if let Some(path) = initial_file {
             app.load_file(path);
@@ -665,10 +702,17 @@ impl SyncplayApp {
     }
 }
 
-impl eframe::App for SyncplayApp {
+impl eframe::App for SyncverseApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx: Context = ui.ctx().clone();
         let now = Instant::now();
+
+        // Scan raw events for any Event::Paste to keep cached clipboard text fresh
+        for ev in &ctx.input(|i| i.raw.events.clone()) {
+            if let egui::Event::Paste(ref text) = ev {
+                self.cached_clipboard = Some(text.clone());
+            }
+        }
 
         // 0. Drain events from playback runtime and local UI workers
         let mut events = Vec::new();
@@ -988,27 +1032,113 @@ impl eframe::App for SyncplayApp {
                 self.osd_overlay.show_notification(toast.to_string(), now);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                let offset_ms = if ctx.input(|i| i.modifiers.shift) { -30_000 } else { -5_000 };
+                let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
+                    -60_000
+                } else if ctx.input(|i| i.modifiers.shift) {
+                    -30_000
+                } else {
+                    -5_000
+                };
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let target = (current_ms + offset_ms).max(0) as u64;
                 self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
-                    format!("Seek: {}", ControlsBarState::format_timestamp(target)),
+                    format!("Seek: {} ({:+}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
                     now,
                 );
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                let offset_ms = if ctx.input(|i| i.modifiers.shift) { 30_000 } else { 5_000 };
+                let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
+                    60_000
+                } else if ctx.input(|i| i.modifiers.shift) {
+                    30_000
+                } else {
+                    5_000
+                };
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
                 let target = ((current_ms + offset_ms).max(0) as u64).min(dur_ms);
                 self.viewport.clear_pending();
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
-                    format!("Seek: {}", ControlsBarState::format_timestamp(target)),
+                    format!("Seek: {} (+{}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
                     now,
                 );
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+                // Step forward 1 frame (~42ms)
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                let step_ms = 42;
+                let target = (current_ms + step_ms).min(dur_ms);
+                if snapshot.is_playing() {
+                    let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                }
+                self.viewport.clear_pending();
+                let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: true });
+                let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                self.osd_overlay.show_notification(
+                    format!("Frame Step: +1 ({})", ControlsBarState::format_timestamp(target)),
+                    now,
+                );
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Comma)) {
+                // Step backward 1 frame (~42ms)
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                let step_ms = 42;
+                let target = current_ms.saturating_sub(step_ms);
+                if snapshot.is_playing() {
+                    let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                }
+                self.viewport.clear_pending();
+                let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: false });
+                let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                self.osd_overlay.show_notification(
+                    format!("Frame Step: -1 ({})", ControlsBarState::format_timestamp(target)),
+                    now,
+                );
+            }
+            if ctx.input(|i| (i.modifiers.ctrl && i.key_pressed(egui::Key::L)) || i.key_pressed(egui::Key::L)) {
+                self.loop_enabled = !self.loop_enabled;
+                let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
+                let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
+                let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
+                self.osd_overlay.show_notification(msg.to_string(), now);
+            }
+            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V)) {
+                let clipboard_text = ctx.input(|i| {
+                    for ev in &i.raw.events {
+                        if let egui::Event::Paste(text) = ev {
+                            return Some(text.clone());
+                        }
+                    }
+                    None
+                }).or_else(|| self.cached_clipboard.clone());
+                if let Some(text) = clipboard_text {
+                    let trimmed = text.trim().trim_matches('"').trim_matches('\'');
+                    if !trimmed.is_empty() {
+                        let path_str = if let Some(stripped) = trimmed.strip_prefix("file://") {
+                            stripped
+                        } else {
+                            trimmed
+                        };
+                        let pb = PathBuf::from(path_str);
+                        if pb.exists() {
+                            self.load_file(pb.clone());
+                            let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(path_str);
+                            self.osd_overlay.show_notification(
+                                format!("Loaded from clipboard: {}", fname),
+                                now,
+                            );
+                        } else {
+                            self.osd_overlay.show_notification(
+                                format!("File not found: {}", path_str),
+                                now,
+                            );
+                        }
+                    }
+                }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                 let new_vol = (self.controls_state.volume.volume + 0.05).min(1.0);
@@ -1304,6 +1434,41 @@ impl eframe::App for SyncplayApp {
                             ui.close();
                             self.file_dialog.open_file_dialog();
                         }
+                        if ui.button("Open Path from Clipboard (Ctrl+V)").clicked() {
+                            ui.close();
+                            let clipboard_text = ctx.input(|i| {
+                                for ev in &i.raw.events {
+                                    if let egui::Event::Paste(text) = ev {
+                                        return Some(text.clone());
+                                    }
+                                }
+                                None
+                            }).or_else(|| self.cached_clipboard.clone());
+                            if let Some(text) = clipboard_text {
+                                let trimmed = text.trim().trim_matches('"').trim_matches('\'');
+                                if !trimmed.is_empty() {
+                                    let path_str = if let Some(stripped) = trimmed.strip_prefix("file://") {
+                                        stripped
+                                    } else {
+                                        trimmed
+                                    };
+                                    let pb = PathBuf::from(path_str);
+                                    if pb.exists() {
+                                        self.load_file(pb.clone());
+                                        let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(path_str);
+                                        self.osd_overlay.show_notification(
+                                            format!("Loaded from clipboard: {}", fname),
+                                            now,
+                                        );
+                                    } else {
+                                        self.osd_overlay.show_notification(
+                                            format!("File not found: {}", path_str),
+                                            now,
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         ui.menu_button("Recent Files", |ui| {
                             if self.recent_files.recent_paths.is_empty() {
@@ -1313,7 +1478,14 @@ impl eframe::App for SyncplayApp {
                                 for p in &self.recent_files.recent_paths {
                                     let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("Media File");
                                     if ui.button(filename).on_hover_text(p.to_string_lossy()).clicked() {
-                                        to_open = Some(p.clone());
+                                        if p.exists() {
+                                            to_open = Some(p.clone());
+                                        } else {
+                                            self.osd_overlay.show_notification(
+                                                format!("File not found: {}", filename),
+                                                now,
+                                            );
+                                        }
                                         ui.close();
                                     }
                                 }
@@ -1403,6 +1575,71 @@ impl eframe::App for SyncplayApp {
                             let target = (current_ms + 30_000).max(0) as u64;
                             self.viewport.clear_pending();
                             let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
+                        }
+                        if ui.button("Seek -60s (Ctrl+←)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
+                            let target = (current_ms - 60_000).max(0) as u64;
+                            self.viewport.clear_pending();
+                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                        }
+                        if ui.button("Seek +60s (Ctrl+→)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
+                            let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                            let target = (current_ms + 60_000).max(0) as u64;
+                            self.viewport.clear_pending();
+                            let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
+                        }
+
+                        ui.separator();
+
+                        if ui.button("Frame Step Backward (,)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            let target = current_ms.saturating_sub(42);
+                            if snapshot.is_playing() {
+                                let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                            }
+                            self.viewport.clear_pending();
+                            let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: false });
+                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                            self.osd_overlay.show_notification(
+                                format!("Frame Step: -1 ({})", ControlsBarState::format_timestamp(target)),
+                                now,
+                            );
+                        }
+                        if ui.button("Frame Step Forward (.)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                            let target = (current_ms + 42).min(dur_ms);
+                            if snapshot.is_playing() {
+                                let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                            }
+                            self.viewport.clear_pending();
+                            let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: true });
+                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                            self.osd_overlay.show_notification(
+                                format!("Frame Step: +1 ({})", ControlsBarState::format_timestamp(target)),
+                                now,
+                            );
+                        }
+
+                        ui.separator();
+
+                        let loop_label = if self.loop_enabled {
+                            "✓ Loop Playback (L)"
+                        } else {
+                            "Loop Playback (L)"
+                        };
+                        if ui.button(loop_label).clicked() {
+                            ui.close();
+                            self.loop_enabled = !self.loop_enabled;
+                            let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
+                            let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
+                            let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
+                            self.osd_overlay.show_notification(msg.to_string(), now);
                         }
 
                         ui.separator();
@@ -1625,6 +1862,14 @@ impl eframe::App for SyncplayApp {
         // Hidden only when controls are auto-hidden in fullscreen
         if !self.controls_state.is_fullscreen || self.controls_state.is_visible(now) {
             self.sidebar_state.show(ui, &snapshot, &self.chat_records, &self.command_tx);
+            if self.sidebar_state.pending_clear_chat {
+                self.sidebar_state.pending_clear_chat = false;
+                self.chat_records.clear();
+            }
+            if !self.sidebar_state.pending_local_records.is_empty() {
+                self.chat_records.append(&mut self.sidebar_state.pending_local_records);
+                self.sidebar_state.autoscroll = true;
+            }
         }
 
         // 11. Central Viewport (Consumes 100% of remaining space with perfect aspect ratio)
@@ -1938,6 +2183,9 @@ impl eframe::App for SyncplayApp {
                     self.subtitle_delay_ms = delay_ms;
                     let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(delay_ms));
                 }
+                crate::gui::SubtitleConfigAction::UpdateConfig(config) => {
+                    *self.subtitle_overlay.config_mut() = config;
+                }
             }
         }
 
@@ -2002,7 +2250,7 @@ pub fn run_desktop_player(
         "Syncverse — Desktop Media Player",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(SyncplayApp::with_subsystems(
+            Ok(Box::new(SyncverseApp::with_subsystems(
                 cc,
                 exchange,
                 video_ring,

@@ -15,7 +15,9 @@ pub mod subtitle_overlay;
 pub mod updater;
 pub mod viewport;
 
-pub use app::{create_native_options, run_desktop_gui, run_desktop_player, SyncplayApp};
+pub use app::{
+    create_native_options, run_desktop_gui, run_desktop_player, SyncplayApp, SyncverseApp,
+};
 pub use aspect_ratio::{AspectRatioOverride, IntoDimension};
 pub use controls::{
     style as controls_style, ControlsBarAction, ControlsBarState, PlaybackControlsBar,

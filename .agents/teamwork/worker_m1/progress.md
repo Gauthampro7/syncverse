@@ -1,23 +1,19 @@
-# Progress - worker_m1
+# Progress Tracking — worker_m1
 
-**Last visited**: 2026-10-26T11:40:00Z
-**Current status**: Task Complete. Milestone 1 implemented, tested, audited, and verified cleanly. Writing handoff.md.
+Last visited: 2026-10-31T03:58:30+05:30
 
-## Milestones & Tasks
-- [x] Initialized DISPATCH.md, BRIEFING.md, and progress.md
-- [x] Add `ureq` (features tls, json) and `semver = "1.0"` to `crates/syncplay-ui/Cargo.toml`
-- [x] Update `crates/syncplay-ui/src/event.rs` with `UpdateAvailable`, `UpdateChecked`, and `UpdateFailed`
-- [x] Implement `crates/syncplay-ui/src/gui/updater.rs`:
-  - Asynchronous background query
-  - SemVer 2.0.0 normalization and comparison
-  - Rate limiting header detection (HTTP 403/429)
-  - Timeout & offline error handling
-  - Cross-platform browser URL launcher
-  - Unit tests including mock HTTP server and rate-limit parsing
-- [x] Expose `updater` in `crates/syncplay-ui/src/gui/mod.rs`
-- [x] Integrate top notification banner and Help menu item in `crates/syncplay-ui/src/gui/app.rs`
-- [x] Run test suite for `syncplay-ui` (all 71 unit and integration tests passing)
-- [x] Run clippy on `syncplay-ui` (0 warnings with `-D warnings`)
-- [x] Dependency blacklist audit (19 banned patterns, 0 violations)
-- [x] Pi Intent Verification Harness (100.0% compliance score across 8 intents)
-- [ ] Write handoff.md and send completion message to parent orchestrator
+## Status
+All Milestone 1 implementation tasks complete. All test suites, clippy checks, dependency audits, and Intent Harness passed with 100% compliance. Finalizing handoff report.
+
+## Tasks
+- [x] Read ORIGINAL_REQUEST.md, survey handoffs, and PROJECT.md
+- [x] Task 1: `crates/syncverse-sync/src/pll.rs` & `crates/syncverse-core/src/playback_runtime.rs` (PLL target rate & clock reanchor)
+- [x] Task 2: `crates/syncverse-demux/src/universal.rs` (128-bit integer chapter timescale conversion)
+- [x] Task 3: `crates/syncverse-demux/src/subtitles/scanner.rs` (subtitle subfolder scanning: subtitles/, Subtitles/, subs/, Subs/)
+- [x] Task 4: `crates/syncverse-codecs/src/audio/` (soft_clip_sample with tanh saturation & integration)
+- [x] Task 5: `crates/syncverse-clock/src/master_clock.rs` (formal // SAFETY: comments)
+- [x] Task 6: `crates/syncverse-chat/src/commands.rs` (safe /poll command argument parsing)
+- [x] Task 7: `crates/syncverse-common/src/time.rs` & `path.rs` (from_timecode_str, FromStr, Windows path fix, legacy docstrings)
+- [x] Task 8: `crates/syncverse-core/src/error.rs` & `playback_runtime.rs` (CoreError typed errors)
+- [x] Verification & Tests (audit_dependencies, cargo check, cargo clippy, cargo test, intent_harness, verify_phase1)
+- [x] Handoff Report & completion message

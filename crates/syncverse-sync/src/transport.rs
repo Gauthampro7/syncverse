@@ -954,7 +954,9 @@ impl ClientNode {
         let now_nanos = self.current_local_nanos();
         let target_pts = room.compute_target_media_pts(now_nanos, theta_hat);
 
-        let corr = self.pll.update(target_pts, self.local_pts_ms, dt_secs);
+        let corr = self
+            .pll
+            .update_with_target_rate(target_pts, self.local_pts_ms, dt_secs, room.r_target);
         if corr.zone == PllZone::HardSeek {
             if let Some(target) = corr.hard_seek_target {
                 self.local_pts_ms = target;

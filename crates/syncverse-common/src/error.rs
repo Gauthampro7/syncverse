@@ -1,4 +1,4 @@
-//! Common error types across syncplay-alt crates.
+//! Common error types across Syncverse crates.
 
 use thiserror::Error;
 

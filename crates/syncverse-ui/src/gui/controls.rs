@@ -11,6 +11,10 @@ use crate::snapshot::PlayerUiSnapshot;
 /// Supported playback speeds in the speed selector.
 pub const SUPPORTED_SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
+/// Minimum controls bar width threshold in logical pixels below which secondary combo boxes
+/// (playback speed and aspect ratio) are collapsed to prevent visual overflow on compact viewports.
+pub const COMPACT_LAYOUT_THRESHOLD_PX: f32 = 700.0;
+
 /// State of audio volume and mute controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeControlState {
@@ -193,6 +197,11 @@ impl ControlsBarState {
         self.video_dialog.speed = self.speed;
         self.video_dialog.aspect_ratio = self.aspect_ratio;
         self.video_dialog.open();
+    }
+
+    /// Returns true if the controls bar width is below `COMPACT_LAYOUT_THRESHOLD_PX` (< 700px).
+    pub fn is_compact_layout(width: f32) -> bool {
+        width < COMPACT_LAYOUT_THRESHOLD_PX
     }
 
     /// Renders any active modal dialogs (Audio, Video, Subtitle) to the UI context.
@@ -480,6 +489,8 @@ impl PlaybackControlsBar {
         state: &mut ControlsBarState,
     ) -> Vec<ControlsBarAction> {
         let mut actions = Vec::new();
+        let bar_width = ui.available_width();
+        let is_compact = ControlsBarState::is_compact_layout(bar_width);
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
@@ -676,49 +687,51 @@ impl PlaybackControlsBar {
                     actions.push(ControlsBarAction::OpenAudioSettings);
                 }
 
-                ui.separator();
+                if !is_compact {
+                    ui.separator();
 
-                // Aspect Ratio Selector (Original, 16:9, 4:3, 21:9, 1:1, Fill/Stretch)
-                let aspect_label = format!("📐 {}", state.aspect_ratio.display_name());
-                egui::ComboBox::from_id_salt("aspect_ratio_selector")
-                    .selected_text(
-                        RichText::new(aspect_label)
-                            .size(12.0)
-                            .color(style::TEXT_PRIMARY),
-                    )
-                    .width(88.0)
-                    .show_ui(ui, |ui| {
-                        for &ar in &AspectRatioOverride::ALL {
-                            let is_selected = state.aspect_ratio == ar;
-                            if ui.selectable_label(is_selected, ar.display_name()).clicked() {
-                                state.aspect_ratio = ar;
-                                actions.push(ControlsBarAction::SetAspectRatio(ar));
+                    // Aspect Ratio Selector (Original, 16:9, 4:3, 21:9, 1:1, Fill/Stretch)
+                    let aspect_label = format!("📐 {}", state.aspect_ratio.display_name());
+                    egui::ComboBox::from_id_salt("aspect_ratio_selector")
+                        .selected_text(
+                            RichText::new(aspect_label)
+                                .size(12.0)
+                                .color(style::TEXT_PRIMARY),
+                        )
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            for &ar in &AspectRatioOverride::ALL {
+                                let is_selected = state.aspect_ratio == ar;
+                                if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                                    state.aspect_ratio = ar;
+                                    actions.push(ControlsBarAction::SetAspectRatio(ar));
+                                }
                             }
-                        }
-                    });
+                        });
 
-                ui.separator();
+                    ui.separator();
 
-                // Playback Speed Selector (0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 1.75x, 2.0x)
-                let speed_label = format!("{:.2}x", state.speed);
-                egui::ComboBox::from_id_salt("playback_speed_selector")
-                    .selected_text(
-                        RichText::new(speed_label)
-                            .monospace()
-                            .size(12.0)
-                            .color(style::TEXT_PRIMARY),
-                    )
-                    .width(68.0)
-                    .show_ui(ui, |ui| {
-                        for &spd in &SUPPORTED_SPEEDS {
-                            let label = format!("{:.2}x", spd);
-                            let is_selected = (state.speed - spd).abs() < 0.01;
-                            if ui.selectable_label(is_selected, label).clicked() {
-                                state.speed = spd;
-                                actions.push(ControlsBarAction::SetSpeed(spd));
+                    // Playback Speed Selector (0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 1.75x, 2.0x)
+                    let speed_label = format!("{:.2}x", state.speed);
+                    egui::ComboBox::from_id_salt("playback_speed_selector")
+                        .selected_text(
+                            RichText::new(speed_label)
+                                .monospace()
+                                .size(12.0)
+                                .color(style::TEXT_PRIMARY),
+                        )
+                        .width(68.0)
+                        .show_ui(ui, |ui| {
+                            for &spd in &SUPPORTED_SPEEDS {
+                                let label = format!("{:.2}x", spd);
+                                let is_selected = (state.speed - spd).abs() < 0.01;
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    state.speed = spd;
+                                    actions.push(ControlsBarAction::SetSpeed(spd));
+                                }
                             }
-                        }
-                    });
+                        });
+                }
 
                 ui.separator();
 
@@ -873,5 +886,14 @@ mod tests {
         assert!(state.video_dialog.is_open);
         assert_eq!(state.video_dialog.speed, state.speed);
         assert_eq!(state.video_dialog.aspect_ratio, state.aspect_ratio);
+    }
+
+    #[test]
+    fn test_responsive_compact_layout_guard() {
+        assert_eq!(COMPACT_LAYOUT_THRESHOLD_PX, 700.0);
+        assert!(ControlsBarState::is_compact_layout(699.9));
+        assert!(ControlsBarState::is_compact_layout(500.0));
+        assert!(!ControlsBarState::is_compact_layout(700.0));
+        assert!(!ControlsBarState::is_compact_layout(1280.0));
     }
 }

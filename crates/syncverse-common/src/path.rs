@@ -1,4 +1,4 @@
-//! Path and URI normalization utilities for Syncplay-Alt.
+//! Path and URI normalization utilities for Syncverse.
 //!
 //! Provides pure-Rust zero-dependency URI stripping (`file://localhost`, `file://`, `file:`)
 //! and percent-decoding (`%20` -> space, `%2F` -> `/`, etc.) for canonical filesystem path resolution.
@@ -45,6 +45,7 @@ pub fn percent_decode(raw: &str) -> String {
 /// If `target` is a `file:` URI:
 /// - Strips `file://localhost`, `file://`, or `file:` scheme prefixes.
 /// - Percent-decodes escape sequences (e.g., `%20` -> space, `%2F` -> `/`).
+/// - Strips leading slash before Windows drive letters (e.g., `/C:/...` -> `C:/...`).
 ///
 /// If `target` is not a `file:` URI (e.g. standard file paths, or synthetic test vectors like
 /// `"synthetic-mkv"`), it is returned unchanged.
@@ -61,7 +62,17 @@ pub fn normalize_target_path(target: &str) -> String {
         return target.to_string();
     };
 
-    percent_decode(raw_path)
+    let decoded = percent_decode(raw_path);
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/' || bytes[3] == b'\\')
+    {
+        return decoded[1..].to_string();
+    }
+    decoded
 }
 
 #[cfg(test)]
@@ -150,5 +161,26 @@ mod tests {
         assert_eq!(normalize_target_path(""), "");
         assert_eq!(normalize_target_path("file://"), "");
         assert_eq!(normalize_target_path("file://localhost"), "");
+    }
+
+    #[test]
+    fn test_normalize_windows_drive_letter() {
+        assert_eq!(
+            normalize_target_path("file:///C:/Users/User/Videos/movie.mkv"),
+            "C:/Users/User/Videos/movie.mkv"
+        );
+        assert_eq!(
+            normalize_target_path("file://localhost/D:/Media/film.mp4"),
+            "D:/Media/film.mp4"
+        );
+        assert_eq!(
+            normalize_target_path("file:/e:/music/track.flac"),
+            "e:/music/track.flac"
+        );
+        // Non-drive letter Unix paths must preserve leading slash
+        assert_eq!(
+            normalize_target_path("file:///home/user/video.mkv"),
+            "/home/user/video.mkv"
+        );
     }
 }

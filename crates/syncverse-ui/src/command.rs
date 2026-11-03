@@ -83,6 +83,15 @@ pub enum PlayerCommand {
     TakeScreenshot,
     /// Load an external subtitle file (.srt, .vtt, .ass) into the active session.
     LoadExternalSubtitle(PathBuf),
+    /// Step presentation forward or backward by a single frame while paused.
+    StepFrame {
+        /// If true, advance forward by one frame (~42ms); if false, step backward by one frame (~42ms).
+        forward: bool,
+    },
+    /// Toggle loop / repeat playback mode.
+    ToggleLoop,
+    /// Explicitly enable or disable loop / repeat playback mode.
+    SetLoop(bool),
 }
 
 #[cfg(test)]
@@ -101,6 +110,10 @@ mod tests {
         let cmd_sub_delay = PlayerCommand::SetSubtitleDelay(100);
         let cmd_adj_sub = PlayerCommand::AdjustSubtitleDelay(-100);
         let cmd_aspect = PlayerCommand::CycleAspectRatio;
+        let cmd_step_fwd = PlayerCommand::StepFrame { forward: true };
+        let cmd_step_bwd = PlayerCommand::StepFrame { forward: false };
+        let cmd_toggle_loop = PlayerCommand::ToggleLoop;
+        let cmd_set_loop = PlayerCommand::SetLoop(true);
 
         assert_eq!(cmd_audio, PlayerCommand::SelectAudioTrack(1));
         assert_eq!(cmd_cycle_audio, PlayerCommand::CycleAudioTrack);
@@ -112,8 +125,13 @@ mod tests {
         assert_eq!(cmd_sub_delay, PlayerCommand::SetSubtitleDelay(100));
         assert_eq!(cmd_adj_sub, PlayerCommand::AdjustSubtitleDelay(-100));
         assert_eq!(cmd_aspect, PlayerCommand::CycleAspectRatio);
+        assert_eq!(cmd_step_fwd, PlayerCommand::StepFrame { forward: true });
+        assert_eq!(cmd_toggle_loop, PlayerCommand::ToggleLoop);
+        assert_eq!(cmd_set_loop, PlayerCommand::SetLoop(true));
 
         assert_ne!(cmd_audio, cmd_cycle_audio);
         assert_ne!(cmd_sub, cmd_sub_off);
+        assert_ne!(cmd_step_fwd, cmd_step_bwd);
+        assert_ne!(cmd_set_loop, PlayerCommand::SetLoop(false));
     }
 }

@@ -183,6 +183,7 @@ impl MasterClock {
         let s = self.seq.load(Ordering::Relaxed);
         self.seq.store(s.wrapping_add(1), Ordering::Release);
 
+        // SAFETY: Writer holds writer_lock, ensuring exclusive mutable access to the internal state.
         unsafe {
             let snap = &mut *self.state.get();
             snap.anchor_pts = curr_pts;
@@ -199,6 +200,7 @@ impl MasterClock {
         let s = self.seq.load(Ordering::Relaxed);
         self.seq.store(s.wrapping_add(1), Ordering::Release);
 
+        // SAFETY: Writer holds writer_lock, ensuring exclusive mutable access to the internal state.
         unsafe {
             let snap = &mut *self.state.get();
             snap.anchor_pts = target_pts_ms;

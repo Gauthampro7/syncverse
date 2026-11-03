@@ -14,9 +14,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use syncverse_chat::{ChatRecord, RoomAnnouncement};
+use syncverse_chat::{
+    format_help, format_sync_status_report, format_timecode, ChatRecord, ParsedSlashCommand,
+    RoomAnnouncement, SlashCommandParser, SyncDiagnostics,
+};
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
-use syncverse_codecs::{UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA};
+use syncverse_codecs::{
+    apply_gain, UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA,
+};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::{
     ClientNode, HostServer, MediaFingerprint, PeerStatusPayload, RoomCryptoSession,
@@ -25,10 +30,12 @@ use syncverse_sync::{
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
     TripleBufferSnapshotExchange, UiEvent, SNAPSHOT_FLAG_FORCE_PLAY, SNAPSHOT_FLAG_GATE_BLOCKED,
-    SNAPSHOT_FLAG_HAS_MISMATCH, SNAPSHOT_FLAG_LOCAL_READY,
+    SNAPSHOT_FLAG_HAS_MISMATCH, SNAPSHOT_FLAG_LOCAL_READY, SNAPSHOT_FLAG_LOOP_ENABLED,
+    SNAPSHOT_FLAG_MUTED,
 };
 
 use crate::audio_sink::{AudioSink, AutoAudioSink};
+use crate::error::CoreError;
 
 /// Commands delivered to the asynchronous audio streaming thread.
 #[derive(Debug, Clone)]
@@ -52,17 +59,6 @@ pub enum AudioWorkerCommand {
     Reset,
 }
 
-/// Applies volume scaling and clamping to normalized audio samples.
-#[inline]
-fn scale_audio_samples(samples: &[f32], volume: f32) -> Vec<f32> {
-    if volume < 1e-4 {
-        vec![0.0f32; samples.len()]
-    } else if (volume - 1.0).abs() < 1e-3 {
-        samples.iter().map(|s| s.clamp(-1.0, 1.0)).collect()
-    } else {
-        samples.iter().map(|s| (s * volume).clamp(-1.0, 1.0)).collect()
-    }
-}
 
 /// Runs the dedicated audio sink output loop on an isolated OS thread with MasterClock pacing and closed-loop sync.
 fn run_audio_sink_worker(
@@ -286,17 +282,19 @@ struct PlaybackSession {
 
 impl PlaybackSession {
     /// Attempts to open a media file and initialize decoders for its primary video and audio streams.
-    fn open(path: &PathBuf) -> Result<Self, String> {
+    fn open(path: &PathBuf) -> Result<Self, CoreError> {
         if !path.exists() {
-            return Err(format!("File does not exist: {:?}", path));
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File does not exist: {:?}", path),
+            )));
         }
-        let demuxer = UniversalDemuxer::open_file(path)
-            .map_err(|e| format!("UniversalDemuxer open failure: {e}"))?;
+        let demuxer = UniversalDemuxer::open_file(path)?;
 
         let info = demuxer
             .container_info()
             .cloned()
-            .ok_or_else(|| "Failed to retrieve container metadata".to_string())?;
+            .ok_or_else(|| CoreError::Runtime("Failed to retrieve container metadata".to_string()))?;
 
         let duration_ms = info.duration_ms.unwrap_or(0);
 
@@ -451,25 +449,23 @@ impl PlaybackSession {
     ///
     /// Constructs a new `UniversalAudioDecoder` for the selected stream.
     /// Returns the human-readable description of the selected track on success.
-    fn select_audio_track(&mut self, track_id: u64) -> Result<String, String> {
+    fn select_audio_track(&mut self, track_id: u64) -> Result<String, CoreError> {
         let track = self
             .available_audio_tracks
             .iter()
             .find(|t| t.track_id == track_id)
             .cloned()
-            .ok_or_else(|| format!("Audio track ID {} not found", track_id))?;
+            .ok_or_else(|| CoreError::Runtime(format!("Audio track ID {} not found", track_id)))?;
 
         let tb = self.demuxer.stream_time_base(track.track_id as usize);
         let new_decoder = if let Some(params) = self.demuxer.stream_parameters(track.track_id as usize) {
-            UniversalAudioDecoder::from_parameters(params, tb)
-                .map_err(|e| format!("Failed to create audio decoder: {e}"))?
+            UniversalAudioDecoder::from_parameters(params, tb)?
         } else {
             UniversalAudioDecoder::from_codec_name(
                 &track.codec_id,
                 tb,
                 track.codec_private.as_deref(),
-            )
-            .map_err(|e| format!("Failed to create audio decoder: {e}"))?
+            )?
         };
 
         self.audio_decoder = Some(new_decoder);
@@ -565,9 +561,9 @@ impl PlaybackSession {
                         }
                     } else if Some(packet.track_id) == self.audio_track_id {
                         let dur = packet.duration_ms.unwrap_or(25);
-                        if packet.pts_ms + dur >= target_ms {
+                        let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                        if delayed_pts + dur >= target_ms {
                             if let Some(ref mut adec) = self.audio_decoder {
-                                let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                                 if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
                                     for mut pcm in pcm_frames {
                                         if pcm.pts_ms < target_ms {
@@ -581,10 +577,10 @@ impl PlaybackSession {
                                                 continue;
                                             }
                                         }
-                                        let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                        apply_gain(&mut pcm.samples, effective_vol);
                                         let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
                                             pts_ms: pcm.pts_ms,
-                                            samples,
+                                            samples: pcm.samples,
                                             generation: audio_generation,
                                         });
                                         first_audio_sent = true;
@@ -649,9 +645,9 @@ impl PlaybackSession {
 
                     if Some(packet.track_id) == self.audio_track_id {
                         let dur = packet.duration_ms.unwrap_or(25);
-                        if packet.pts_ms + dur >= current_pts {
+                        let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                        if delayed_pts + dur >= current_pts {
                             if let Some(ref mut adec) = self.audio_decoder {
-                                let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                                 if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
                                     for mut pcm in pcm_frames {
                                         if pcm.pts_ms < current_pts {
@@ -665,10 +661,10 @@ impl PlaybackSession {
                                                 continue;
                                             }
                                         }
-                                        let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                        apply_gain(&mut pcm.samples, effective_vol);
                                         let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
                                             pts_ms: pcm.pts_ms,
-                                            samples,
+                                            samples: pcm.samples,
                                             generation: audio_generation,
                                         });
                                     }
@@ -833,6 +829,7 @@ pub fn run_playback_worker(
     let mut gate_blocked: bool = false;
     let mut volume: f32 = 1.0;
     let mut is_muted: bool = false;
+    let mut is_loop_enabled: bool = false;
     let mut audio_delay_ms: i64 = 0;
     let mut subtitle_delay_ms: i64 = 0;
     let mut speed: f64 = 1.0;
@@ -1417,7 +1414,7 @@ pub fn run_playback_worker(
                 | PlayerCommand::TakeScreenshot => {
                     // Handled by UI presentation layer / video viewport / MPRIS
                 }
-                PlayerCommand::SendChatMessage(text) | PlayerCommand::ExecuteSlashCommand(text) => {
+                PlayerCommand::SendChatMessage(text) => {
                     let now = Instant::now();
                     let wall_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1445,6 +1442,256 @@ pub fn run_playback_worker(
                     }
 
                     let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                }
+                PlayerCommand::ExecuteSlashCommand(text) => {
+                    let now = Instant::now();
+                    let wall_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let media_ms = clock.current_pts(now).max(0.0) as u64;
+
+                    match SlashCommandParser::parse(&text, Some(media_ms)) {
+                        Ok(ParsedSlashCommand::Seek { target_pts_ms }) => {
+                            let duration = session.as_ref().map(|s| s.duration_ms).unwrap_or(u64::MAX);
+                            let bounded_target = target_pts_ms.min(duration);
+                            overflow_frame = None;
+                            let was_playing = clock.is_playing();
+                            clock.set_state(now, PlaybackState::Seeking);
+                            clock.seek_to(bounded_target as f64, now);
+
+                            current_audio_generation = current_audio_generation.wrapping_add(1);
+                            let _ = audio_tx.send(AudioWorkerCommand::Reset);
+
+                            let landed_pts = if let Some(ref mut sess) = session {
+                                let effective_vol = if is_muted { 0.0 } else { volume };
+                                sess.seek_preroll(
+                                    bounded_target,
+                                    &video_ring,
+                                    &audio_tx,
+                                    current_audio_generation,
+                                    effective_vol,
+                                    audio_delay_ms,
+                                )
+                            } else {
+                                bounded_target
+                            };
+
+                            let resume_now = Instant::now();
+                            clock.seek_to(landed_pts as f64, resume_now);
+                            if was_playing {
+                                clock.set_state(resume_now, PlaybackState::Playing);
+                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                            } else {
+                                clock.set_state(resume_now, PlaybackState::Paused);
+                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            }
+
+                            match &mut party_role {
+                                WatchPartyRole::Host { server, .. } => {
+                                    server.set_media_state(landed_pts, speed, !was_playing);
+                                    let _ = server.broadcast_room_state();
+                                }
+                                WatchPartyRole::Client { client, .. } => {
+                                    let _ = client.send_seek(landed_pts);
+                                }
+                                WatchPartyRole::None => {}
+                            }
+                            let sender = get_sender_name(&party_role);
+                            let msg = RoomAnnouncement::seeked_ms(&sender, landed_pts);
+                            broadcast_chat_announcement(&msg, resume_now, &clock, &mut party_role, &event_tx);
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Seek: {}", format_timecode(landed_pts)),
+                                timestamp: resume_now,
+                            });
+                        }
+                        Ok(ParsedSlashCommand::Loop { enabled }) => {
+                            is_loop_enabled = enabled.unwrap_or(!is_loop_enabled);
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Repeat: {}", if is_loop_enabled { "On" } else { "Off" }),
+                                timestamp: now,
+                            });
+                        }
+                        Ok(ParsedSlashCommand::Mute { enabled }) => {
+                            let new_mute = enabled.unwrap_or(!is_muted);
+                            if new_mute != is_muted {
+                                is_muted = new_mute;
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: if is_muted {
+                                        "Muted".to_string()
+                                    } else {
+                                        format!("Volume: {}%", (volume * 100.0).round() as u32)
+                                    },
+                                    timestamp: now,
+                                });
+                            }
+                        }
+                        Ok(ParsedSlashCommand::Speed { speed_permille }) => {
+                            let new_speed = (speed_permille as f64 / 1000.0).clamp(0.2, 4.0);
+                            speed = new_speed;
+                            clock.reanchor(now, speed);
+                            if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                                let current_pts = clock.current_pts(now).max(0.0) as u64;
+                                server.set_media_state(current_pts, speed, !clock.is_playing());
+                                let _ = server.broadcast_room_state();
+                            }
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Speed: {:.2}x", speed),
+                                timestamp: now,
+                            });
+                        }
+                        Ok(ParsedSlashCommand::AudioDelay { delay_ms }) => {
+                            audio_delay_ms = delay_ms.clamp(-5000, 5000);
+                            let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Audio Delay: {:+} ms", audio_delay_ms),
+                                timestamp: now,
+                            });
+                        }
+                        Ok(ParsedSlashCommand::SubtitleDelay { delay_ms }) => {
+                            subtitle_delay_ms = delay_ms.clamp(-5000, 5000);
+                            let _ = event_tx.send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Subtitle Delay: {:+} ms", subtitle_delay_ms),
+                                timestamp: now,
+                            });
+                        }
+                        Ok(ParsedSlashCommand::Help { command }) => {
+                            let help_text = format_help(command.as_deref());
+                            let rec = RoomAnnouncement::create_record(wall_ms, media_ms, &help_text);
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        Ok(ParsedSlashCommand::SyncStatus) => {
+                            let (rtt, offset, peers) = match &party_role {
+                                WatchPartyRole::Host { server, .. } => {
+                                    (server.max_rtt_ms() as f64, 0.0, server.clients().len() + 1)
+                                }
+                                WatchPartyRole::Client { client, .. } => (
+                                    client.median_rtt_nanos() / 1_000_000.0,
+                                    client.filtered_offset_nanos().unwrap_or(0.0) / 1_000_000.0,
+                                    client.peer_statuses().len() + 1,
+                                ),
+                                WatchPartyRole::None => (0.0, 0.0, 1),
+                            };
+                            let diag = SyncDiagnostics {
+                                rtt_ms: rtt,
+                                clock_offset_ms: offset,
+                                speed_multiplier: speed,
+                                peer_count: peers,
+                                current_pts_ms: media_ms,
+                                is_paused: !clock.is_playing(),
+                                pll_zone: if offset.abs() <= 15.0 {
+                                    "Deadband".to_string()
+                                } else if offset.abs() <= 1500.0 {
+                                    "MicroSpeed".to_string()
+                                } else {
+                                    "HardSeek".to_string()
+                                },
+                            };
+                            let report = format_sync_status_report(&diag);
+                            let rec = RoomAnnouncement::create_record(wall_ms, media_ms, &report);
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        Ok(ParsedSlashCommand::Clear) => {
+                            // UI clears local view on Clear command
+                        }
+                        Ok(ParsedSlashCommand::Who) => {
+                            let mut members_summary = Vec::new();
+                            match &party_role {
+                                WatchPartyRole::Host { local_username, server, .. } => {
+                                    members_summary.push(syncverse_chat::RoomMemberSummary {
+                                        username: local_username.clone(),
+                                        is_local: true,
+                                        is_host: true,
+                                        rtt_ms: 0.0,
+                                        is_ready: local_ready,
+                                        file_name: current_file_name.clone(),
+                                    });
+                                    for client_sess in server.clients().values() {
+                                        members_summary.push(syncverse_chat::RoomMemberSummary {
+                                            username: if !client_sess.username.is_empty() {
+                                                client_sess.username.clone()
+                                            } else {
+                                                format!("Peer-{}", client_sess.client_id)
+                                            },
+                                            is_local: false,
+                                            is_host: false,
+                                            rtt_ms: client_sess.rtt_ms as f64,
+                                            is_ready: client_sess.is_user_ready,
+                                            file_name: if client_sess.has_media {
+                                                Some(client_sess.filename.clone())
+                                            } else {
+                                                None
+                                            },
+                                        });
+                                    }
+                                }
+                                WatchPartyRole::Client { local_username, client, .. } => {
+                                    members_summary.push(syncverse_chat::RoomMemberSummary {
+                                        username: local_username.clone(),
+                                        is_local: true,
+                                        is_host: false,
+                                        rtt_ms: client.median_rtt_nanos() / 1_000_000.0,
+                                        is_ready: local_ready,
+                                        file_name: current_file_name.clone(),
+                                    });
+                                    for status in client.peer_statuses().values() {
+                                        members_summary.push(syncverse_chat::RoomMemberSummary {
+                                            username: status.username.clone(),
+                                            is_local: false,
+                                            is_host: status.client_id == 0,
+                                            rtt_ms: 0.0,
+                                            is_ready: status.is_ready,
+                                            file_name: if status.has_media {
+                                                Some(status.filename.clone())
+                                            } else {
+                                                None
+                                            },
+                                        });
+                                    }
+                                }
+                                WatchPartyRole::None => {
+                                    members_summary.push(syncverse_chat::RoomMemberSummary {
+                                        username: std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+                                        is_local: true,
+                                        is_host: true,
+                                        rtt_ms: 0.0,
+                                        is_ready: local_ready,
+                                        file_name: current_file_name.clone(),
+                                    });
+                                }
+                            }
+                            let report = syncverse_chat::format_who_report(&members_summary);
+                            let rec = RoomAnnouncement::create_record(wall_ms, media_ms, &report);
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        Ok(ParsedSlashCommand::Bookmark { .. })
+                        | Ok(ParsedSlashCommand::Clip { .. })
+                        | Ok(ParsedSlashCommand::Poll { .. }) => {
+                            let sender_name = match &party_role {
+                                WatchPartyRole::Host { local_username, .. } => local_username.clone(),
+                                WatchPartyRole::Client { local_username, .. } => local_username.clone(),
+                                WatchPartyRole::None => std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+                            };
+                            let rec = ChatRecord::new_text(wall_ms, media_ms, [0u8; 16], sender_name, &text);
+                            let wire_bytes = rec.to_network_bytes();
+                            match &mut party_role {
+                                WatchPartyRole::Host { server, .. } => {
+                                    let _ = server.broadcast_chat_message(&wire_bytes);
+                                }
+                                WatchPartyRole::Client { client, .. } => {
+                                    let _ = client.send_chat_message_with_pts(&wire_bytes, media_ms);
+                                }
+                                WatchPartyRole::None => {}
+                            }
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        Err(err) => {
+                            let err_msg = format!("❌ Command Error: {}", err);
+                            let rec = RoomAnnouncement::create_record(wall_ms, media_ms, &err_msg);
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                    }
                 }
                 PlayerCommand::HostParty {
                     port,
@@ -1736,6 +1983,44 @@ pub fn run_playback_worker(
                     );
                     let _ = event_tx.send(UiEvent::NewChatRecord(rec));
                 }
+                PlayerCommand::StepFrame { forward } => {
+                    let now = Instant::now();
+                    let current_pts = clock.current_pts(now).max(0.0) as u64;
+                    let step_ms = 42; // ~24fps single frame
+                    let target = if forward {
+                        current_pts.saturating_add(step_ms)
+                    } else {
+                        current_pts.saturating_sub(step_ms)
+                    };
+                    clock.seek_to(target as f64, now);
+                    if let Some(ref mut sess) = session {
+                        current_audio_generation = current_audio_generation.wrapping_add(1);
+                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                        let effective_vol = if is_muted { 0.0 } else { volume };
+                        sess.seek_preroll(
+                            target,
+                            &video_ring,
+                            &audio_tx,
+                            current_audio_generation,
+                            effective_vol,
+                            audio_delay_ms,
+                        );
+                    }
+                }
+                PlayerCommand::ToggleLoop => {
+                    is_loop_enabled = !is_loop_enabled;
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Repeat: {}", if is_loop_enabled { "On" } else { "Off" }),
+                        timestamp: Instant::now(),
+                    });
+                }
+                PlayerCommand::SetLoop(enabled) => {
+                    is_loop_enabled = enabled;
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Repeat: {}", if is_loop_enabled { "On" } else { "Off" }),
+                        timestamp: Instant::now(),
+                    });
+                }
             }
         }
 
@@ -1809,11 +2094,11 @@ pub fn run_playback_worker(
                                         let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                                         if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
                                             let effective_vol = if is_muted { 0.0 } else { volume };
-                                            for pcm in pcm_frames {
-                                                let samples = scale_audio_samples(&pcm.samples, effective_vol);
+                                            for mut pcm in pcm_frames {
+                                                apply_gain(&mut pcm.samples, effective_vol);
                                                 let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
                                                     pts_ms: pcm.pts_ms,
-                                                    samples,
+                                                    samples: pcm.samples,
                                                     generation: current_audio_generation,
                                                 });
                                             }
@@ -2079,14 +2364,18 @@ pub fn run_playback_worker(
                     } else if drift_ms > 15 && clock.is_playing() {
                         // Zone 2: Micro-speed steering
                         if let Some(corr) = client.update_pll(0.025) {
-                            let steered_speed = corr.speed_multiplier.clamp(0.96, 1.04);
+                            let target_speed = room_state.r_target;
+                            let steered_speed = corr
+                                .speed_multiplier
+                                .clamp(target_speed * 0.96, target_speed * 1.04);
                             clock.reanchor(now, steered_speed);
                         }
                     } else if drift_ms <= 15 && clock.is_playing() {
-                        // Zone 1: Deadband - normal speed
-                        if (speed - 1.0).abs() > 1e-4 {
-                            speed = 1.0;
-                            clock.reanchor(now, 1.0);
+                        // Zone 1: Deadband - reanchor client clock to room_state.r_target
+                        let target_speed = room_state.r_target;
+                        if (clock.speed() - target_speed).abs() > 1e-4 {
+                            speed = target_speed;
+                            clock.reanchor(now, target_speed);
                         }
                     }
                 }
@@ -2316,6 +2605,12 @@ pub fn run_playback_worker(
             if has_mismatch {
                 playback_state_flags |= SNAPSHOT_FLAG_HAS_MISMATCH;
             }
+            if is_muted {
+                playback_state_flags |= SNAPSHOT_FLAG_MUTED;
+            }
+            if is_loop_enabled {
+                playback_state_flags |= SNAPSHOT_FLAG_LOOP_ENABLED;
+            }
 
             let snap = PlayerUiSnapshot {
                 monotonic_timestamp: now.elapsed().as_nanos() as u64,
@@ -2345,7 +2640,7 @@ pub fn run_playback_worker(
 /// Launches the full desktop graphical player with integrated background decoding and presentation runtime.
 pub fn launch_desktop_player_app(
     initial_file: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), CoreError> {
     let exchange = Arc::new(TripleBufferSnapshotExchange::new());
     let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
     let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
@@ -2362,7 +2657,7 @@ pub fn launch_desktop_player_app(
         .spawn(move || {
             run_audio_sink_worker(audio_rx, audio_clock, audio_running);
         })
-        .map_err(|e| format!("Failed to spawn audio worker thread: {e}"))?;
+        .map_err(|e| CoreError::Runtime(format!("Failed to spawn audio worker thread: {e}")))?;
 
     // Spawn dedicated background playback coordinator thread
     let thread_exchange = Arc::clone(&exchange);
@@ -2383,7 +2678,7 @@ pub fn launch_desktop_player_app(
                 thread_running,
             );
         })
-        .map_err(|e| format!("Failed to spawn playback worker thread: {e}"))?;
+        .map_err(|e| CoreError::Runtime(format!("Failed to spawn playback worker thread: {e}")))?;
 
     // Run native graphical player on main thread (blocks until window is closed)
     let gui_res = syncverse_ui::run_desktop_player(
@@ -2400,7 +2695,7 @@ pub fn launch_desktop_player_app(
     let _ = worker_handle.join();
     let _ = audio_handle.join();
 
-    gui_res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    gui_res.map_err(|e| CoreError::Runtime(format!("GUI presentation error: {e}")))
 }
 
 #[cfg(test)]

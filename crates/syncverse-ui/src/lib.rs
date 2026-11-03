@@ -26,6 +26,7 @@ pub use gui::{
     FileDialogManager, FileMatchStatus, IntoDimension, PlaybackControlsBar,
     ReactionParticle, ReactionSystem, RecentFilesManager, RoomMember, SidebarState,
     SubtitleCue, SubtitleOverlay, SubtitleOverlayConfig, SubtitleTrack, SyncplayApp,
+    SyncverseApp,
     VideoTextureBuffer, VideoViewport, ViewportAction, ViewportDisplayMode, ViewportGeometry,
     VolumeControlState, compute_effective_pts, find_active_cue, find_active_cue_text,
     find_active_cues, REACTION_PRESETS, SUPPORTED_EXTENSIONS, SUPPORTED_SPEEDS,
@@ -47,6 +48,7 @@ pub use snapshot::{
     PlayerUiSnapshot, TripleBufferSnapshotExchange, PLAYBACK_STATE_BUFFERING, PLAYBACK_STATE_PAUSED,
     PLAYBACK_STATE_PLAYING, PLAYBACK_STATE_SEEKING, SNAPSHOT_FLAG_FORCE_PLAY,
     SNAPSHOT_FLAG_GATE_BLOCKED, SNAPSHOT_FLAG_HAS_MISMATCH, SNAPSHOT_FLAG_LOCAL_READY,
+    SNAPSHOT_FLAG_LOOP_ENABLED, SNAPSHOT_FLAG_MUTED,
 };
 pub use terminal::{
     get_terminal_size, parse_key_sequence, render_hotkeys_footer, render_osd_hud,

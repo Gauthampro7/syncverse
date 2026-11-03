@@ -314,6 +314,73 @@ impl InteractivePlayer {
                                     Duration::from_secs(3),
                                 );
                             }
+                            Ok(ParsedSlashCommand::Help { .. }) => {
+                                self.set_status_message(
+                                    "[HELP] /seek, /bookmark, /clip, /poll, /sync-status, /who, /loop, /mute, /speed, /delay",
+                                    Duration::from_secs(4),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::Clear) => {
+                                self.set_status_message(
+                                    "[CLEAR] Local chat cleared",
+                                    Duration::from_secs(2),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::Loop { enabled }) => {
+                                match enabled {
+                                    Some(b) => {
+                                        let _ = self.coordinator.handle_command(PlayerCommand::SetLoop(b), now);
+                                    }
+                                    None => {
+                                        let _ = self.coordinator.handle_command(PlayerCommand::ToggleLoop, now);
+                                    }
+                                }
+                                self.set_status_message(
+                                    format!("[LOOP] Repeat mode: {:?}", enabled),
+                                    Duration::from_secs(2),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::Who) => {
+                                self.set_status_message(
+                                    "[WHO] Active room participants queried",
+                                    Duration::from_secs(3),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::Mute { enabled }) => {
+                                let new_mute = enabled.unwrap_or(!self.is_muted);
+                                self.is_muted = new_mute;
+                                let _ = self.coordinator.handle_command(PlayerCommand::ToggleMute, now);
+                                self.set_status_message(
+                                    if self.is_muted {
+                                        "[MUTE] Audio muted"
+                                    } else {
+                                        "[MUTE] Audio unmuted"
+                                    },
+                                    Duration::from_secs(2),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::Speed { speed_permille }) => {
+                                let ratio = speed_permille as f64 / 1000.0;
+                                let _ = self.coordinator.handle_command(PlayerCommand::SetSpeed(ratio), now);
+                                self.set_status_message(
+                                    format!("[SPEED] {:.2}x", ratio),
+                                    Duration::from_secs(2),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::AudioDelay { delay_ms }) => {
+                                let _ = self.coordinator.handle_command(PlayerCommand::SetAudioDelay(delay_ms), now);
+                                self.set_status_message(
+                                    format!("[AUDIO DELAY] {:+} ms", delay_ms),
+                                    Duration::from_secs(2),
+                                );
+                            }
+                            Ok(ParsedSlashCommand::SubtitleDelay { delay_ms }) => {
+                                let _ = self.coordinator.handle_command(PlayerCommand::SetSubtitleDelay(delay_ms), now);
+                                self.set_status_message(
+                                    format!("[SUB DELAY] {:+} ms", delay_ms),
+                                    Duration::from_secs(2),
+                                );
+                            }
                             Err(e) => {
                                 self.set_status_message(
                                     format!("[ERROR] {}", e),

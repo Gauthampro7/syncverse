@@ -1,11 +1,13 @@
 //! Subtitle demuxing, pure-Rust parsers (SRT, WebVTT, ASS/SSA), and external file scanner.
 
 pub mod ass;
+pub mod microdvd;
 pub mod scanner;
 pub mod srt;
 pub mod vtt;
 
 pub use ass::{clean_ass_text, parse_ass, parse_ass_dialogue_line, parse_ass_timestamp};
+pub use microdvd::{clean_microdvd_text, parse_microdvd, parse_microdvd_line};
 pub use scanner::{
     decode_subtitle_bytes, detect_subtitle_language, lookup_language, parse_subtitle_file,
     read_subtitle_to_string, scan_external_subtitles, SUBTITLE_EXTENSIONS,

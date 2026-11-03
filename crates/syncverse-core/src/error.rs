@@ -33,6 +33,10 @@ pub enum CoreError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Common foundational types error.
+    #[error("common error: {0}")]
+    Common(#[from] syncverse_common::CommonError),
+
     /// Coordinator lifecycle error.
     #[error("runtime coordinator error: {0}")]
     Runtime(String),

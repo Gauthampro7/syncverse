@@ -2,7 +2,10 @@
 
 use std::fmt;
 use std::ops::{Add, Sub};
+use std::str::FromStr;
 use std::time::Instant;
+
+use crate::error::CommonError;
 
 /// Media presentation timestamp (PTS) with nanosecond precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -11,6 +14,9 @@ pub struct MediaTime(u64);
 impl MediaTime {
     /// Sentinel value representing unanchored or invalid media presentation time.
     pub const UNANCHORED: Self = Self(u64::MAX);
+
+    /// Zero presentation timestamp (0 nanoseconds).
+    pub const ZERO: Self = Self(0);
 
     /// Creates a `MediaTime` from milliseconds.
     #[inline]
@@ -70,6 +76,194 @@ impl MediaTime {
         let mins = total_mins % 60;
         let hours = total_mins / 60;
         format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, ms)
+    }
+
+    /// Formats the presentation timestamp as standard `HH:MM:SS` (without fractional seconds).
+    pub fn to_hms(&self) -> String {
+        if *self == Self::UNANCHORED {
+            return "--:--:--".to_string();
+        }
+        let total_secs = self.as_millis() / 1000;
+        let secs = total_secs % 60;
+        let mins = (total_secs / 60) % 60;
+        let hours = total_secs / 3600;
+        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+    }
+
+    /// Formats the duration into a human-friendly string (e.g. `"1h 23m 45s"`, `"14m 20s"`, or `"5s"`).
+    pub fn to_friendly_duration(&self) -> String {
+        if *self == Self::UNANCHORED {
+            return "unknown".to_string();
+        }
+        let total_secs = self.as_millis() / 1000;
+        let secs = total_secs % 60;
+        let mins = (total_secs / 60) % 60;
+        let hours = total_secs / 3600;
+
+        if hours > 0 {
+            format!("{}h {}m {}s", hours, mins, secs)
+        } else if mins > 0 {
+            format!("{}m {}s", mins, secs)
+        } else {
+            format!("{}s", secs)
+        }
+    }
+
+    /// Computes the percentage `[0.0, 100.0]` of this timestamp relative to `total`.
+    ///
+    /// Returns `0.0` if `total` is zero, unanchored, or if `self` is unanchored.
+    pub fn percent_of(&self, total: MediaTime) -> f64 {
+        if *self == Self::UNANCHORED || total == Self::UNANCHORED || total.as_nanos() == 0 {
+            return 0.0;
+        }
+        let ratio = (self.as_nanos() as f64) / (total.as_nanos() as f64);
+        (ratio * 100.0).clamp(0.0, 100.0)
+    }
+
+    /// Computes a `MediaTime` from a percentage `[0.0, 100.0]` of `total`.
+    ///
+    /// Clamps the input percentage to `[0.0, 100.0]` and guards against negative or non-finite inputs.
+    pub fn from_percent(total: MediaTime, percent: f64) -> MediaTime {
+        if total == Self::UNANCHORED || total.as_nanos() == 0 || !percent.is_finite() || percent <= 0.0 {
+            return MediaTime::ZERO;
+        }
+        let clamped = percent.clamp(0.0, 100.0);
+        let nanos = ((total.as_nanos() as f64) * (clamped / 100.0)).round() as u64;
+        MediaTime::from_nanos(nanos)
+    }
+
+    /// Parses a timecode string ("HH:MM:SS", "HH:MM:SS.mmm", "MM:SS", "MM:SS.mmm", or "SS.mmm") into `MediaTime`.
+    ///
+    /// Also recognizes the unanchored sentinel timecode `"--:--:--.---"`.
+    pub fn from_timecode_str(s: &str) -> Result<Self, CommonError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(CommonError::InvalidData("empty timecode string".to_string()));
+        }
+        if trimmed == "--:--:--.---" {
+            return Ok(Self::UNANCHORED);
+        }
+
+        if trimmed.contains(':') {
+            let parts: Vec<&str> = trimmed.split(':').collect();
+            match parts.len() {
+                2 => {
+                    // MM:SS or MM:SS.mmm
+                    let mins: u64 = parts[0].parse().map_err(|_| {
+                        CommonError::InvalidData(format!("invalid minutes in timecode: {}", s))
+                    })?;
+                    let sec_nanos = parse_seconds_nanos(parts[1], s)?;
+                    if sec_nanos >= 60_000_000_000 {
+                        return Err(CommonError::InvalidData(format!(
+                            "seconds component must be less than 60 in timecode: {}",
+                            s
+                        )));
+                    }
+                    let total_nanos = mins
+                        .checked_mul(60 * 1_000_000_000)
+                        .and_then(|n| n.checked_add(sec_nanos))
+                        .ok_or_else(|| {
+                            CommonError::InvalidData(format!("timecode overflow: {}", s))
+                        })?;
+                    Ok(Self(total_nanos))
+                }
+                3 => {
+                    // HH:MM:SS or HH:MM:SS.mmm
+                    let hours: u64 = parts[0].parse().map_err(|_| {
+                        CommonError::InvalidData(format!("invalid hours in timecode: {}", s))
+                    })?;
+                    let mins: u64 = parts[1].parse().map_err(|_| {
+                        CommonError::InvalidData(format!("invalid minutes in timecode: {}", s))
+                    })?;
+                    if mins >= 60 {
+                        return Err(CommonError::InvalidData(format!(
+                            "minutes component must be less than 60 in timecode: {}",
+                            s
+                        )));
+                    }
+                    let sec_nanos = parse_seconds_nanos(parts[2], s)?;
+                    if sec_nanos >= 60_000_000_000 {
+                        return Err(CommonError::InvalidData(format!(
+                            "seconds component must be less than 60 in timecode: {}",
+                            s
+                        )));
+                    }
+                    let total_nanos = hours
+                        .checked_mul(3600 * 1_000_000_000)
+                        .and_then(|h| {
+                            mins.checked_mul(60 * 1_000_000_000).and_then(|m| h.checked_add(m))
+                        })
+                        .and_then(|hm| hm.checked_add(sec_nanos))
+                        .ok_or_else(|| {
+                            CommonError::InvalidData(format!("timecode overflow: {}", s))
+                        })?;
+                    Ok(Self(total_nanos))
+                }
+                _ => Err(CommonError::InvalidData(format!(
+                    "malformed timecode (expected 1 or 2 colons): {}",
+                    s
+                ))),
+            }
+        } else {
+            // Raw seconds (e.g. "45", "12.345", "10s")
+            let stripped = trimmed.trim_end_matches(['s', 'S']);
+            let sec_nanos = parse_seconds_nanos(stripped, s)?;
+            Ok(Self(sec_nanos))
+        }
+    }
+}
+
+fn parse_seconds_nanos(sec_str: &str, original_input: &str) -> Result<u64, CommonError> {
+    let sec_str = sec_str.trim();
+    if sec_str.is_empty() {
+        return Err(CommonError::InvalidData(format!(
+            "empty seconds field in timecode: {}",
+            original_input
+        )));
+    }
+    let (whole_str, frac_str) = match sec_str.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (sec_str, None),
+    };
+    let whole_secs: u64 = whole_str.parse().map_err(|_| {
+        CommonError::InvalidData(format!("invalid seconds component: {}", original_input))
+    })?;
+    let mut nanos = whole_secs.checked_mul(1_000_000_000).ok_or_else(|| {
+        CommonError::InvalidData(format!("seconds overflow: {}", original_input))
+    })?;
+    if let Some(frac) = frac_str {
+        if frac.is_empty() {
+            return Err(CommonError::InvalidData(format!(
+                "invalid fractional seconds in timecode: {}",
+                original_input
+            )));
+        }
+        if !frac.chars().all(|c| c.is_ascii_digit()) {
+            return Err(CommonError::InvalidData(format!(
+                "invalid digits in fractional seconds: {}",
+                original_input
+            )));
+        }
+        let truncated = if frac.len() > 9 { &frac[..9] } else { frac };
+        let padded = format!("{:0<9}", truncated);
+        let frac_nanos: u64 = padded.parse().map_err(|_| {
+            CommonError::InvalidData(format!(
+                "failed to parse fractional seconds: {}",
+                original_input
+            ))
+        })?;
+        nanos = nanos.checked_add(frac_nanos).ok_or_else(|| {
+            CommonError::InvalidData(format!("timestamp overflow: {}", original_input))
+        })?;
+    }
+    Ok(nanos)
+}
+
+impl FromStr for MediaTime {
+    type Err = CommonError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_timecode_str(s)
     }
 }
 
@@ -142,5 +336,77 @@ mod tests {
 
         let hours = MediaTime::from_millis(3600 * 1000 + 120 * 1000 + 500);
         assert_eq!(hours.to_timecode_string(), "01:02:00.500");
+    }
+
+    #[test]
+    fn test_media_time_from_timecode_str() {
+        // HH:MM:SS and HH:MM:SS.mmm
+        let t1 = MediaTime::from_timecode_str("01:02:03.500").unwrap();
+        assert_eq!(t1.as_millis(), 3600 * 1000 + 2 * 60 * 1000 + 3500);
+        assert_eq!(t1.to_timecode_string(), "01:02:03.500");
+
+        let t2 = MediaTime::from_timecode_str("00:00:10").unwrap();
+        assert_eq!(t2.as_millis(), 10000);
+
+        // MM:SS and MM:SS.mmm
+        let t3 = MediaTime::from_timecode_str("05:30.250").unwrap();
+        assert_eq!(t3.as_millis(), 5 * 60 * 1000 + 30250);
+
+        let t4 = MediaTime::from_timecode_str("00:45").unwrap();
+        assert_eq!(t4.as_millis(), 45000);
+
+        // Raw seconds
+        let t5 = MediaTime::from_timecode_str("90").unwrap();
+        assert_eq!(t5.as_millis(), 90000);
+
+        let t6 = MediaTime::from_timecode_str("12.5s").unwrap();
+        assert_eq!(t6.as_millis(), 12500);
+
+        // FromStr trait
+        let t7: MediaTime = "02:15:00.000".parse().unwrap();
+        assert_eq!(t7.as_millis(), 2 * 3600 * 1000 + 15 * 60 * 1000);
+
+        // Sentinel
+        let unanchored = MediaTime::from_timecode_str("--:--:--.---").unwrap();
+        assert_eq!(unanchored, MediaTime::UNANCHORED);
+
+        // Errors
+        assert!(MediaTime::from_timecode_str("").is_err());
+        assert!(MediaTime::from_timecode_str("invalid").is_err());
+        assert!(MediaTime::from_timecode_str("01:65:00").is_err()); // minutes >= 60
+        assert!(MediaTime::from_timecode_str("01:20:65").is_err()); // seconds >= 60
+        assert!(MediaTime::from_timecode_str("10:70").is_err());    // seconds >= 60
+        assert!(MediaTime::from_timecode_str("01:02:03:04").is_err()); // too many colons
+    }
+
+    #[test]
+    fn test_media_time_extended_helpers() {
+        let t1 = MediaTime::from_millis(3600 * 1000 + 120 * 1000 + 45 * 1000 + 500);
+        assert_eq!(t1.to_hms(), "01:02:45");
+        assert_eq!(t1.to_friendly_duration(), "1h 2m 45s");
+
+        let t2 = MediaTime::from_millis(5 * 60 * 1000 + 30 * 1000);
+        assert_eq!(t2.to_hms(), "00:05:30");
+        assert_eq!(t2.to_friendly_duration(), "5m 30s");
+
+        let t3 = MediaTime::from_millis(15 * 1000);
+        assert_eq!(t3.to_hms(), "00:00:15");
+        assert_eq!(t3.to_friendly_duration(), "15s");
+
+        assert_eq!(MediaTime::UNANCHORED.to_hms(), "--:--:--");
+        assert_eq!(MediaTime::UNANCHORED.to_friendly_duration(), "unknown");
+
+        let total = MediaTime::from_millis(100_000);
+        let half = MediaTime::from_millis(50_000);
+        assert!((half.percent_of(total) - 50.0).abs() < 1e-6);
+        assert_eq!(MediaTime::from_percent(total, 50.0).as_millis(), 50_000);
+
+        // Edge cases
+        assert_eq!(half.percent_of(MediaTime::ZERO), 0.0);
+        assert_eq!(half.percent_of(MediaTime::UNANCHORED), 0.0);
+        assert_eq!(MediaTime::UNANCHORED.percent_of(total), 0.0);
+        assert_eq!(MediaTime::from_percent(total, -10.0), MediaTime::ZERO);
+        assert_eq!(MediaTime::from_percent(total, 150.0), total);
+        assert_eq!(MediaTime::from_percent(MediaTime::ZERO, 50.0), MediaTime::ZERO);
     }
 }
