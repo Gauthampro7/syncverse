@@ -257,7 +257,11 @@ impl VideoViewport {
         now: Instant,
     ) {
         if !clock.is_playing() {
-            if let Some(frame) = self.pending_frame.take().or_else(|| video_ring.try_pop()) {
+            let mut latest_frame = self.pending_frame.take().or_else(|| video_ring.try_pop());
+            while let Some(newer) = video_ring.try_pop() {
+                latest_frame = Some(newer);
+            }
+            if let Some(frame) = latest_frame {
                 self.upload_texture(ctx, &frame);
                 ctx.request_repaint();
             }
@@ -474,7 +478,7 @@ impl VideoViewport {
         // 5. Handle mouse click and scroll events
         if response.hovered() {
             action.scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-            if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) {
+            if response.clicked_by(egui::PointerButton::Middle) {
                 action.toggle_mute = true;
             }
         }

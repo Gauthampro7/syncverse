@@ -78,11 +78,14 @@ impl HostPartyDialog {
         egui::Window::new("🌐 Host Watch Party Room")
             .open(&mut is_open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .default_width(420.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.label(RichText::new("Host a deterministic clock-synchronized watch party.").italics().color(Color32::from_rgb(156, 163, 175)));
                 ui.separator();
 
@@ -181,6 +184,7 @@ impl HostPartyDialog {
                     });
                 });
             });
+            });
 
         self.is_open = is_open;
     }
@@ -238,11 +242,14 @@ impl ConnectPartyDialog {
         egui::Window::new("🔗 Connect to Watch Party")
             .open(&mut is_open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .default_width(400.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.label(RichText::new("Connect to a friend's watch party room.").italics().color(Color32::from_rgb(156, 163, 175)));
                 ui.separator();
 
@@ -314,6 +321,7 @@ impl ConnectPartyDialog {
                     });
                 });
             });
+            });
 
         self.is_open = is_open;
     }
@@ -344,6 +352,8 @@ impl ShortcutsDialog {
             .resizable(true)
             .default_width(560.0)
             .default_height(480.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -566,11 +576,14 @@ impl AboutDialog {
         egui::Window::new("ℹ About Syncverse")
             .open(&mut is_open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .default_width(460.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.heading("Syncverse");
                     ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(96, 165, 250)));
@@ -594,6 +607,7 @@ impl AboutDialog {
                         self.is_open = false;
                     }
                 });
+            });
             });
 
         self.is_open = is_open;
@@ -781,9 +795,12 @@ impl AudioConfigDialog {
             .collapsible(false)
             .resizable(true)
             .default_width(450.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.label(
                     RichText::new("Configure audio streams, output volume, and sync calibration.")
                         .italics()
@@ -919,6 +936,7 @@ impl AudioConfigDialog {
                         self.is_open = false;
                     }
                 });
+            });
             });
 
         self.is_open = is_open;
@@ -1093,9 +1111,12 @@ impl VideoConfigDialog {
             .collapsible(false)
             .resizable(true)
             .default_width(460.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.label(
                     RichText::new("Configure aspect ratio framing, playback speed, and stream properties.")
                         .italics()
@@ -1189,6 +1210,7 @@ impl VideoConfigDialog {
                         self.is_open = false;
                     }
                 });
+            });
             });
 
         self.is_open = is_open;
@@ -1477,9 +1499,12 @@ impl SubtitleConfigDialog {
             .collapsible(false)
             .resizable(true)
             .default_width(480.0)
+            .max_width(ctx.content_rect().width() - 20.0)
+            .max_height(ctx.content_rect().height() - 20.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
                 ui.label(
                     RichText::new("Select embedded or external subtitles and calibrate display timing.")
                         .italics()
@@ -1675,6 +1700,7 @@ impl SubtitleConfigDialog {
                         self.is_open = false;
                     }
                 });
+            });
             });
 
         self.is_open = is_open;

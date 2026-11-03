@@ -216,6 +216,25 @@ impl ControlsBarState {
         width < ULTRA_COMPACT_LAYOUT_THRESHOLD_PX
     }
 
+    /// Evaluates the effective presentation timestamp in milliseconds, taking into account
+    /// active dragging and pending seek smoothing with a 400ms grace period.
+    pub fn effective_position_ms(&mut self, snapshot_ms: u64, now: Instant) -> u64 {
+        if let Some(drag_pts) = self.drag_pts_ms {
+            drag_pts
+        } else if let Some((seek_target, seek_time)) = self.pending_seek_ms {
+            if now.saturating_duration_since(seek_time) < std::time::Duration::from_millis(400)
+                && snapshot_ms.abs_diff(seek_target) > 500
+            {
+                seek_target
+            } else {
+                self.pending_seek_ms = None;
+                snapshot_ms
+            }
+        } else {
+            snapshot_ms
+        }
+    }
+
     /// Renders any active modal dialogs (Audio, Video, Subtitle) to the UI context.
     pub fn show_dialogs(&mut self, ctx: &Context) {
         self.audio_dialog.show(ctx);
@@ -316,13 +335,16 @@ impl PlaybackControlsBar {
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
+                    let snapshot_ms = snapshot.media_position_pts / 1_000_000;
+                    let current_ms = state.effective_position_ms(snapshot_ms, now);
+
                     // Top: Interactive Seekbar spanning available width
-                    actions.extend(Self::render_seekbar(ui, snapshot, state, now));
+                    actions.extend(Self::render_seekbar(ui, snapshot, state, current_ms, now));
 
                     ui.add_space(6.0);
 
                     // Bottom: Transport buttons, Timecode HUD, Volume, Speed, and Toggles
-                    actions.extend(Self::render_controls_row(ui, snapshot, state));
+                    actions.extend(Self::render_controls_row(ui, snapshot, state, current_ms));
                 });
             });
 
@@ -334,31 +356,12 @@ impl PlaybackControlsBar {
         ui: &mut Ui,
         snapshot: &PlayerUiSnapshot,
         state: &mut ControlsBarState,
+        current_ms: u64,
         now: Instant,
     ) -> Vec<ControlsBarAction> {
         let mut actions = Vec::new();
 
         let duration_ms = snapshot.media_duration_pts / 1_000_000;
-        let snapshot_ms = snapshot.media_position_pts / 1_000_000;
-
-        // Resolve presentation position for seekbar thumb:
-        // 1. Drag position while user is actively scrubbing
-        // 2. Pending seek target within 400ms grace period until snapshot catches up
-        // 3. Current snapshot position
-        let current_ms = if let Some(drag_pts) = state.drag_pts_ms {
-            drag_pts
-        } else if let Some((seek_target, seek_time)) = state.pending_seek_ms {
-            if seek_time.elapsed() < std::time::Duration::from_millis(400)
-                && snapshot_ms.abs_diff(seek_target) > 500
-            {
-                seek_target
-            } else {
-                state.pending_seek_ms = None;
-                snapshot_ms
-            }
-        } else {
-            snapshot_ms
-        };
 
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 16.0),
@@ -437,14 +440,17 @@ impl PlaybackControlsBar {
 
         // Hover tooltip preview (HH:MM:SS with Chapter title) & mouse wheel seek
         if response.hovered() && duration_ms > 0 {
-            // Mouse wheel scroll to seek (±5s)
-            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 0.0 {
-                state.on_user_activity(now);
-                let step_ms: i64 = if scroll_y > 0.0 { 5_000 } else { -5_000 };
-                let target_pts = (current_ms as i64 + step_ms).clamp(0, duration_ms as i64) as u64;
-                state.pending_seek_ms = Some((target_pts, now));
-                actions.push(ControlsBarAction::Seek(target_pts));
+            // Mouse wheel scroll to seek (±5s) - ignored if actively dragging to prevent conflicts
+            let is_dragging = response.dragged() || state.drag_pts_ms.is_some();
+            if !is_dragging {
+                let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_y.abs() >= 2.0 {
+                    state.on_user_activity(now);
+                    let step_ms: i64 = if scroll_y > 0.0 { 5_000 } else { -5_000 };
+                    let target_pts = (current_ms as i64 + step_ms).clamp(0, duration_ms as i64) as u64;
+                    state.pending_seek_ms = Some((target_pts, now));
+                    actions.push(ControlsBarAction::Seek(target_pts));
+                }
             }
 
             if let Some(mouse_pos) = response.hover_pos() {
@@ -507,10 +513,8 @@ impl PlaybackControlsBar {
                 state.pending_seek_ms = Some((final_pts, now));
                 actions.push(ControlsBarAction::Seek(final_pts));
             }
-        }
-
-        // Click-to-seek
-        if response.clicked() && duration_ms > 0 {
+        } else if response.clicked() && duration_ms > 0 {
+            // Click-to-seek (guarded by else-if so it does not trigger on drag release)
             state.on_user_activity(now);
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = ((mouse_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
@@ -528,6 +532,7 @@ impl PlaybackControlsBar {
         ui: &mut Ui,
         snapshot: &PlayerUiSnapshot,
         state: &mut ControlsBarState,
+        current_ms: u64,
     ) -> Vec<ControlsBarAction> {
         let mut actions = Vec::new();
         let bar_width = ui.available_width();
@@ -619,20 +624,6 @@ impl PlaybackControlsBar {
             }
 
             // Timecode HUD: Monospace HH:MM:SS / HH:MM:SS (or single HH:MM:SS on narrowest viewports)
-            let snapshot_ms = snapshot.media_position_pts / 1_000_000;
-            let current_ms = if let Some(drag_pts) = state.drag_pts_ms {
-                drag_pts
-            } else if let Some((seek_target, seek_time)) = state.pending_seek_ms {
-                if seek_time.elapsed() < std::time::Duration::from_millis(400)
-                    && snapshot_ms.abs_diff(seek_target) > 500
-                {
-                    seek_target
-                } else {
-                    snapshot_ms
-                }
-            } else {
-                snapshot_ms
-            };
             let duration_ms = snapshot.media_duration_pts / 1_000_000;
             let timecode_str = if bar_width < 450.0 {
                 ControlsBarState::format_timestamp(current_ms)
@@ -797,16 +788,17 @@ impl PlaybackControlsBar {
                 }
 
                 ui.separator();
-
-                // Volume percentage text
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(state.volume.formatted_percentage())
-                            .monospace()
-                            .size(12.0)
-                            .color(style::TEXT_SECONDARY),
-                    ),
-                );
+                if !is_ultra_compact {
+                    // Volume percentage text (hidden on ultra-compact to avoid crowding)
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(state.volume.formatted_percentage())
+                                .monospace()
+                                .size(12.0)
+                                .color(style::TEXT_SECONDARY),
+                        ),
+                    );
+                }
 
                 // Volume Slider (0.0 to 1.0, compact width on narrow viewports)
                 let mut vol = state.volume.volume;
@@ -820,11 +812,11 @@ impl PlaybackControlsBar {
                     actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
                 } else if slider_resp.hovered() {
                     let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll_y > 0.0 {
+                    if scroll_y >= 2.0 {
                         let new_vol = (state.volume.volume + 0.05).min(1.0);
                         state.volume.set_volume(new_vol);
                         actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
-                    } else if scroll_y < 0.0 {
+                    } else if scroll_y <= -2.0 {
                         let new_vol = (state.volume.volume - 0.05).max(0.0);
                         state.volume.set_volume(new_vol);
                         actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
@@ -983,6 +975,34 @@ mod tests {
 
         // Clearing pending seek resets smoothly
         state.pending_seek_ms = None;
+        assert_eq!(state.pending_seek_ms, None);
+    }
+
+    #[test]
+    fn test_effective_position_ms_lifecycle() {
+        let mut state = ControlsBarState::new();
+        let now = Instant::now();
+
+        // 1. Without dragging or pending seek: returns snapshot position
+        assert_eq!(state.effective_position_ms(10_000, now), 10_000);
+
+        // 2. While actively dragging: returns drag PTS irrespective of snapshot
+        state.drag_pts_ms = Some(25_000);
+        assert_eq!(state.effective_position_ms(10_000, now), 25_000);
+        state.drag_pts_ms = None;
+
+        // 3. With pending seek within 400ms grace period: returns seek target if snapshot lags (> 500ms diff)
+        state.pending_seek_ms = Some((30_000, now));
+        assert_eq!(state.effective_position_ms(10_000, now), 30_000);
+        assert!(state.pending_seek_ms.is_some());
+
+        // 4. When snapshot catches up (within 500ms of seek target): resets pending seek and returns snapshot
+        assert_eq!(state.effective_position_ms(29_800, now), 29_800);
+        assert_eq!(state.pending_seek_ms, None);
+
+        // 5. When grace period expires (> 400ms): clears pending seek and returns snapshot
+        state.pending_seek_ms = Some((50_000, now - Duration::from_millis(500)));
+        assert_eq!(state.effective_position_ms(12_000, now), 12_000);
         assert_eq!(state.pending_seek_ms, None);
     }
 }

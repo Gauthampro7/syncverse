@@ -6,13 +6,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Cross-platform system idle inhibitor managing screen-saver suspension during playback.
 pub struct IdleInhibitor {
     is_active: AtomicBool,
     #[cfg(target_os = "linux")]
-    cookie: Mutex<Option<(u32, zbus::blocking::Connection)>>,
+    cookie: Arc<Mutex<Option<(u32, zbus::blocking::Connection)>>>,
 }
 
 impl Default for IdleInhibitor {
@@ -27,7 +27,7 @@ impl IdleInhibitor {
         Self {
             is_active: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
-            cookie: Mutex::new(None),
+            cookie: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -39,25 +39,30 @@ impl IdleInhibitor {
 
         #[cfg(target_os = "linux")]
         {
-            if let Ok(mut lock) = self.cookie.lock() {
-                if lock.is_none() {
-                    if let Ok(conn) = zbus::blocking::Connection::session() {
-                        let res: Result<u32, _> = conn
-                            .call_method(
-                                Some("org.freedesktop.ScreenSaver"),
-                                "/org/freedesktop/ScreenSaver",
-                                Some("org.freedesktop.ScreenSaver"),
-                                "Inhibit",
-                                &("Syncverse", "Video Playback"),
-                            )
-                            .and_then(|reply| reply.body().deserialize());
+            let cookie_arc = self.cookie.clone();
+            let _ = std::thread::Builder::new()
+                .name("syncverse-idle-inhibit".to_string())
+                .spawn(move || {
+                    if let Ok(mut lock) = cookie_arc.lock() {
+                        if lock.is_none() {
+                            if let Ok(conn) = zbus::blocking::Connection::session() {
+                                let res: Result<u32, _> = conn
+                                    .call_method(
+                                        Some("org.freedesktop.ScreenSaver"),
+                                        "/org/freedesktop/ScreenSaver",
+                                        Some("org.freedesktop.ScreenSaver"),
+                                        "Inhibit",
+                                        &("Syncverse", "Video Playback"),
+                                    )
+                                    .and_then(|reply| reply.body().deserialize());
 
-                        if let Ok(cookie_val) = res {
-                            *lock = Some((cookie_val, conn));
+                                if let Ok(cookie_val) = res {
+                                    *lock = Some((cookie_val, conn));
+                                }
+                            }
                         }
                     }
-                }
-            }
+                });
         }
     }
 
@@ -69,17 +74,22 @@ impl IdleInhibitor {
 
         #[cfg(target_os = "linux")]
         {
-            if let Ok(mut lock) = self.cookie.lock() {
-                if let Some((cookie_val, conn)) = lock.take() {
-                    let _ = conn.call_method(
-                        Some("org.freedesktop.ScreenSaver"),
-                        "/org/freedesktop/ScreenSaver",
-                        Some("org.freedesktop.ScreenSaver"),
-                        "UnInhibit",
-                        &(cookie_val,),
-                    );
-                }
-            }
+            let cookie_arc = self.cookie.clone();
+            let _ = std::thread::Builder::new()
+                .name("syncverse-idle-uninhibit".to_string())
+                .spawn(move || {
+                    if let Ok(mut lock) = cookie_arc.lock() {
+                        if let Some((cookie_val, conn)) = lock.take() {
+                            let _ = conn.call_method(
+                                Some("org.freedesktop.ScreenSaver"),
+                                "/org/freedesktop/ScreenSaver",
+                                Some("org.freedesktop.ScreenSaver"),
+                                "UnInhibit",
+                                &(cookie_val,),
+                            );
+                        }
+                    }
+                });
         }
     }
 

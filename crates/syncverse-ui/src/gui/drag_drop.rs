@@ -42,18 +42,28 @@ pub enum DroppedFileAction {
 pub struct DragDropHandler;
 
 impl DragDropHandler {
-    /// Inspects egui raw input and returns the first dropped media or subtitle file action, if any.
-    pub fn handle_dropped_file(ctx: &Context) -> Option<DroppedFileAction> {
+    /// Inspects egui raw input and returns all dropped media and subtitle file actions, prioritizing media first.
+    pub fn handle_dropped_files(ctx: &Context) -> Vec<DroppedFileAction> {
+        let mut actions = Vec::new();
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        for file in dropped {
+        for file in &dropped {
             let path = file.path();
             if is_supported_media(path) {
-                return Some(DroppedFileAction::OpenMedia(path.to_path_buf()));
+                actions.push(DroppedFileAction::OpenMedia(path.to_path_buf()));
             } else if is_supported_subtitle(path) {
-                return Some(DroppedFileAction::LoadSubtitle(path.to_path_buf()));
+                actions.push(DroppedFileAction::LoadSubtitle(path.to_path_buf()));
             }
         }
-        None
+        actions.sort_by_key(|a| match a {
+            DroppedFileAction::OpenMedia(_) => 0,
+            DroppedFileAction::LoadSubtitle(_) => 1,
+        });
+        actions
+    }
+
+    /// Inspects egui raw input and returns the first dropped media or subtitle file action, if any.
+    pub fn handle_dropped_file(ctx: &Context) -> Option<DroppedFileAction> {
+        Self::handle_dropped_files(ctx).into_iter().next()
     }
 
     /// Renders a centered semi-transparent drag-hover overlay when a file is hovered over the window.

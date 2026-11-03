@@ -328,3 +328,32 @@ fn test_subtitle_cache_overlapping_cues() {
     assert_eq!(app.current_active_subtitle(6000), None);
 }
 
+#[test]
+fn test_seek_to_lifecycle_and_pending_pts() {
+    use syncverse_ui::gui::SyncverseApp;
+
+    let mut app = SyncverseApp::new();
+    let now = Instant::now();
+
+    assert_eq!(app.controls_state().pending_seek_ms, None);
+    app.seek_to(15_000, now, Some("Seek: 00:00:15 (+15s)".to_string()));
+
+    assert_eq!(app.controls_state().pending_seek_ms, Some((15_000, now)));
+    assert!(app.osd_overlay().active_notification(now).is_some());
+}
+
+#[test]
+fn test_loop_mode_flag_mutation() {
+    use syncverse_ui::gui::SyncverseApp;
+
+    let mut app = SyncverseApp::new();
+    assert!(!app.is_loop_enabled());
+
+    app.set_loop_enabled(true);
+    assert!(app.is_loop_enabled());
+
+    app.set_loop_enabled(false);
+    assert!(!app.is_loop_enabled());
+}
+
+

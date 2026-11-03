@@ -111,6 +111,8 @@ pub struct SyncverseApp {
     mpris_manager: crate::gui::mpris::MprisManager,
     loop_enabled: bool,
     cached_clipboard: Option<String>,
+    last_sent_window_title: Option<String>,
+    was_minimized: bool,
 }
 
 /// Backwards-compatible type alias for [`SyncverseApp`].
@@ -170,6 +172,8 @@ impl Default for SyncverseApp {
             mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
             loop_enabled: false,
             cached_clipboard: None,
+            last_sent_window_title: None,
+            was_minimized: bool::default(),
         };
         app.controls_state
             .subtitle_dialog
@@ -269,6 +273,8 @@ impl SyncverseApp {
             mpris_manager: crate::gui::mpris::MprisManager::start(command_tx.clone()),
             loop_enabled: false,
             cached_clipboard: None,
+            last_sent_window_title: None,
+            was_minimized: bool::default(),
         };
         app.controls_state
             .subtitle_dialog
@@ -300,6 +306,16 @@ impl SyncverseApp {
     /// Returns a mutable reference to the active OSD HUD overlay.
     pub fn osd_overlay_mut(&mut self) -> &mut OsdOverlay {
         &mut self.osd_overlay
+    }
+
+    /// Returns a reference to the controls bar state.
+    pub fn controls_state(&self) -> &ControlsBarState {
+        &self.controls_state
+    }
+
+    /// Returns a mutable reference to the controls bar state.
+    pub fn controls_state_mut(&mut self) -> &mut ControlsBarState {
+        &mut self.controls_state
     }
 
     /// Returns the current presentation audio delay in milliseconds.
@@ -366,6 +382,16 @@ impl SyncverseApp {
         }
     }
 
+    /// Dispatches a seek command with smooth presentation tracking and viewport queue invalidation.
+    pub fn seek_to(&mut self, target_ms: u64, now: Instant, osd_label: Option<String>) {
+        self.viewport.clear_pending();
+        self.controls_state.pending_seek_ms = Some((target_ms, now));
+        let _ = self.command_tx.send(PlayerCommand::Seek(target_ms));
+        if let Some(msg) = osd_label {
+            self.osd_overlay.show_notification(msg, now);
+        }
+    }
+
     /// Navigates to the next chapter if present, seeking to its start timestamp.
     pub fn jump_next_chapter(&mut self, current_ms: u64, now: Instant) {
         if self.controls_state.chapters.is_empty() {
@@ -377,9 +403,12 @@ impl SyncverseApp {
             .iter()
             .find(|c| c.start_ms > current_ms + 1000);
         if let Some(ch) = next {
-            let _ = self.command_tx.send(PlayerCommand::Seek(ch.start_ms));
             let title = if ch.title.is_empty() { "Chapter" } else { ch.title.as_str() };
-            self.osd_overlay.show_notification(format!("⏭ Next Chapter: {}", title), now);
+            self.seek_to(
+                ch.start_ms,
+                now,
+                Some(format!("⏭ Next Chapter: {}", title)),
+            );
         }
     }
 
@@ -397,14 +426,20 @@ impl SyncverseApp {
         if let Some(idx) = current_idx {
             let ch = &self.controls_state.chapters[idx];
             if current_ms > ch.start_ms + 3000 || idx == 0 {
-                let _ = self.command_tx.send(PlayerCommand::Seek(ch.start_ms));
                 let title = if ch.title.is_empty() { "Chapter" } else { ch.title.as_str() };
-                self.osd_overlay.show_notification(format!("⏮ Restart Chapter: {}", title), now);
+                self.seek_to(
+                    ch.start_ms,
+                    now,
+                    Some(format!("⏮ Restart Chapter: {}", title)),
+                );
             } else {
                 let prev_ch = &self.controls_state.chapters[idx - 1];
-                let _ = self.command_tx.send(PlayerCommand::Seek(prev_ch.start_ms));
                 let title = if prev_ch.title.is_empty() { "Chapter" } else { prev_ch.title.as_str() };
-                self.osd_overlay.show_notification(format!("⏮ Previous Chapter: {}", title), now);
+                self.seek_to(
+                    prev_ch.start_ms,
+                    now,
+                    Some(format!("⏮ Previous Chapter: {}", title)),
+                );
             }
         }
     }
@@ -598,6 +633,12 @@ impl SyncverseApp {
         self.subtitle_track_data.clear();
         self.active_subtitle_cues.clear();
         self.subtitle_delay_ms = 0;
+        self.audio_track_index = 0;
+        self.audio_tracks.clear();
+        self.controls_state.audio_dialog.tracks.clear();
+        self.controls_state.chapters.clear();
+        self.controls_state.pending_seek_ms = None;
+        self.controls_state.drag_pts_ms = None;
 
         let external = syncverse_demux::subtitles::scan_external_subtitles(&path);
         for ext_track in external {
@@ -958,11 +999,39 @@ impl eframe::App for SyncverseApp {
             let _ = self.command_tx.send(PlayerCommand::Stop);
         }
 
-        // Push current dynamic window title to viewport
-        ctx.send_viewport_cmd(ViewportCommand::Title(self.current_window_title.clone()));
+        // Minimize detection and render throttling
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if is_minimized {
+            self.was_minimized = true;
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        } else if self.was_minimized {
+            self.was_minimized = false;
+            ctx.request_repaint();
+        }
+
+        // Sync fullscreen state from compositor / window manager
+        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
+            self.controls_state.is_fullscreen = fs;
+        }
+
+        // Push current dynamic window title to viewport (cached to eliminate redundant IPC spam)
+        if self.last_sent_window_title.as_ref() != Some(&self.current_window_title) {
+            ctx.send_viewport_cmd(ViewportCommand::Title(self.current_window_title.clone()));
+            self.last_sent_window_title = Some(self.current_window_title.clone());
+        }
 
         // 2. Poll latest atomic UI snapshot from telemetry aggregator
         let snapshot = self.exchange.poll_latest_snapshot();
+        self.controls_state.volume.is_muted = snapshot.is_muted();
+        self.loop_enabled = snapshot.is_loop_enabled();
+
+        // Cache raw clipboard paste events
+        for ev in ctx.input(|i| i.raw.events.clone()) {
+            if let egui::Event::Paste(ref text) = ev {
+                self.cached_clipboard = Some(text.clone());
+            }
+        }
 
         // 3. User activity tracking for fullscreen auto-hide & cursor visibility
         let any_modal = self.is_any_modal_open();
@@ -1034,25 +1103,25 @@ impl eframe::App for SyncverseApp {
         // 4. Global keyboard shortcuts (suppressed if typing in text edit or any modal dialog is open)
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus && !self.is_any_modal_open() {
-            if ctx.input(|i| i.key_pressed(egui::Key::F11) || i.key_pressed(egui::Key::F)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::F11) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::F))) {
                 self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Tab)) {
                 self.sidebar_state.toggle();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
                 self.shortcuts_dialog.open();
             }
-            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O)) {
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::O)) {
                 self.file_dialog.open_file_dialog();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Space)) {
                 let _ = self.command_tx.send(PlayerCommand::TogglePause);
                 let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
                 self.osd_overlay.show_notification(toast.to_string(), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
                 let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
                     -60_000
                 } else if ctx.input(|i| i.modifiers.shift) {
@@ -1062,15 +1131,13 @@ impl eframe::App for SyncverseApp {
                 };
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let target = (current_ms + offset_ms).max(0) as u64;
-                self.viewport.clear_pending();
-                self.controls_state.pending_seek_ms = Some((target, now));
-                let _ = self.command_tx.send(PlayerCommand::Seek(target));
-                self.osd_overlay.show_notification(
-                    format!("Seek: {} ({:+}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
+                self.seek_to(
+                    target,
                     now,
+                    Some(format!("Seek: {} ({:+}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000)),
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
                 let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
                     60_000
                 } else if ctx.input(|i| i.modifiers.shift) {
@@ -1081,32 +1148,25 @@ impl eframe::App for SyncverseApp {
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
                 let target = ((current_ms + offset_ms).max(0) as u64).min(dur_ms);
-                self.viewport.clear_pending();
-                self.controls_state.pending_seek_ms = Some((target, now));
-                let _ = self.command_tx.send(PlayerCommand::Seek(target));
-                self.osd_overlay.show_notification(
-                    format!("Seek: {} (+{}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
+                self.seek_to(
+                    target,
                     now,
+                    Some(format!("Seek: {} (+{}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000)),
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
-                self.viewport.clear_pending();
-                self.controls_state.pending_seek_ms = Some((0, now));
-                let _ = self.command_tx.send(PlayerCommand::Seek(0));
-                self.osd_overlay.show_notification("Seek: 00:00:00 (Start)".to_string(), now);
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Home)) {
+                self.seek_to(0, now, Some("Seek: 00:00:00 (Start)".to_string()));
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::End)) {
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
                 let target = dur_ms.saturating_sub(1000);
-                self.viewport.clear_pending();
-                self.controls_state.pending_seek_ms = Some((target, now));
-                let _ = self.command_tx.send(PlayerCommand::Seek(target));
-                self.osd_overlay.show_notification(
-                    format!("Seek: {} (End)", ControlsBarState::format_timestamp(target)),
+                self.seek_to(
+                    target,
                     now,
+                    Some(format!("Seek: {} (End)", ControlsBarState::format_timestamp(target))),
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Period)) {
                 // Step forward 1 frame (~42ms)
                 let current_ms = snapshot.media_position_pts / 1_000_000;
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
@@ -1118,13 +1178,12 @@ impl eframe::App for SyncverseApp {
                 self.viewport.clear_pending();
                 self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: true });
-                let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
                     format!("Frame Step: +1 ({})", ControlsBarState::format_timestamp(target)),
                     now,
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Comma)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Comma)) {
                 // Step backward 1 frame (~42ms)
                 let current_ms = snapshot.media_position_pts / 1_000_000;
                 let step_ms = 42;
@@ -1135,20 +1194,18 @@ impl eframe::App for SyncverseApp {
                 self.viewport.clear_pending();
                 self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: false });
-                let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
                     format!("Frame Step: -1 ({})", ControlsBarState::format_timestamp(target)),
                     now,
                 );
             }
-            if ctx.input(|i| (i.modifiers.ctrl && i.key_pressed(egui::Key::L)) || i.key_pressed(egui::Key::L)) {
+            if ctx.input(|i| (i.modifiers.ctrl && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::L))) {
                 self.loop_enabled = !self.loop_enabled;
                 let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
-                let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
                 let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
                 self.osd_overlay.show_notification(msg.to_string(), now);
             }
-            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V)) {
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::V)) {
                 let clipboard_text = ctx.input(|i| {
                     for ev in &i.raw.events {
                         if let egui::Event::Paste(text) = ev {
@@ -1182,7 +1239,7 @@ impl eframe::App for SyncverseApp {
                     }
                 }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)) {
                 let new_vol = (self.controls_state.volume.volume + 0.05).min(1.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
@@ -1191,7 +1248,7 @@ impl eframe::App for SyncverseApp {
                     now,
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)) {
                 let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
@@ -1200,35 +1257,35 @@ impl eframe::App for SyncverseApp {
                     now,
                 );
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::M)) {
                 self.controls_state.volume.toggle_mute();
                 let _ = self.command_tx.send(PlayerCommand::ToggleMute);
                 let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
                 self.osd_overlay.show_notification(toast.to_string(), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::S)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::S)) {
                 let _ = self.command_tx.send(PlayerCommand::Stop);
                 self.osd_overlay.show_notification("Stopped".to_string(), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::OpenBracket)) {
                 let spd = (self.controls_state.speed - 0.25).max(0.25);
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
                 self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::CloseBracket)) {
                 let spd = (self.controls_state.speed + 0.25).min(3.0);
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
                 self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Backspace)) {
                 self.controls_state.speed = 1.0;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(1.0));
                 self.osd_overlay.show_notification("Speed: 1.00x".to_string(), now);
             }
             // Audio track cycling (B)
-            if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::B)) {
                 let _ = self.command_tx.send(PlayerCommand::CycleAudioTrack);
                 let notif = if !self.audio_tracks.is_empty() {
                     self.audio_track_index = (self.audio_track_index + 1) % self.audio_tracks.len();
@@ -1249,7 +1306,7 @@ impl eframe::App for SyncverseApp {
                 ctx.request_repaint();
             }
             // Subtitle track cycling (V or C)
-            if ctx.input(|i| i.key_pressed(egui::Key::V) || i.key_pressed(egui::Key::C)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::V) || i.key_pressed(egui::Key::C))) {
                 let _ = self.command_tx.send(PlayerCommand::CycleSubtitleTrack);
                 let notif = if !self.subtitle_tracks.is_empty() {
                     let next_idx = match self.subtitle_track_index {
@@ -1287,7 +1344,7 @@ impl eframe::App for SyncverseApp {
                 self.osd_overlay.show_notification(notif, now);
             }
             // Aspect ratio cycling (A)
-            if ctx.input(|i| i.key_pressed(egui::Key::A)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::A)) {
                 let new_ar = self.viewport.cycle_aspect_override();
                 self.controls_state.aspect_ratio = new_ar;
                 self.controls_state.video_dialog.set_aspect_ratio(new_ar);
@@ -1297,20 +1354,20 @@ impl eframe::App for SyncverseApp {
                 self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
             }
             // Audio delay adjustment (J: -50ms, K: +50ms)
-            if ctx.input(|i| i.key_pressed(egui::Key::J)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::J)) {
                 self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::K)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::K)) {
                 self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
             // Subtitle delay adjustment (Z: -50ms, X: +50ms)
-            if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Z)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1318,7 +1375,7 @@ impl eframe::App for SyncverseApp {
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::X)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1337,7 +1394,7 @@ impl eframe::App for SyncverseApp {
                 (egui::Key::Num6, "🎉"),
             ];
             for (key, emoji) in reaction_keys {
-                if ctx.input(|i| i.key_pressed(key)) {
+                if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(key)) {
                     let _ = self.command_tx.send(PlayerCommand::SendReaction(emoji.to_string()));
                     let target_rect = self
                         .viewport
@@ -1349,17 +1406,17 @@ impl eframe::App for SyncverseApp {
             }
 
             // Chapter Navigation (PageUp: Previous, PageDown: Next)
-            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::PageUp)) {
                 let current_ms = snapshot.media_position_pts / 1_000_000;
                 self.jump_prev_chapter(current_ms, now);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::PageDown)) {
                 let current_ms = snapshot.media_position_pts / 1_000_000;
                 self.jump_next_chapter(current_ms, now);
             }
 
             // Lossless Screenshot Snapshot (F8 or Ctrl+S)
-            if ctx.input(|i| i.key_pressed(egui::Key::F8) || (i.modifiers.ctrl && i.key_pressed(egui::Key::S))) {
+            if ctx.input(|i| i.key_pressed(egui::Key::F8) || (i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::S))) {
                 self.take_screenshot(now);
             }
         }
@@ -1368,7 +1425,7 @@ impl eframe::App for SyncverseApp {
         if let Some(picked_file) = self.file_dialog.poll_selected_file() {
             self.load_file(picked_file);
         }
-        if let Some(action) = DragDropHandler::handle_dropped_file(&ctx) {
+        for action in DragDropHandler::handle_dropped_files(&ctx) {
             match action {
                 DroppedFileAction::OpenMedia(path) => {
                     self.load_file(path);
@@ -1558,6 +1615,10 @@ impl eframe::App for SyncverseApp {
                             self.subtitle_track_data.clear();
                             self.active_subtitle_cues.clear();
                             self.subtitle_track_index = None;
+                            self.controls_state.subtitle_dialog.tracks.clear();
+                            self.audio_tracks.clear();
+                            self.audio_track_index = 0;
+                            self.controls_state.audio_dialog.tracks.clear();
                             self.controls_state.chapters.clear();
                             self.controls_state.pending_seek_ms = None;
                             self.controls_state.drag_pts_ms = None;
@@ -1600,46 +1661,40 @@ impl eframe::App for SyncverseApp {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let target = (current_ms - 5_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                            self.seek_to(target, now, Some(format!("Seek: {} (-5s)", ControlsBarState::format_timestamp(target))));
                         }
                         if ui.button("Seek +5s (→)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let dur_ms = snapshot.media_duration_pts / 1_000_000;
                             let target = (current_ms + 5_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
+                            self.seek_to(target.min(dur_ms), now, Some(format!("Seek: {} (+5s)", ControlsBarState::format_timestamp(target.min(dur_ms)))));
                         }
                         if ui.button("Seek -30s (Shift+←)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let target = (current_ms - 30_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                            self.seek_to(target, now, Some(format!("Seek: {} (-30s)", ControlsBarState::format_timestamp(target))));
                         }
                         if ui.button("Seek +30s (Shift+→)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let dur_ms = snapshot.media_duration_pts / 1_000_000;
                             let target = (current_ms + 30_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
+                            self.seek_to(target.min(dur_ms), now, Some(format!("Seek: {} (+30s)", ControlsBarState::format_timestamp(target.min(dur_ms)))));
                         }
                         if ui.button("Seek -60s (Ctrl+←)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let target = (current_ms - 60_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                            self.seek_to(target, now, Some(format!("Seek: {} (-60s)", ControlsBarState::format_timestamp(target))));
                         }
                         if ui.button("Seek +60s (Ctrl+→)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                             let dur_ms = snapshot.media_duration_pts / 1_000_000;
                             let target = (current_ms + 60_000).max(0) as u64;
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target.min(dur_ms)));
+                            self.seek_to(target.min(dur_ms), now, Some(format!("Seek: {} (+60s)", ControlsBarState::format_timestamp(target.min(dur_ms)))));
                         }
 
                         ui.separator();
@@ -1652,8 +1707,8 @@ impl eframe::App for SyncverseApp {
                                 let _ = self.command_tx.send(PlayerCommand::TogglePause);
                             }
                             self.viewport.clear_pending();
+                            self.controls_state.pending_seek_ms = Some((target, now));
                             let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: false });
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
                             self.osd_overlay.show_notification(
                                 format!("Frame Step: -1 ({})", ControlsBarState::format_timestamp(target)),
                                 now,
@@ -1668,8 +1723,8 @@ impl eframe::App for SyncverseApp {
                                 let _ = self.command_tx.send(PlayerCommand::TogglePause);
                             }
                             self.viewport.clear_pending();
+                            self.controls_state.pending_seek_ms = Some((target, now));
                             let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: true });
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target));
                             self.osd_overlay.show_notification(
                                 format!("Frame Step: +1 ({})", ControlsBarState::format_timestamp(target)),
                                 now,
@@ -1687,7 +1742,6 @@ impl eframe::App for SyncverseApp {
                             ui.close();
                             self.loop_enabled = !self.loop_enabled;
                             let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
-                            let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
                             let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
                             self.osd_overlay.show_notification(msg.to_string(), now);
                         }
@@ -1774,6 +1828,19 @@ impl eframe::App for SyncverseApp {
                             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
                         }
 
+                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        let max_label = if is_maximized { "Restore Window" } else { "Maximize Window" };
+                        if ui.button(max_label).clicked() {
+                            ui.close();
+                            ctx.send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
+                        }
+                        if ui.button("Minimize Window").clicked() {
+                            ui.close();
+                            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                        }
+
+                        ui.separator();
+
                         ui.menu_button("Aspect Ratio", |ui| {
                             for &ar in &crate::gui::aspect_ratio::AspectRatioOverride::ALL {
                                 let is_selected = self.viewport.aspect_override() == ar;
@@ -1846,8 +1913,7 @@ impl eframe::App for SyncverseApp {
                             let _ = self.command_tx.send(PlayerCommand::Stop);
                         }
                         ControlsBarAction::Seek(target_pts) => {
-                            self.viewport.clear_pending();
-                            let _ = self.command_tx.send(PlayerCommand::Seek(target_pts));
+                            self.seek_to(target_pts, now, None);
                         }
                         ControlsBarAction::SetVolume(vol) => {
                             let _ = self.command_tx.send(PlayerCommand::SetVolume(vol));
@@ -1932,6 +1998,8 @@ impl eframe::App for SyncverseApp {
                 let mut request_jump_prev_chapter = false;
                 let mut request_jump_next_chapter = false;
                 let mut request_toggle_loop = false;
+                let mut request_select_audio_track: Option<usize> = None;
+                let mut request_select_subtitle_track: Option<Option<usize>> = None;
 
                 let action = self.viewport.show_with_context_menu(ui, |ui| {
                     ui.set_min_width(220.0);
@@ -2007,29 +2075,29 @@ impl eframe::App for SyncverseApp {
                             ui.close();
                             self.controls_state.audio_dialog.open();
                         }
+                        if !self.audio_tracks.is_empty() {
+                            ui.separator();
+                            for (idx, track) in self.audio_tracks.iter().enumerate() {
+                                let is_selected = self.audio_track_index == idx;
+                                if ui.selectable_label(is_selected, track).clicked() {
+                                    ui.close();
+                                    request_select_audio_track = Some(idx);
+                                }
+                            }
+                        }
                     });
 
                     ui.menu_button("💬 Subtitles", |ui| {
                         let off_selected = self.subtitle_track_index.is_none();
                         if ui.selectable_label(off_selected, "Off").clicked() {
                             ui.close();
-                            self.subtitle_track_index = None;
-                            self.controls_state.subtitle_dialog.select_track(None);
-                            self.active_subtitle_cues.clear();
-                            let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(None));
-                            self.osd_overlay.show_notification("Subtitles: Off".to_string(), now);
+                            request_select_subtitle_track = Some(None);
                         }
                         for (idx, track) in self.subtitle_tracks.iter().enumerate() {
                             let is_selected = self.subtitle_track_index == Some(idx);
                             if ui.selectable_label(is_selected, track).clicked() {
                                 ui.close();
-                                self.subtitle_track_index = Some(idx);
-                                self.controls_state.subtitle_dialog.select_track(Some(idx));
-                                if idx < self.subtitle_track_data.len() {
-                                    self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-                                }
-                                let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(Some(idx)));
-                                self.osd_overlay.show_notification(format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track), now);
+                                request_select_subtitle_track = Some(Some(idx));
                             }
                         }
                         ui.separator();
@@ -2086,9 +2154,34 @@ impl eframe::App for SyncverseApp {
                 if request_toggle_loop {
                     self.loop_enabled = !self.loop_enabled;
                     let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
-                    let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
                     let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
                     self.osd_overlay.show_notification(msg.to_string(), now);
+                }
+                if let Some(idx) = request_select_audio_track {
+                    self.audio_track_index = idx;
+                    if idx < self.controls_state.audio_dialog.tracks.len() {
+                        let id = self.controls_state.audio_dialog.tracks[idx].id;
+                        self.controls_state.audio_dialog.select_track(id);
+                    }
+                    let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(idx as u64));
+                    let track_name = self.audio_tracks.get(idx).cloned().unwrap_or_else(|| format!("Track {}", idx + 1));
+                    self.osd_overlay.show_notification(
+                        format!("Audio: Track {}/{} - {}", idx + 1, self.audio_tracks.len(), track_name),
+                        now,
+                    );
+                    ctx.request_repaint();
+                }
+                if let Some(sub_idx) = request_select_subtitle_track {
+                    self.select_subtitle_track(sub_idx);
+                    let msg = match sub_idx {
+                        Some(idx) => {
+                            let track_name = self.subtitle_tracks.get(idx).cloned().unwrap_or_else(|| format!("Track {}", idx + 1));
+                            format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track_name)
+                        }
+                        None => "Subtitles: Off".to_string(),
+                    };
+                    self.osd_overlay.show_notification(msg, now);
+                    ctx.request_repaint();
                 }
 
                 if let Some(ar) = menu_aspect_ratio {
@@ -2228,6 +2321,7 @@ impl eframe::App for SyncverseApp {
         for action in audio_actions {
             match action {
                 crate::gui::AudioConfigAction::SelectTrack(track_id) => {
+                    self.audio_track_index = track_id as usize;
                     let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(track_id));
                 }
                 crate::gui::AudioConfigAction::SetVolume(vol) => {
@@ -2267,15 +2361,8 @@ impl eframe::App for SyncverseApp {
         for action in sub_actions {
             match action {
                 crate::gui::SubtitleConfigAction::SelectTrack(track_id) => {
-                    self.subtitle_track_index = track_id;
-                    if let Some(idx) = track_id {
-                        if idx < self.subtitle_track_data.len() {
-                            self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-                        }
-                    } else {
-                        self.active_subtitle_cues.clear();
-                    }
-                    let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(track_id));
+                    self.select_subtitle_track(track_id);
+                    ctx.request_repaint();
                 }
                 crate::gui::SubtitleConfigAction::LoadExternal(path) => {
                     self.load_external_subtitle_file(path, now);
