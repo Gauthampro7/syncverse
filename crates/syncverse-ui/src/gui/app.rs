@@ -966,7 +966,28 @@ impl eframe::App for SyncverseApp {
 
         // 3. User activity tracking for fullscreen auto-hide & cursor visibility
         let any_modal = self.is_any_modal_open();
-        if any_modal || ctx.input(|i| i.pointer.is_moving() || i.pointer.any_click() || i.smooth_scroll_delta != egui::Vec2::ZERO) {
+        let is_dragging = self.controls_state.drag_pts_ms.is_some()
+            || ctx.input(|i| i.pointer.is_decidedly_dragging());
+        let screen_rect = ctx.content_rect();
+        let is_in_controls_zone = if self.controls_state.is_fullscreen {
+            ctx.input(|i| i.pointer.hover_pos())
+                .map(|p| p.y >= screen_rect.bottom() - 90.0 || p.y <= screen_rect.top() + 45.0)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let has_focus = ctx.memory(|m| m.focused().is_some());
+
+        if any_modal
+            || is_dragging
+            || has_focus
+            || is_in_controls_zone
+            || ctx.input(|i| {
+                i.pointer.is_moving()
+                    || i.pointer.any_click()
+                    || i.smooth_scroll_delta != egui::Vec2::ZERO
+            })
+        {
             self.controls_state.on_user_activity(now);
         }
         if self.controls_state.is_fullscreen && !any_modal {
@@ -1042,6 +1063,7 @@ impl eframe::App for SyncverseApp {
                 let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
                 let target = (current_ms + offset_ms).max(0) as u64;
                 self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
                     format!("Seek: {} ({:+}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
@@ -1060,9 +1082,27 @@ impl eframe::App for SyncverseApp {
                 let dur_ms = snapshot.media_duration_pts / 1_000_000;
                 let target = ((current_ms + offset_ms).max(0) as u64).min(dur_ms);
                 self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
                     format!("Seek: {} (+{}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000),
+                    now,
+                );
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((0, now));
+                let _ = self.command_tx.send(PlayerCommand::Seek(0));
+                self.osd_overlay.show_notification("Seek: 00:00:00 (Start)".to_string(), now);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                let target = dur_ms.saturating_sub(1000);
+                self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((target, now));
+                let _ = self.command_tx.send(PlayerCommand::Seek(target));
+                self.osd_overlay.show_notification(
+                    format!("Seek: {} (End)", ControlsBarState::format_timestamp(target)),
                     now,
                 );
             }
@@ -1076,6 +1116,7 @@ impl eframe::App for SyncverseApp {
                     let _ = self.command_tx.send(PlayerCommand::TogglePause);
                 }
                 self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: true });
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
@@ -1092,6 +1133,7 @@ impl eframe::App for SyncverseApp {
                     let _ = self.command_tx.send(PlayerCommand::TogglePause);
                 }
                 self.viewport.clear_pending();
+                self.controls_state.pending_seek_ms = Some((target, now));
                 let _ = self.command_tx.send(PlayerCommand::StepFrame { forward: false });
                 let _ = self.command_tx.send(PlayerCommand::Seek(target));
                 self.osd_overlay.show_notification(
@@ -1511,6 +1553,14 @@ impl eframe::App for SyncverseApp {
                             ui.close();
                             self.viewport.reset();
                             self.current_file = None;
+                            self.current_window_title = "Syncverse — Desktop Media Player".to_string();
+                            self.subtitle_tracks.clear();
+                            self.subtitle_track_data.clear();
+                            self.active_subtitle_cues.clear();
+                            self.subtitle_track_index = None;
+                            self.controls_state.chapters.clear();
+                            self.controls_state.pending_seek_ms = None;
+                            self.controls_state.drag_pts_ms = None;
                             let _ = self.command_tx.send(PlayerCommand::Stop);
                         }
 
@@ -1878,6 +1928,10 @@ impl eframe::App for SyncverseApp {
             .show(ui, |ui| {
                 let current_ar = self.viewport.aspect_override();
                 let mut menu_aspect_ratio = None;
+                let mut request_take_screenshot = false;
+                let mut request_jump_prev_chapter = false;
+                let mut request_jump_next_chapter = false;
+                let mut request_toggle_loop = false;
 
                 let action = self.viewport.show_with_context_menu(ui, |ui| {
                     ui.set_min_width(220.0);
@@ -1986,6 +2040,28 @@ impl eframe::App for SyncverseApp {
                     });
 
                     ui.separator();
+                    if ui.button("📸 Take Snapshot (F8)").clicked() {
+                        ui.close();
+                        request_take_screenshot = true;
+                    }
+                    if !self.controls_state.chapters.is_empty() {
+                        if ui.button("⏮ Previous Chapter (PageUp)").clicked() {
+                            ui.close();
+                            request_jump_prev_chapter = true;
+                        }
+                        if ui.button("⏭ Next Chapter (PageDown)").clicked() {
+                            ui.close();
+                            request_jump_next_chapter = true;
+                        }
+                    }
+
+                    let loop_label = if self.loop_enabled { "✓ Loop Playback (L)" } else { "Loop Playback (L)" };
+                    if ui.button(loop_label).clicked() {
+                        ui.close();
+                        request_toggle_loop = true;
+                    }
+
+                    ui.separator();
                     if ui.button("Video Stream Details...").clicked() {
                         ui.close();
                         self.controls_state.video_dialog.open();
@@ -1995,6 +2071,25 @@ impl eframe::App for SyncverseApp {
                         self.shortcuts_dialog.open();
                     }
                 });
+
+                if request_take_screenshot {
+                    self.take_screenshot(now);
+                }
+                if request_jump_prev_chapter {
+                    let current_ms = snapshot.media_position_pts / 1_000_000;
+                    self.jump_prev_chapter(current_ms, now);
+                }
+                if request_jump_next_chapter {
+                    let current_ms = snapshot.media_position_pts / 1_000_000;
+                    self.jump_next_chapter(current_ms, now);
+                }
+                if request_toggle_loop {
+                    self.loop_enabled = !self.loop_enabled;
+                    let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
+                    let _ = self.command_tx.send(PlayerCommand::ToggleLoop);
+                    let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
+                    self.osd_overlay.show_notification(msg.to_string(), now);
+                }
 
                 if let Some(ar) = menu_aspect_ratio {
                     self.viewport.set_aspect_override(ar);
@@ -2023,6 +2118,12 @@ impl eframe::App for SyncverseApp {
                     if action.toggle_play_pause {
                         let _ = self.command_tx.send(PlayerCommand::TogglePause);
                         let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
+                        self.osd_overlay.show_notification(toast.to_string(), now);
+                    }
+                    if action.toggle_mute {
+                        self.controls_state.volume.toggle_mute();
+                        let _ = self.command_tx.send(PlayerCommand::ToggleMute);
+                        let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
                         self.osd_overlay.show_notification(toast.to_string(), now);
                     }
                     if action.scroll_delta != 0.0 {
@@ -2220,7 +2321,7 @@ pub fn create_native_options() -> eframe::NativeOptions {
     let viewport = ViewportBuilder::default()
         .with_title("Syncverse — Desktop Media Player")
         .with_inner_size([1280.0, 720.0])
-        .with_min_inner_size([640.0, 360.0])
+        .with_min_inner_size([480.0, 270.0])
         .with_resizable(true)
         .with_active(true)
         .with_drag_and_drop(true);

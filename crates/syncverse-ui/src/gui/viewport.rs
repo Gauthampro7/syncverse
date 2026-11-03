@@ -203,6 +203,8 @@ pub struct ViewportAction {
     pub toggle_play_pause: bool,
     /// User clicked empty viewport: open media file picker.
     pub open_file: bool,
+    /// User middle-clicked: toggle audio mute.
+    pub toggle_mute: bool,
     /// Vertical mouse scroll delta over viewport.
     pub scroll_delta: f32,
 }
@@ -472,6 +474,9 @@ impl VideoViewport {
         // 5. Handle mouse click and scroll events
         if response.hovered() {
             action.scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) {
+                action.toggle_mute = true;
+            }
         }
 
         let is_empty = self.texture.is_none();

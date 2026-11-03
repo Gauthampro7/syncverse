@@ -15,6 +15,10 @@ pub const SUPPORTED_SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2
 /// (playback speed and aspect ratio) are collapsed to prevent visual overflow on compact viewports.
 pub const COMPACT_LAYOUT_THRESHOLD_PX: f32 = 700.0;
 
+/// Minimum controls bar width threshold in logical pixels below which secondary buttons and chapters
+/// are collapsed to preserve core transport and HUD clarity on narrow or split viewports.
+pub const ULTRA_COMPACT_LAYOUT_THRESHOLD_PX: f32 = 560.0;
+
 /// State of audio volume and mute controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeControlState {
@@ -110,6 +114,8 @@ pub struct ControlsBarState {
     pub aspect_ratio: AspectRatioOverride,
     /// Active drag scrub position in milliseconds (if user is actively dragging the seekbar).
     pub drag_pts_ms: Option<u64>,
+    /// Pending seek target in milliseconds and emission instant to avoid rubber-band jitter before snapshot updates.
+    pub pending_seek_ms: Option<(u64, Instant)>,
     /// Hover preview timestamp in milliseconds (if mouse is hovering over seekbar).
     pub hover_pts_ms: Option<u64>,
     /// Timestamp of last user mouse activity (for fullscreen auto-hide).
@@ -136,6 +142,7 @@ impl Default for ControlsBarState {
             speed: 1.0,
             aspect_ratio: AspectRatioOverride::Original,
             drag_pts_ms: None,
+            pending_seek_ms: None,
             hover_pts_ms: None,
             last_mouse_activity: Instant::now(),
             is_fullscreen: false,
@@ -202,6 +209,11 @@ impl ControlsBarState {
     /// Returns true if the controls bar width is below `COMPACT_LAYOUT_THRESHOLD_PX` (< 700px).
     pub fn is_compact_layout(width: f32) -> bool {
         width < COMPACT_LAYOUT_THRESHOLD_PX
+    }
+
+    /// Returns true if the controls bar width is below `ULTRA_COMPACT_LAYOUT_THRESHOLD_PX` (< 560px).
+    pub fn is_ultra_compact_layout(width: f32) -> bool {
+        width < ULTRA_COMPACT_LAYOUT_THRESHOLD_PX
     }
 
     /// Renders any active modal dialogs (Audio, Video, Subtitle) to the UI context.
@@ -327,9 +339,26 @@ impl PlaybackControlsBar {
         let mut actions = Vec::new();
 
         let duration_ms = snapshot.media_duration_pts / 1_000_000;
-        let current_ms = state
-            .drag_pts_ms
-            .unwrap_or(snapshot.media_position_pts / 1_000_000);
+        let snapshot_ms = snapshot.media_position_pts / 1_000_000;
+
+        // Resolve presentation position for seekbar thumb:
+        // 1. Drag position while user is actively scrubbing
+        // 2. Pending seek target within 400ms grace period until snapshot catches up
+        // 3. Current snapshot position
+        let current_ms = if let Some(drag_pts) = state.drag_pts_ms {
+            drag_pts
+        } else if let Some((seek_target, seek_time)) = state.pending_seek_ms {
+            if seek_time.elapsed() < std::time::Duration::from_millis(400)
+                && snapshot_ms.abs_diff(seek_target) > 500
+            {
+                seek_target
+            } else {
+                state.pending_seek_ms = None;
+                snapshot_ms
+            }
+        } else {
+            snapshot_ms
+        };
 
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 16.0),
@@ -406,8 +435,18 @@ impl PlaybackControlsBar {
             );
         }
 
-        // Hover tooltip preview (HH:MM:SS with Chapter title)
+        // Hover tooltip preview (HH:MM:SS with Chapter title) & mouse wheel seek
         if response.hovered() && duration_ms > 0 {
+            // Mouse wheel scroll to seek (±5s)
+            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll_y.abs() > 0.0 {
+                state.on_user_activity(now);
+                let step_ms: i64 = if scroll_y > 0.0 { 5_000 } else { -5_000 };
+                let target_pts = (current_ms as i64 + step_ms).clamp(0, duration_ms as i64) as u64;
+                state.pending_seek_ms = Some((target_pts, now));
+                actions.push(ControlsBarAction::Seek(target_pts));
+            }
+
             if let Some(mouse_pos) = response.hover_pos() {
                 let rel_x = ((mouse_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let hover_pts = (rel_x as f64 * duration_ms as f64).round() as u64;
@@ -465,6 +504,7 @@ impl PlaybackControlsBar {
             state.on_user_activity(now);
             if let Some(drag_pts) = state.drag_pts_ms.take() {
                 let final_pts = state.debouncer.on_release_instant(drag_pts, now);
+                state.pending_seek_ms = Some((final_pts, now));
                 actions.push(ControlsBarAction::Seek(final_pts));
             }
         }
@@ -475,6 +515,7 @@ impl PlaybackControlsBar {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = ((mouse_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let target_pts = (rel_x as f64 * duration_ms as f64).round() as u64;
+                state.pending_seek_ms = Some((target_pts, now));
                 actions.push(ControlsBarAction::Seek(target_pts));
             }
         }
@@ -491,6 +532,7 @@ impl PlaybackControlsBar {
         let mut actions = Vec::new();
         let bar_width = ui.available_width();
         let is_compact = ControlsBarState::is_compact_layout(bar_width);
+        let is_ultra_compact = ControlsBarState::is_ultra_compact_layout(bar_width);
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
@@ -537,48 +579,66 @@ impl PlaybackControlsBar {
                 actions.push(ControlsBarAction::Stop);
             }
 
-            // Previous Chapter Button
-            let prev_ch_btn = egui::Button::new(
-                RichText::new("⏮")
-                    .size(13.0)
-                    .color(style::TEXT_PRIMARY),
-            )
-            .min_size(Vec2::new(28.0, 32.0))
-            .fill(style::BUTTON_BG)
-            .corner_radius(6.0);
+            // Chapter Buttons (collapsed on narrow viewports < 560px)
+            if !is_ultra_compact {
+                // Previous Chapter Button
+                let prev_ch_btn = egui::Button::new(
+                    RichText::new("⏮")
+                        .size(13.0)
+                        .color(style::TEXT_PRIMARY),
+                )
+                .min_size(Vec2::new(28.0, 32.0))
+                .fill(style::BUTTON_BG)
+                .corner_radius(6.0);
 
-            if ui
-                .add(prev_ch_btn)
-                .on_hover_text("Previous Chapter ([)")
-                .clicked()
-            {
-                actions.push(ControlsBarAction::PreviousChapter);
+                if ui
+                    .add(prev_ch_btn)
+                    .on_hover_text("Previous Chapter (PageUp)")
+                    .clicked()
+                {
+                    actions.push(ControlsBarAction::PreviousChapter);
+                }
+
+                // Next Chapter Button
+                let next_ch_btn = egui::Button::new(
+                    RichText::new("⏭")
+                        .size(13.0)
+                        .color(style::TEXT_PRIMARY),
+                )
+                .min_size(Vec2::new(28.0, 32.0))
+                .fill(style::BUTTON_BG)
+                .corner_radius(6.0);
+
+                if ui
+                    .add(next_ch_btn)
+                    .on_hover_text("Next Chapter (PageDown)")
+                    .clicked()
+                {
+                    actions.push(ControlsBarAction::NextChapter);
+                }
             }
 
-            // Next Chapter Button
-            let next_ch_btn = egui::Button::new(
-                RichText::new("⏭")
-                    .size(13.0)
-                    .color(style::TEXT_PRIMARY),
-            )
-            .min_size(Vec2::new(28.0, 32.0))
-            .fill(style::BUTTON_BG)
-            .corner_radius(6.0);
-
-            if ui
-                .add(next_ch_btn)
-                .on_hover_text("Next Chapter (])")
-                .clicked()
-            {
-                actions.push(ControlsBarAction::NextChapter);
-            }
-
-            // Timecode HUD: Monospace HH:MM:SS / HH:MM:SS
-            let current_ms = state
-                .drag_pts_ms
-                .unwrap_or(snapshot.media_position_pts / 1_000_000);
+            // Timecode HUD: Monospace HH:MM:SS / HH:MM:SS (or single HH:MM:SS on narrowest viewports)
+            let snapshot_ms = snapshot.media_position_pts / 1_000_000;
+            let current_ms = if let Some(drag_pts) = state.drag_pts_ms {
+                drag_pts
+            } else if let Some((seek_target, seek_time)) = state.pending_seek_ms {
+                if seek_time.elapsed() < std::time::Duration::from_millis(400)
+                    && snapshot_ms.abs_diff(seek_target) > 500
+                {
+                    seek_target
+                } else {
+                    snapshot_ms
+                }
+            } else {
+                snapshot_ms
+            };
             let duration_ms = snapshot.media_duration_pts / 1_000_000;
-            let timecode_str = format_timecode_hud(current_ms, duration_ms);
+            let timecode_str = if bar_width < 450.0 {
+                ControlsBarState::format_timestamp(current_ms)
+            } else {
+                format_timecode_hud(current_ms, duration_ms)
+            };
 
             ui.add(
                 egui::Label::new(
@@ -601,11 +661,12 @@ impl PlaybackControlsBar {
                     actions.push(ControlsBarAction::ToggleFullscreen);
                 }
 
-                // Lossless Screenshot Button (📸)
-                if ui
-                    .button(RichText::new("📸").size(14.0))
-                    .on_hover_text("Take Lossless Screenshot (F8 / Ctrl+S)")
-                    .clicked()
+                // Lossless Screenshot Button (📸) (hidden on narrow viewports < 560px)
+                if !is_ultra_compact
+                    && ui
+                        .button(RichText::new("📸").size(14.0))
+                        .on_hover_text("Take Lossless Screenshot (F8 / Ctrl+S)")
+                        .clicked()
                 {
                     actions.push(ControlsBarAction::TakeScreenshot);
                 }
@@ -621,47 +682,49 @@ impl PlaybackControlsBar {
 
                 ui.separator();
 
-                // Video Configuration Quick-Access Button
-                let video_active = state.video_dialog.is_open;
-                let video_btn = egui::Button::new(
-                    RichText::new("🎬")
-                        .size(13.0)
-                        .color(if video_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
-                )
-                .min_size(Vec2::new(28.0, 28.0))
-                .fill(if video_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
+                // Video Configuration Quick-Access Button (hidden on narrow viewports < 560px)
+                if !is_ultra_compact {
+                    let video_active = state.video_dialog.is_open;
+                    let video_btn = egui::Button::new(
+                        RichText::new("🎬")
+                            .size(13.0)
+                            .color(if video_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
+                    )
+                    .min_size(Vec2::new(28.0, 28.0))
+                    .fill(if video_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
 
-                if ui
-                    .add(video_btn)
-                    .on_hover_text("Video Settings (Aspect Ratio, Playback Speed, Stream Info)")
-                    .clicked()
-                {
-                    state.video_dialog.is_open = !state.video_dialog.is_open;
-                    if state.video_dialog.is_open {
-                        state.video_dialog.speed = state.speed;
-                        state.video_dialog.aspect_ratio = state.aspect_ratio;
+                    if ui
+                        .add(video_btn)
+                        .on_hover_text("Video Settings (Aspect Ratio, Playback Speed, Stream Info)")
+                        .clicked()
+                    {
+                        state.video_dialog.is_open = !state.video_dialog.is_open;
+                        if state.video_dialog.is_open {
+                            state.video_dialog.speed = state.speed;
+                            state.video_dialog.aspect_ratio = state.aspect_ratio;
+                        }
+                        actions.push(ControlsBarAction::OpenVideoSettings);
                     }
-                    actions.push(ControlsBarAction::OpenVideoSettings);
-                }
 
-                // Subtitle Configuration Quick-Access Button
-                let sub_active = state.subtitle_dialog.is_open;
-                let sub_btn = egui::Button::new(
-                    RichText::new("CC")
-                        .strong()
-                        .size(12.0)
-                        .color(if sub_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
-                )
-                .min_size(Vec2::new(28.0, 28.0))
-                .fill(if sub_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
+                    // Subtitle Configuration Quick-Access Button
+                    let sub_active = state.subtitle_dialog.is_open;
+                    let sub_btn = egui::Button::new(
+                        RichText::new("CC")
+                            .strong()
+                            .size(12.0)
+                            .color(if sub_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
+                    )
+                    .min_size(Vec2::new(28.0, 28.0))
+                    .fill(if sub_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
 
-                if ui
-                    .add(sub_btn)
-                    .on_hover_text("Subtitle Settings (Tracks, External Subtitles, Sync Offset)")
-                    .clicked()
-                {
-                    state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
-                    actions.push(ControlsBarAction::OpenSubtitleSettings);
+                    if ui
+                        .add(sub_btn)
+                        .on_hover_text("Subtitle Settings (Tracks, External Subtitles, Sync Offset)")
+                        .clicked()
+                    {
+                        state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
+                        actions.push(ControlsBarAction::OpenSubtitleSettings);
+                    }
                 }
 
                 // Audio Configuration Quick-Access Button
@@ -745,12 +808,13 @@ impl PlaybackControlsBar {
                     ),
                 );
 
-                // Volume Slider (0.0 to 1.0)
+                // Volume Slider (0.0 to 1.0, compact width on narrow viewports)
                 let mut vol = state.volume.volume;
                 let slider = egui::Slider::new(&mut vol, 0.0..=1.0)
                     .show_value(false)
                     .trailing_fill(true);
-                let slider_resp = ui.add_sized(Vec2::new(80.0, 16.0), slider);
+                let slider_width = if is_ultra_compact { 50.0 } else { 80.0 };
+                let slider_resp = ui.add_sized(Vec2::new(slider_width, 16.0), slider);
                 if slider_resp.changed() {
                     state.volume.set_volume(vol);
                     actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
@@ -895,5 +959,30 @@ mod tests {
         assert!(ControlsBarState::is_compact_layout(500.0));
         assert!(!ControlsBarState::is_compact_layout(700.0));
         assert!(!ControlsBarState::is_compact_layout(1280.0));
+    }
+
+    #[test]
+    fn test_responsive_ultra_compact_layout_guard() {
+        assert_eq!(ULTRA_COMPACT_LAYOUT_THRESHOLD_PX, 560.0);
+        assert!(ControlsBarState::is_ultra_compact_layout(360.0));
+        assert!(ControlsBarState::is_ultra_compact_layout(480.0));
+        assert!(ControlsBarState::is_ultra_compact_layout(559.9));
+        assert!(!ControlsBarState::is_ultra_compact_layout(560.0));
+        assert!(!ControlsBarState::is_ultra_compact_layout(640.0));
+        assert!(!ControlsBarState::is_ultra_compact_layout(1920.0));
+    }
+
+    #[test]
+    fn test_pending_seek_smoothing_lifecycle() {
+        let mut state = ControlsBarState::new();
+        assert_eq!(state.pending_seek_ms, None);
+
+        let now = Instant::now();
+        state.pending_seek_ms = Some((45_000, now));
+        assert_eq!(state.pending_seek_ms, Some((45_000, now)));
+
+        // Clearing pending seek resets smoothly
+        state.pending_seek_ms = None;
+        assert_eq!(state.pending_seek_ms, None);
     }
 }

@@ -373,8 +373,16 @@ impl ShortcutsDialog {
                             ui.label("Quit Application");
                             ui.end_row();
 
-                            ui.label(RichText::new("Mouse Wheel / Scroll").monospace().strong());
+                            ui.label(RichText::new("Mouse Wheel over Viewport").monospace().strong());
                             ui.label("Adjust Volume (±5%)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Mouse Wheel over Seekbar").monospace().strong());
+                            ui.label("Seek Backward / Forward (±5 seconds)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Middle Click Viewport").monospace().strong());
+                            ui.label("Toggle Audio Mute");
                             ui.end_row();
 
                             ui.label(RichText::new("Tab").monospace().strong());
@@ -405,6 +413,14 @@ impl ShortcutsDialog {
                             ui.label("Seek Forward 60 seconds");
                             ui.end_row();
 
+                            ui.label(RichText::new("Home / End").monospace().strong());
+                            ui.label("Seek to Beginning (00:00:00) / End of Media");
+                            ui.end_row();
+
+                            ui.label(RichText::new("PageUp / PageDown").monospace().strong());
+                            ui.label("Jump to Previous / Next Chapter");
+                            ui.end_row();
+
                             ui.label(RichText::new(", (Comma) / . (Period)").monospace().strong());
                             ui.label("Step 1 Frame Backward / Forward (~42ms) while Paused");
                             ui.end_row();
@@ -419,6 +435,14 @@ impl ShortcutsDialog {
 
                             ui.label(RichText::new("S").monospace().strong());
                             ui.label("Stop Playback & Rewind to 00:00:00");
+                            ui.end_row();
+
+                            ui.label(RichText::new("F8 / Ctrl + S").monospace().strong());
+                            ui.label("Capture Lossless Video Snapshot to Pictures/Syncverse");
+                            ui.end_row();
+
+                            ui.label(RichText::new("1 - 6").monospace().strong());
+                            ui.label("Send Floating Emoji Reactions (❤️ 😂 🔥 👏 🍿 🎉)");
                             ui.end_row();
 
                             ui.label(RichText::new("[ / ]").monospace().strong());
