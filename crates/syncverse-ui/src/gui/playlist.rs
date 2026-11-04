@@ -131,6 +131,33 @@ impl PlaylistManager {
         self.rebuild_shuffle_order();
     }
 
+    /// Returns `true` if the playlist queue already contains the specified media file.
+    pub fn contains(&self, path: &Path) -> bool {
+        let cur_canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.items.iter().any(|item| {
+            item.path == path
+                || item.path.canonicalize().unwrap_or_else(|_| item.path.clone()) == cur_canonical
+        })
+    }
+
+    /// Sets the current playing track to `path` if present in the playlist without clearing the queue.
+    /// Returns `true` if found and updated.
+    pub fn set_current_file(&mut self, path: &Path) -> bool {
+        let cur_canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(idx) = self.items.iter().position(|item| {
+            item.path == path
+                || item.path.canonicalize().unwrap_or_else(|_| item.path.clone()) == cur_canonical
+        }) {
+            self.current_index = Some(idx);
+            if let Some(pos) = self.shuffled_order.iter().position(|&i| i == idx) {
+                self.shuffled_pointer = pos;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Appends a media file to the playlist queue.
     pub fn add_file(&mut self, path: PathBuf) {
         if !self.items.iter().any(|item| item.path == path) {
@@ -283,6 +310,11 @@ impl PlaylistManager {
             self.shuffled_order.swap(i, j);
         }
         self.shuffled_pointer = 0;
+        if let Some(cur) = self.current_index {
+            if let Some(pos) = self.shuffled_order.iter().position(|&i| i == cur) {
+                self.shuffled_pointer = pos;
+            }
+        }
     }
 }
 

@@ -503,7 +503,7 @@ impl ShortcutsDialog {
                             ui.label("Cycle Audio Track Sequentially");
                             ui.end_row();
 
-                            ui.label(RichText::new("G / F (or J / K)").monospace().strong());
+                            ui.label(RichText::new("G / F").monospace().strong());
                             ui.label("Adjust Audio Delay (-50 ms / +50 ms)");
                             ui.end_row();
                         });
@@ -519,7 +519,7 @@ impl ShortcutsDialog {
                             ui.label("Cycle Subtitle Track (Including Off)");
                             ui.end_row();
 
-                            ui.label(RichText::new("H / J (or Z / X)").monospace().strong());
+                            ui.label(RichText::new("H / J").monospace().strong());
                             ui.label("Adjust Subtitle Delay (-50 ms / +50 ms)");
                             ui.end_row();
 

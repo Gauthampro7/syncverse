@@ -356,4 +356,62 @@ fn test_loop_mode_flag_mutation() {
     assert!(!app.is_loop_enabled());
 }
 
+#[test]
+fn test_ab_repeat_seek_guard_and_no_storm() {
+    use syncverse_ui::gui::ab_loop::AbRepeatState;
+
+    let mut ab = AbRepeatState::default();
+    ab.set_point_a(10_000);
+    ab.set_point_b(20_000);
+    assert!(ab.is_active());
+
+    // Current PTS before B -> No loop seek
+    assert_eq!(ab.evaluate_loop(19_999), None);
+
+    // Current PTS reaches B -> Returns target A (10_000)
+    assert_eq!(ab.evaluate_loop(20_000), Some(10_000));
+    assert_eq!(ab.evaluate_loop(20_500), Some(10_000));
+
+    // When reset/disabled -> No loop seek
+    ab.clear();
+    assert!(!ab.is_active());
+    assert_eq!(ab.evaluate_loop(20_000), None);
+}
+
+#[test]
+fn test_playlist_manager_contains_and_set_current_file() {
+    use std::path::PathBuf;
+    use syncverse_ui::gui::playlist::PlaylistManager;
+
+    let mut pm = PlaylistManager::new();
+    let p1 = PathBuf::from("/media/video1.mkv");
+    let p2 = PathBuf::from("/media/video2.mp4");
+    let p3 = PathBuf::from("/media/audio.flac");
+
+    pm.add_file(p1.clone());
+    pm.add_file(p2.clone());
+    pm.add_file(p3.clone());
+
+    assert_eq!(pm.items.len(), 3);
+    assert!(pm.contains(&p1));
+    assert!(pm.contains(&p2));
+    assert!(pm.contains(&p3));
+    assert!(!pm.contains(&PathBuf::from("/media/other.avi")));
+
+    // set_current_file updates current_index
+    assert!(pm.set_current_file(&p2));
+    assert_eq!(pm.current_index, Some(1));
+
+    // Non-existent file returns false
+    assert!(!pm.set_current_file(&PathBuf::from("/media/missing.mp4")));
+    assert_eq!(pm.current_index, Some(1));
+}
+
+#[test]
+fn test_playback_eof_reached_event_variant() {
+    let ev = UiEvent::PlaybackEofReached;
+    assert!(matches!(ev, UiEvent::PlaybackEofReached));
+}
+
+
 

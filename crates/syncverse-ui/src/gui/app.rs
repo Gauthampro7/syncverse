@@ -655,7 +655,9 @@ impl SyncverseApp {
         self.controls_state.drag_pts_ms = None;
         self.ab_repeat.clear();
         self.controls_state.ab_repeat.clear();
-        self.playlist_manager.scan_folder_of_file(&path);
+        if !self.playlist_manager.set_current_file(&path) {
+            self.playlist_manager.scan_folder_of_file(&path);
+        }
 
         let external = syncverse_demux::subtitles::scan_external_subtitles(&path);
         for ext_track in external {
@@ -995,6 +997,16 @@ impl eframe::App for SyncverseApp {
                 UiEvent::ChaptersDiscovered(chapters) => {
                     self.controls_state.chapters = chapters;
                 }
+                UiEvent::PlaybackEofReached => {
+                    if !self.ab_repeat.is_active() {
+                        if self.playlist_manager.repeat_mode == crate::gui::playlist::PlaylistRepeatMode::Track {
+                            self.seek_to(0, now, Some("Repeating Track".to_string()));
+                            let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                        } else if self.playlist_manager.items.len() > 1 {
+                            self.play_next_file(now);
+                        }
+                    }
+                }
             }
         }
 
@@ -1075,9 +1087,11 @@ impl eframe::App for SyncverseApp {
 
         // Evaluate A-B repeat boundary and loop back to point A when reaching point B
         if self.ab_repeat.is_active() && snapshot.is_playing() {
-            let current_ms = snapshot.media_position_pts / 1_000_000;
-            if let Some(loop_target_ms) = self.ab_repeat.evaluate_loop(current_ms) {
-                self.seek_to(loop_target_ms, now, None);
+            let current_ms = self.controls_state.effective_position_ms(snapshot.media_position_pts / 1_000_000, now);
+            if self.controls_state.pending_seek_ms.is_none() {
+                if let Some(loop_target_ms) = self.ab_repeat.evaluate_loop(current_ms) {
+                    self.seek_to(loop_target_ms, now, None);
+                }
             }
         }
 
@@ -1340,7 +1354,7 @@ impl eframe::App for SyncverseApp {
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
                 self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Equals))) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::Backspace) || (!i.modifiers.shift && i.key_pressed(egui::Key::Equals)))) {
                 self.controls_state.speed = 1.0;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(1.0));
                 self.osd_overlay.show_notification("Speed: 1.00x".to_string(), now);
@@ -1419,20 +1433,20 @@ impl eframe::App for SyncverseApp {
                 let zm = self.viewport.cycle_zoom_mode();
                 self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
             }
-            // Audio delay adjustment (G / J: -50ms, F / K: +50ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::G) || i.key_pressed(egui::Key::J))) {
+            // Audio delay adjustment (G: -50ms, F: +50ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::G)) {
                 self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::K))) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::F)) {
                 self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            // Subtitle delay adjustment (H: -50ms, X: +50ms)
+            // Subtitle delay adjustment (H: -50ms, J: +50ms)
             if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::H)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
@@ -1441,7 +1455,7 @@ impl eframe::App for SyncverseApp {
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::X)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::J)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);

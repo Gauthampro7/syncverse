@@ -99,6 +99,8 @@ pub enum UiEvent {
     },
     /// Discovered container chapter markers.
     ChaptersDiscovered(Vec<syncverse_demux::MediaChapter>),
+    /// Playback reached the end of the loaded media (EOF).
+    PlaybackEofReached,
 }
 
 #[cfg(test)]

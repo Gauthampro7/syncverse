@@ -184,6 +184,18 @@ impl MediaInfoDialog {
                             ui.label(video_meta.codec_str());
                             ui.end_row();
 
+                            if let Some(ref pf) = video_meta.pixel_format {
+                                ui.label(RichText::new("Pixel Format:").strong());
+                                ui.label(pf);
+                                ui.end_row();
+                            }
+
+                            if let Some(bd) = video_meta.bit_depth {
+                                ui.label(RichText::new("Bit Depth:").strong());
+                                ui.label(format!("{}-bit", bd));
+                                ui.end_row();
+                            }
+
                             ui.label(RichText::new("Resolution:").strong());
                             ui.label(video_meta.resolution_str());
                             ui.end_row();
@@ -225,6 +237,29 @@ impl MediaInfoDialog {
                             ui.label(RichText::new("Active Track:").strong());
                             ui.label(track_desc);
                             ui.end_row();
+
+                            if let Some(idx) = active_audio_track {
+                                if idx < audio_tracks.len() {
+                                    let t = &audio_tracks[idx];
+                                    if let Some(sr) = t.sample_rate {
+                                        ui.label(RichText::new("Sample Rate:").strong());
+                                        ui.label(format!("{:.0} Hz", sr));
+                                        ui.end_row();
+                                    }
+                                    if let Some(ch) = t.channels {
+                                        ui.label(RichText::new("Channels:").strong());
+                                        let ch_str = match ch {
+                                            1 => "1.0 Mono".to_string(),
+                                            2 => "2.0 Stereo".to_string(),
+                                            6 => "5.1 Surround".to_string(),
+                                            8 => "7.1 Surround".to_string(),
+                                            n => format!("{} channels", n),
+                                        };
+                                        ui.label(ch_str);
+                                        ui.end_row();
+                                    }
+                                }
+                            }
 
                             ui.label(RichText::new("Audio Delay:").strong());
                             ui.label(format!("{:+} ms", audio_delay_ms));
@@ -308,6 +343,12 @@ impl MediaInfoDialog {
 
         report.push_str("\n**Video Stream:**\n");
         report.push_str(&format!("- **Codec:** {}\n", video_meta.codec_str()));
+        if let Some(ref pf) = video_meta.pixel_format {
+            report.push_str(&format!("- **Pixel Format:** {}\n", pf));
+        }
+        if let Some(bd) = video_meta.bit_depth {
+            report.push_str(&format!("- **Bit Depth:** {}-bit\n", bd));
+        }
         report.push_str(&format!("- **Resolution:** {}\n", video_meta.resolution_str()));
         report.push_str(&format!("- **Aspect Ratio:** {} (Override: {})\n", video_meta.aspect_ratio_str(), aspect_override.display_name()));
         report.push_str(&format!("- **Zoom Mode:** {}\n", zoom_mode.display_name()));
@@ -316,7 +357,14 @@ impl MediaInfoDialog {
         report.push_str("\n**Audio Stream:**\n");
         if let Some(idx) = active_audio_track {
             if idx < audio_tracks.len() {
-                report.push_str(&format!("- **Active Track:** {} ({})\n", audio_tracks[idx].title, audio_tracks[idx].codec));
+                let t = &audio_tracks[idx];
+                report.push_str(&format!("- **Active Track:** {} ({})\n", t.title, t.codec));
+                if let Some(sr) = t.sample_rate {
+                    report.push_str(&format!("- **Sample Rate:** {:.0} Hz\n", sr));
+                }
+                if let Some(ch) = t.channels {
+                    report.push_str(&format!("- **Channels:** {}\n", ch));
+                }
             }
         }
         report.push_str(&format!("- **Audio Delay:** {:+} ms\n", audio_delay_ms));

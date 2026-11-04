@@ -2467,17 +2467,42 @@ pub fn run_playback_worker(
             let dur_ms = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
             let mut is_playing = clock.is_playing();
 
-            // EOF auto-pause and boundary clamping at media duration
+            // EOF handling: loop back to 0 if repeat enabled, else auto-pause and notify UI
             if dur_ms > 0 && current_pts_ms >= dur_ms as f64 {
-                current_pts_ms = dur_ms as f64;
-                if is_playing {
-                    clock.seek_to(dur_ms as f64, now);
-                    clock.set_state(now, PlaybackState::Paused);
-                    let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                    is_playing = false;
+                if is_loop_enabled {
+                    if let Some(ref mut sess) = session {
+                        current_audio_generation = current_audio_generation.wrapping_add(1);
+                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                        let effective_vol = if is_muted { 0.0 } else { volume };
+                        let landed = sess.seek_preroll(
+                            0,
+                            &video_ring,
+                            &audio_tx,
+                            current_audio_generation,
+                            effective_vol,
+                            audio_delay_ms,
+                        );
+                        clock.seek_to(landed as f64, now);
+                    } else {
+                        clock.seek_to(0.0, now);
+                    }
+                    current_pts_ms = 0.0;
                     if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                        server.set_media_state(dur_ms, 1.0, true);
+                        server.set_media_state(0, speed, false);
                         let _ = server.broadcast_room_state();
+                    }
+                } else {
+                    current_pts_ms = dur_ms as f64;
+                    if is_playing {
+                        clock.seek_to(dur_ms as f64, now);
+                        clock.set_state(now, PlaybackState::Paused);
+                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                        is_playing = false;
+                        let _ = event_tx.send(UiEvent::PlaybackEofReached);
+                        if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                            server.set_media_state(dur_ms, 1.0, true);
+                            let _ = server.broadcast_room_state();
+                        }
                     }
                 }
             }
