@@ -1,5 +1,6 @@
 //! Desktop graphical user interface modules (eframe/egui).
 
+pub mod ab_loop;
 pub mod app;
 pub mod aspect_ratio;
 pub mod controls;
@@ -7,7 +8,9 @@ pub mod dialogs;
 pub mod drag_drop;
 pub mod file_dialog;
 pub mod inhibit;
+pub mod media_info;
 pub mod mpris;
+pub mod playlist;
 pub mod reactions;
 pub mod recent_files;
 pub mod sidebar;
@@ -15,10 +18,11 @@ pub mod subtitle_overlay;
 pub mod updater;
 pub mod viewport;
 
+pub use ab_loop::AbRepeatState;
 pub use app::{
     create_native_options, run_desktop_gui, run_desktop_player, SyncplayApp, SyncverseApp,
 };
-pub use aspect_ratio::{AspectRatioOverride, IntoDimension};
+pub use aspect_ratio::{AspectRatioOverride, IntoDimension, ZoomMode};
 pub use controls::{
     style as controls_style, ControlsBarAction, ControlsBarState, PlaybackControlsBar,
     VolumeControlState, SUPPORTED_SPEEDS,
@@ -31,7 +35,12 @@ pub use dialogs::{
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
 pub use file_dialog::FileDialogManager;
 pub use inhibit::IdleInhibitor;
+pub use media_info::{format_file_size, MediaInfoContext, MediaInfoDialog};
 pub use mpris::MprisManager;
+pub use playlist::{
+    PlaylistAction, PlaylistDialog, PlaylistItem, PlaylistManager, PlaylistRepeatMode,
+    SUPPORTED_PLAYLIST_EXTENSIONS,
+};
 pub use reactions::{ReactionParticle, ReactionSystem, REACTION_PRESETS};
 pub use recent_files::RecentFilesManager;
 pub use sidebar::{

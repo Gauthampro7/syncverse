@@ -591,7 +591,9 @@ fn test_viewport_geometry_extreme_aspect_ratios_and_degenerates() {
         (AspectRatioOverride::Original, 1920.0, 1080.0, ViewportDisplayMode::Exact),
         (AspectRatioOverride::Ratio16_9, 1920.0, 1080.0, ViewportDisplayMode::Exact),
         (AspectRatioOverride::Ratio4_3, 1440.0, 1080.0, ViewportDisplayMode::Pillarbox),
+        (AspectRatioOverride::Ratio16_10, 1728.0, 1080.0, ViewportDisplayMode::Pillarbox),
         (AspectRatioOverride::Ratio21_9, 1920.0, 822.8571, ViewportDisplayMode::Letterbox),
+        (AspectRatioOverride::Ratio2_35_1, 1920.0, 817.0213, ViewportDisplayMode::Letterbox),
         (AspectRatioOverride::Ratio1_1, 1080.0, 1080.0, ViewportDisplayMode::Pillarbox),
         (AspectRatioOverride::FillStretch, 1920.0, 1080.0, ViewportDisplayMode::Exact),
     ];

@@ -431,11 +431,27 @@ impl ShortcutsDialog {
                             ui.label("Jump to Previous / Next Chapter");
                             ui.end_row();
 
+                            ui.label(RichText::new("P / N").monospace().strong());
+                            ui.label("Previous / Next File in Playlist or Folder");
+                            ui.end_row();
+
+                            ui.label(RichText::new("R / Shift + L").monospace().strong());
+                            ui.label("A-B Repeat Looping (Cycle: Set A ➔ Set B ➔ Off)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + L").monospace().strong());
+                            ui.label("Toggle Playlist Queue Dialog Window");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + I / Ctrl + J").monospace().strong());
+                            ui.label("Media Information & Codec Statistics Dialog");
+                            ui.end_row();
+
                             ui.label(RichText::new(", (Comma) / . (Period)").monospace().strong());
                             ui.label("Step 1 Frame Backward / Forward (~42ms) while Paused");
                             ui.end_row();
 
-                            ui.label(RichText::new("L / Ctrl + L").monospace().strong());
+                            ui.label(RichText::new("L").monospace().strong());
                             ui.label("Toggle Repeat / Loop Playback Mode");
                             ui.end_row();
 
@@ -456,11 +472,11 @@ impl ShortcutsDialog {
                             ui.end_row();
 
                             ui.label(RichText::new("[ / ]").monospace().strong());
-                            ui.label("Decrease / Increase Playback Speed");
+                            ui.label("Fine Step Playback Speed (-0.1x / +0.1x)");
                             ui.end_row();
 
-                            ui.label(RichText::new("Backspace").monospace().strong());
-                            ui.label("Reset Playback Speed to 1.0x");
+                            ui.label(RichText::new("= / Backspace").monospace().strong());
+                            ui.label("Reset Playback Speed to 1.00x");
                             ui.end_row();
                         });
 
@@ -472,7 +488,7 @@ impl ShortcutsDialog {
                         .striped(true)
                         .show(ui, |ui| {
                             ui.label(RichText::new("Up Arrow (↑)").monospace().strong());
-                            ui.label("Increase Volume (+5%)");
+                            ui.label("Increase Volume (+5%, up to 200% Boost)");
                             ui.end_row();
 
                             ui.label(RichText::new("Down Arrow (↓)").monospace().strong());
@@ -487,13 +503,13 @@ impl ShortcutsDialog {
                             ui.label("Cycle Audio Track Sequentially");
                             ui.end_row();
 
-                            ui.label(RichText::new("J / K").monospace().strong());
+                            ui.label(RichText::new("G / F (or J / K)").monospace().strong());
                             ui.label("Adjust Audio Delay (-50 ms / +50 ms)");
                             ui.end_row();
                         });
 
                     ui.add_space(12.0);
-                    ui.heading("Subtitles & Aspect Ratio");
+                    ui.heading("Subtitles, Zoom & Aspect Ratio");
                     egui::Grid::new("subtitles_aspect_shortcuts_grid")
                         .num_columns(2)
                         .spacing([16.0, 6.0])
@@ -503,12 +519,16 @@ impl ShortcutsDialog {
                             ui.label("Cycle Subtitle Track (Including Off)");
                             ui.end_row();
 
-                            ui.label(RichText::new("Z / X").monospace().strong());
+                            ui.label(RichText::new("H / J (or Z / X)").monospace().strong());
                             ui.label("Adjust Subtitle Delay (-50 ms / +50 ms)");
                             ui.end_row();
 
+                            ui.label(RichText::new("Z").monospace().strong());
+                            ui.label("Cycle Video Zoom Mode (Fit, 1:4, 1:2, 1:1 Original, 2:1)");
+                            ui.end_row();
+
                             ui.label(RichText::new("A").monospace().strong());
-                            ui.label("Cycle Aspect Ratio (Original, 16:9, 4:3, 21:9, 1:1, Fill)");
+                            ui.label("Cycle Aspect Ratio (Original, 16:9, 4:3, 16:10, 21:9, 2.35:1, 1:1, Fill)");
                             ui.end_row();
                         });
 

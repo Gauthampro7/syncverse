@@ -1230,12 +1230,13 @@ pub fn run_playback_worker(
                     }
                 }
                 PlayerCommand::SetVolume(vol) => {
-                    volume = vol.clamp(0.0, 1.0);
+                    volume = vol.clamp(0.0, 2.0);
                     if volume > 0.0 {
                         is_muted = false;
                     }
+                    let boost_suffix = if volume > 1.0 { " [Boost]" } else { "" };
                     let _ = event_tx.send(UiEvent::HudNotification {
-                        text: format!("Volume: {}%", (volume * 100.0).round() as u32),
+                        text: format!("Volume: {}%{}", (volume * 100.0).round() as u32, boost_suffix),
                         timestamp: Instant::now(),
                     });
                 }

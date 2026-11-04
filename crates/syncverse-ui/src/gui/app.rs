@@ -113,6 +113,10 @@ pub struct SyncverseApp {
     cached_clipboard: Option<String>,
     last_sent_window_title: Option<String>,
     was_minimized: bool,
+    ab_repeat: crate::gui::ab_loop::AbRepeatState,
+    playlist_manager: crate::gui::playlist::PlaylistManager,
+    playlist_dialog: crate::gui::playlist::PlaylistDialog,
+    media_info_dialog: crate::gui::media_info::MediaInfoDialog,
 }
 
 /// Backwards-compatible type alias for [`SyncverseApp`].
@@ -174,6 +178,10 @@ impl Default for SyncverseApp {
             cached_clipboard: None,
             last_sent_window_title: None,
             was_minimized: bool::default(),
+            ab_repeat: crate::gui::ab_loop::AbRepeatState::default(),
+            playlist_manager: crate::gui::playlist::PlaylistManager::new(),
+            playlist_dialog: crate::gui::playlist::PlaylistDialog::new(),
+            media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
         };
         app.controls_state
             .subtitle_dialog
@@ -275,6 +283,10 @@ impl SyncverseApp {
             cached_clipboard: None,
             last_sent_window_title: None,
             was_minimized: bool::default(),
+            ab_repeat: crate::gui::ab_loop::AbRepeatState::default(),
+            playlist_manager: crate::gui::playlist::PlaylistManager::new(),
+            playlist_dialog: crate::gui::playlist::PlaylistDialog::new(),
+            media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
         };
         app.controls_state
             .subtitle_dialog
@@ -287,7 +299,7 @@ impl SyncverseApp {
         app
     }
 
-    /// Returns `true` if any of the application's 7 modal configuration/dialog windows are open.
+    /// Returns `true` if any of the application's modal configuration/dialog windows are open.
     pub fn is_any_modal_open(&self) -> bool {
         self.host_dialog.is_open
             || self.connect_dialog.is_open
@@ -296,6 +308,8 @@ impl SyncverseApp {
             || self.controls_state.audio_dialog.is_open
             || self.controls_state.subtitle_dialog.is_open
             || self.controls_state.video_dialog.is_open
+            || self.playlist_dialog.is_open
+            || self.media_info_dialog.is_open
     }
 
     /// Returns a reference to the active OSD HUD overlay.
@@ -639,6 +653,9 @@ impl SyncverseApp {
         self.controls_state.chapters.clear();
         self.controls_state.pending_seek_ms = None;
         self.controls_state.drag_pts_ms = None;
+        self.ab_repeat.clear();
+        self.controls_state.ab_repeat.clear();
+        self.playlist_manager.scan_folder_of_file(&path);
 
         let external = syncverse_demux::subtitles::scan_external_subtitles(&path);
         for ext_track in external {
@@ -677,6 +694,35 @@ impl SyncverseApp {
             })
             .collect();
         self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+    }
+
+    /// Jumps to the previous media file in the active folder or playlist queue.
+    pub fn play_previous_file(&mut self, now: Instant) {
+        if let Some(prev) = self.playlist_manager.previous_track() {
+            let fname = prev.file_name().and_then(|s| s.to_str()).unwrap_or("Media").to_string();
+            self.load_file(prev);
+            self.osd_overlay.show_notification(format!("Previous: {fname}"), now);
+        } else {
+            self.osd_overlay.show_notification("Start of Playlist".to_string(), now);
+        }
+    }
+
+    /// Jumps to the next media file in the active folder or playlist queue.
+    pub fn play_next_file(&mut self, now: Instant) {
+        if let Some(next) = self.playlist_manager.next_track() {
+            let fname = next.file_name().and_then(|s| s.to_str()).unwrap_or("Media").to_string();
+            self.load_file(next);
+            self.osd_overlay.show_notification(format!("Next: {fname}"), now);
+        } else {
+            self.osd_overlay.show_notification("End of Playlist".to_string(), now);
+        }
+    }
+
+    /// Advances the A-B repeat playback looping state machine at current presentation timestamp.
+    pub fn cycle_ab_repeat(&mut self, current_pts_ms: u64, now: Instant) {
+        self.ab_repeat = self.ab_repeat.cycle(current_pts_ms);
+        self.controls_state.ab_repeat = self.ab_repeat;
+        self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
     }
 
     /// Loads an external subtitle file (.srt, .vtt, .ass) asynchronously in a background thread,
@@ -1025,6 +1071,15 @@ impl eframe::App for SyncverseApp {
         let snapshot = self.exchange.poll_latest_snapshot();
         self.controls_state.volume.is_muted = snapshot.is_muted();
         self.loop_enabled = snapshot.is_loop_enabled();
+        self.controls_state.ab_repeat = self.ab_repeat;
+
+        // Evaluate A-B repeat boundary and loop back to point A when reaching point B
+        if self.ab_repeat.is_active() && snapshot.is_playing() {
+            let current_ms = snapshot.media_position_pts / 1_000_000;
+            if let Some(loop_target_ms) = self.ab_repeat.evaluate_loop(current_ms) {
+                self.seek_to(loop_target_ms, now, None);
+            }
+        }
 
         // Cache raw clipboard paste events
         for ev in ctx.input(|i| i.raw.events.clone()) {
@@ -1074,7 +1129,11 @@ impl eframe::App for SyncverseApp {
 
         // Escape hierarchy: closes top-most open modal/dialog first, then exits fullscreen
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.shortcuts_dialog.is_open {
+            if self.playlist_dialog.is_open {
+                self.playlist_dialog.close();
+            } else if self.media_info_dialog.is_open {
+                self.media_info_dialog.close();
+            } else if self.shortcuts_dialog.is_open {
                 self.shortcuts_dialog.is_open = false;
             } else if self.about_dialog.is_open {
                 self.about_dialog.is_open = false;
@@ -1240,11 +1299,12 @@ impl eframe::App for SyncverseApp {
                 }
             }
             if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)) {
-                let new_vol = (self.controls_state.volume.volume + 0.05).min(1.0);
+                let new_vol = (self.controls_state.volume.volume + 0.05).min(crate::gui::controls::VolumeControlState::MAX_VOLUME);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
                 self.osd_overlay.show_notification(
-                    format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                    format!("Volume: {}%{}", (new_vol * 100.0).round() as u32, boost_str),
                     now,
                 );
             }
@@ -1267,19 +1327,20 @@ impl eframe::App for SyncverseApp {
                 let _ = self.command_tx.send(PlayerCommand::Stop);
                 self.osd_overlay.show_notification("Stopped".to_string(), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::OpenBracket)) {
-                let spd = (self.controls_state.speed - 0.25).max(0.25);
+            // Fine playback speed stepping (-0.1x / +0.1x)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::OpenBracket) || i.key_pressed(egui::Key::Minus))) {
+                let spd = ((self.controls_state.speed - 0.1).max(0.25) * 10.0).round() / 10.0;
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
                 self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::CloseBracket)) {
-                let spd = (self.controls_state.speed + 0.25).min(3.0);
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::CloseBracket) || i.key_pressed(egui::Key::Plus))) {
+                let spd = ((self.controls_state.speed + 0.1).min(4.0) * 10.0).round() / 10.0;
                 self.controls_state.speed = spd;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
                 self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Backspace)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Equals))) {
                 self.controls_state.speed = 1.0;
                 let _ = self.command_tx.send(PlayerCommand::SetSpeed(1.0));
                 self.osd_overlay.show_notification("Speed: 1.00x".to_string(), now);
@@ -1353,21 +1414,26 @@ impl eframe::App for SyncverseApp {
                 }
                 self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
             }
-            // Audio delay adjustment (J: -50ms, K: +50ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::J)) {
+            // Video Zoom mode cycling (Z)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Z)) {
+                let zm = self.viewport.cycle_zoom_mode();
+                self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
+            }
+            // Audio delay adjustment (G / J: -50ms, F / K: +50ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::G) || i.key_pressed(egui::Key::J))) {
                 self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::K)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::K))) {
                 self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            // Subtitle delay adjustment (Z: -50ms, X: +50ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Z)) {
+            // Subtitle delay adjustment (H: -50ms, X: +50ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::H)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1382,6 +1448,32 @@ impl eframe::App for SyncverseApp {
                 self.invalidate_subtitle_cache();
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
+            }
+
+            // A-B Repeat Looping (Shift+L or R)
+            if ctx.input(|i| (i.modifiers.shift && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::R))) {
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                self.cycle_ab_repeat(current_ms, now);
+            }
+
+            // Playlist Queue Dialog Toggle (Ctrl+L)
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::L)) {
+                self.playlist_dialog.toggle();
+            }
+
+            // Media Info & Codec Statistics Dialog (Ctrl+I or Ctrl+J)
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && (i.key_pressed(egui::Key::I) || i.key_pressed(egui::Key::J))) {
+                self.media_info_dialog.toggle();
+            }
+
+            // Previous File in Playlist/Folder (P)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::P)) {
+                self.play_previous_file(now);
+            }
+
+            // Next File in Playlist/Folder (N)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::N)) {
+                self.play_next_file(now);
             }
 
             // Floating emoji reactions (1: ❤️, 2: 😂, 3: 🔥, 4: 👏, 5: 🍿, 6: 🎉)
@@ -1969,6 +2061,22 @@ impl eframe::App for SyncverseApp {
                         ControlsBarAction::TakeScreenshot => {
                             self.take_screenshot(now);
                         }
+                        ControlsBarAction::CycleAbRepeat => {
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.cycle_ab_repeat(current_ms, now);
+                        }
+                        ControlsBarAction::TogglePlaylist => {
+                            self.playlist_dialog.toggle();
+                        }
+                        ControlsBarAction::ToggleMediaInfo => {
+                            self.media_info_dialog.toggle();
+                        }
+                        ControlsBarAction::PreviousTrack => {
+                            self.play_previous_file(now);
+                        }
+                        ControlsBarAction::NextTrack => {
+                            self.play_next_file(now);
+                        }
                     }
                 }
             });
@@ -1993,7 +2101,13 @@ impl eframe::App for SyncverseApp {
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ui, |ui| {
                 let current_ar = self.viewport.aspect_override();
+                let current_zm = self.viewport.zoom_mode();
+                let current_ab = self.ab_repeat;
                 let mut menu_aspect_ratio = None;
+                let mut menu_zoom_mode = None;
+                let mut request_cycle_ab = false;
+                let mut request_toggle_playlist = false;
+                let mut request_toggle_media_info = false;
                 let mut request_take_screenshot = false;
                 let mut request_jump_prev_chapter = false;
                 let mut request_jump_next_chapter = false;
@@ -2041,6 +2155,16 @@ impl eframe::App for SyncverseApp {
                             if ui.selectable_label(is_selected, ar.display_name()).clicked() {
                                 ui.close();
                                 menu_aspect_ratio = Some(ar);
+                            }
+                        }
+                    });
+
+                    ui.menu_button("🔍 Zoom Mode", |ui| {
+                        for &zm in &crate::gui::aspect_ratio::ZoomMode::ALL {
+                            let is_selected = current_zm == zm;
+                            if ui.selectable_label(is_selected, zm.display_name()).clicked() {
+                                ui.close();
+                                menu_zoom_mode = Some(zm);
                             }
                         }
                     });
@@ -2129,6 +2253,30 @@ impl eframe::App for SyncverseApp {
                         request_toggle_loop = true;
                     }
 
+                    let ab_label = match current_ab {
+                        crate::gui::ab_loop::AbRepeatState::Disabled => "🔁 A-B Repeat: Off (Shift+L)".to_string(),
+                        crate::gui::ab_loop::AbRepeatState::PointASet(a_ms) => {
+                            format!("🔁 A-B Repeat: A [{}] (Shift+L)", ControlsBarState::format_timestamp(a_ms))
+                        }
+                        crate::gui::ab_loop::AbRepeatState::Active { a_ms, b_ms } => {
+                            format!("🔁 A-B Repeat: [{} ↔ {}]", ControlsBarState::format_timestamp(a_ms), ControlsBarState::format_timestamp(b_ms))
+                        }
+                    };
+                    if ui.button(ab_label).clicked() {
+                        ui.close();
+                        request_cycle_ab = true;
+                    }
+
+                    if ui.button("📑 Playlist / Queue (Ctrl+L)").clicked() {
+                        ui.close();
+                        request_toggle_playlist = true;
+                    }
+
+                    if ui.button("ℹ️ Media Information (Ctrl+I)").clicked() {
+                        ui.close();
+                        request_toggle_media_info = true;
+                    }
+
                     ui.separator();
                     if ui.button("Video Stream Details...").clicked() {
                         ui.close();
@@ -2139,6 +2287,21 @@ impl eframe::App for SyncverseApp {
                         self.shortcuts_dialog.open();
                     }
                 });
+
+                if let Some(zm) = menu_zoom_mode {
+                    self.viewport.set_zoom_mode(zm);
+                    self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
+                }
+                if request_cycle_ab {
+                    let current_ms = snapshot.media_position_pts / 1_000_000;
+                    self.cycle_ab_repeat(current_ms, now);
+                }
+                if request_toggle_playlist {
+                    self.playlist_dialog.toggle();
+                }
+                if request_toggle_media_info {
+                    self.media_info_dialog.toggle();
+                }
 
                 if request_take_screenshot {
                     self.take_screenshot(now);
@@ -2316,6 +2479,39 @@ impl eframe::App for SyncverseApp {
         self.connect_dialog.show(&ctx, &mut self.sidebar_state, &self.command_tx);
         self.shortcuts_dialog.show(&ctx);
         self.about_dialog.show(&ctx);
+
+        if let Some(action) = self.playlist_dialog.show(&ctx, &mut self.playlist_manager) {
+            match action {
+                crate::gui::playlist::PlaylistAction::PlayTrack(path) => {
+                    self.load_file(path);
+                }
+                crate::gui::playlist::PlaylistAction::AddMediaFiles => {
+                    self.file_dialog.open_file_dialog();
+                }
+                crate::gui::playlist::PlaylistAction::ClearQueue => {
+                    self.playlist_manager.clear();
+                }
+            }
+        }
+
+        let active_audio = if self.audio_tracks.is_empty() {
+            None
+        } else {
+            Some(self.audio_track_index)
+        };
+        let media_ctx = crate::gui::media_info::MediaInfoContext {
+            current_file: self.current_file.as_ref(),
+            video_meta: &self.controls_state.video_dialog.metadata,
+            audio_tracks: &self.controls_state.audio_dialog.tracks,
+            active_audio_track: active_audio,
+            audio_delay_ms: self.audio_delay_ms,
+            subtitle_delay_ms: self.subtitle_delay_ms,
+            aspect_override: self.viewport.aspect_override(),
+            zoom_mode: self.viewport.zoom_mode(),
+            volume: self.controls_state.volume.effective_volume(),
+            snapshot: &snapshot,
+        };
+        self.media_info_dialog.show(&ctx, &media_ctx);
 
         let audio_actions = self.controls_state.audio_dialog.show(&ctx);
         for action in audio_actions {

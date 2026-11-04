@@ -3,6 +3,7 @@
 use std::time::Instant;
 use egui::{Color32, Context, FontId, Layout, RichText, Stroke, Ui, Vec2};
 use crate::debouncer::SeekDebouncer;
+use crate::gui::ab_loop::AbRepeatState;
 use crate::gui::aspect_ratio::AspectRatioOverride;
 use crate::gui::dialogs::{AudioConfigDialog, SubtitleConfigDialog, VideoConfigDialog};
 use crate::overlay::format_timecode_hud;
@@ -22,7 +23,7 @@ pub const ULTRA_COMPACT_LAYOUT_THRESHOLD_PX: f32 = 560.0;
 /// State of audio volume and mute controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeControlState {
-    /// Normalized audio gain [0.0, 1.0].
+    /// Audio gain [0.0, 2.0], where > 1.0 enables soft-knee over-amplification boost.
     pub volume: f32,
     /// Whether audio output is currently muted.
     pub is_muted: bool,
@@ -41,9 +42,12 @@ impl Default for VolumeControlState {
 }
 
 impl VolumeControlState {
-    /// Constructs a new `VolumeControlState` with initial volume [0.0, 1.0].
+    /// Maximum allowable audio gain multiplier (2.0 = 200% volume boost).
+    pub const MAX_VOLUME: f32 = 2.0;
+
+    /// Constructs a new `VolumeControlState` with initial volume clamped to [0.0, MAX_VOLUME].
     pub fn new(initial_volume: f32) -> Self {
-        let v = initial_volume.clamp(0.0, 1.0);
+        let v = initial_volume.clamp(0.0, Self::MAX_VOLUME);
         Self {
             volume: v,
             is_muted: v == 0.0,
@@ -62,7 +66,7 @@ impl VolumeControlState {
 
     /// Updates volume from user slider adjustment, automatically unmuting if positive.
     pub fn set_volume(&mut self, vol: f32) {
-        let v = vol.clamp(0.0, 1.0);
+        let v = vol.clamp(0.0, Self::MAX_VOLUME);
         self.volume = v;
         if v > 0.0 {
             self.is_muted = false;
@@ -132,6 +136,8 @@ pub struct ControlsBarState {
     pub video_dialog: VideoConfigDialog,
     /// Discovered container chapter markers.
     pub chapters: Vec<syncverse_demux::MediaChapter>,
+    /// Active A-B repeat playback looping state.
+    pub ab_repeat: AbRepeatState,
 }
 
 impl Default for ControlsBarState {
@@ -151,6 +157,7 @@ impl Default for ControlsBarState {
             subtitle_dialog: SubtitleConfigDialog::default(),
             video_dialog: VideoConfigDialog::default(),
             chapters: Vec::new(),
+            ab_repeat: AbRepeatState::default(),
         }
     }
 }
@@ -252,7 +259,7 @@ pub enum ControlsBarAction {
     Stop,
     /// Seek to target timestamp in milliseconds.
     Seek(u64),
-    /// Set audio volume [0.0, 1.0].
+    /// Set audio volume [0.0, 2.0].
     SetVolume(f32),
     /// Toggle audio mute.
     ToggleMute,
@@ -278,6 +285,16 @@ pub enum ControlsBarAction {
     PreviousChapter,
     /// Capture a lossless PNG screenshot of the current video frame.
     TakeScreenshot,
+    /// Advance A-B repeat playback looping state machine.
+    CycleAbRepeat,
+    /// Toggle playlist queue dialog window.
+    TogglePlaylist,
+    /// Toggle technical media and codec statistics dialog window.
+    ToggleMediaInfo,
+    /// Jump to previous track in playlist/folder.
+    PreviousTrack,
+    /// Jump to next track in playlist/folder.
+    NextTrack,
 }
 
 /// Modern sleek dark aesthetics palette for player controls bar.
@@ -415,6 +432,42 @@ impl PlaybackControlsBar {
                         Stroke::new(1.5, egui::Color32::from_rgb(250, 204, 21)),
                     );
                 }
+            }
+
+            // A-B Repeat segment and marker ticks
+            if let Some(a_ms) = state.ab_repeat.point_a() {
+                let a_frac = (a_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+                let a_x = rect.min.x + (a_frac as f32 * rect.width());
+
+                // Looping span and Point B marker if active
+                if let Some(b_ms) = state.ab_repeat.point_b() {
+                    let b_frac = (b_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+                    let b_x = rect.min.x + (b_frac as f32 * rect.width());
+                    let min_x = a_x.min(b_x);
+                    let max_x = a_x.max(b_x);
+
+                    painter.line_segment(
+                        [egui::pos2(min_x, y_center), egui::pos2(max_x, y_center)],
+                        Stroke::new(track_height * 1.5, Color32::from_rgb(168, 85, 247)),
+                    );
+
+                    painter.line_segment(
+                        [
+                            egui::pos2(b_x, y_center - (track_height * 1.3)),
+                            egui::pos2(b_x, y_center + (track_height * 1.3)),
+                        ],
+                        Stroke::new(2.5, Color32::from_rgb(236, 72, 153)),
+                    );
+                }
+
+                // Point A marker tick
+                painter.line_segment(
+                    [
+                        egui::pos2(a_x, y_center - (track_height * 1.3)),
+                        egui::pos2(a_x, y_center + (track_height * 1.3)),
+                    ],
+                    Stroke::new(2.5, Color32::from_rgb(74, 222, 128)),
+                );
             }
         }
 
@@ -584,42 +637,66 @@ impl PlaybackControlsBar {
                 actions.push(ControlsBarAction::Stop);
             }
 
-            // Chapter Buttons (collapsed on narrow viewports < 560px)
+            // Track / Chapter & A-B Looping Buttons (collapsed on narrow viewports < 560px)
             if !is_ultra_compact {
-                // Previous Chapter Button
-                let prev_ch_btn = egui::Button::new(
+                // Previous Track Button (P)
+                let prev_trk_btn = egui::Button::new(
                     RichText::new("⏮")
                         .size(13.0)
                         .color(style::TEXT_PRIMARY),
                 )
-                .min_size(Vec2::new(28.0, 32.0))
+                .min_size(Vec2::new(26.0, 32.0))
                 .fill(style::BUTTON_BG)
                 .corner_radius(6.0);
 
                 if ui
-                    .add(prev_ch_btn)
-                    .on_hover_text("Previous Chapter (PageUp)")
+                    .add(prev_trk_btn)
+                    .on_hover_text("Previous File / Track (P)")
                     .clicked()
                 {
-                    actions.push(ControlsBarAction::PreviousChapter);
+                    actions.push(ControlsBarAction::PreviousTrack);
                 }
 
-                // Next Chapter Button
-                let next_ch_btn = egui::Button::new(
+                // Next Track Button (N)
+                let next_trk_btn = egui::Button::new(
                     RichText::new("⏭")
                         .size(13.0)
                         .color(style::TEXT_PRIMARY),
                 )
-                .min_size(Vec2::new(28.0, 32.0))
+                .min_size(Vec2::new(26.0, 32.0))
                 .fill(style::BUTTON_BG)
                 .corner_radius(6.0);
 
                 if ui
-                    .add(next_ch_btn)
-                    .on_hover_text("Next Chapter (PageDown)")
+                    .add(next_trk_btn)
+                    .on_hover_text("Next File / Track (N)")
                     .clicked()
                 {
-                    actions.push(ControlsBarAction::NextChapter);
+                    actions.push(ControlsBarAction::NextTrack);
+                }
+
+                // A-B Repeat Looping Button
+                let (ab_label, ab_color) = match state.ab_repeat {
+                    AbRepeatState::Disabled => ("🔁 A-B", style::TEXT_SECONDARY),
+                    AbRepeatState::PointASet(_) => ("A➔...", Color32::from_rgb(74, 222, 128)),
+                    AbRepeatState::Active { .. } => ("A⇄B", Color32::from_rgb(168, 85, 247)),
+                };
+                let ab_btn = egui::Button::new(
+                    RichText::new(ab_label)
+                        .size(11.0)
+                        .strong()
+                        .color(ab_color),
+                )
+                .min_size(Vec2::new(36.0, 32.0))
+                .fill(style::BUTTON_BG)
+                .corner_radius(6.0);
+
+                if ui
+                    .add(ab_btn)
+                    .on_hover_text(format!("{} (Press Shift+L or R to cycle)", state.ab_repeat.status_text()))
+                    .clicked()
+                {
+                    actions.push(ControlsBarAction::CycleAbRepeat);
                 }
             }
 
@@ -669,6 +746,25 @@ impl PlaybackControlsBar {
                     .clicked()
                 {
                     actions.push(ControlsBarAction::ToggleSidebar);
+                }
+
+                // Playlist Queue Button (🎶)
+                if ui
+                    .button(RichText::new("🎶").size(14.0))
+                    .on_hover_text("Playlist Queue (Ctrl+L)")
+                    .clicked()
+                {
+                    actions.push(ControlsBarAction::TogglePlaylist);
+                }
+
+                // Media Info & Diagnostics Button (ℹ️)
+                if !is_ultra_compact
+                    && ui
+                        .button(RichText::new("ℹ️").size(14.0))
+                        .on_hover_text("Media Information & Codec Statistics (Ctrl+I)")
+                        .clicked()
+                {
+                    actions.push(ControlsBarAction::ToggleMediaInfo);
                 }
 
                 ui.separator();
@@ -789,20 +885,25 @@ impl PlaybackControlsBar {
 
                 ui.separator();
                 if !is_ultra_compact {
-                    // Volume percentage text (hidden on ultra-compact to avoid crowding)
+                    // Volume percentage text (amber highlight when boosted > 100%)
+                    let vol_color = if state.volume.volume > 1.0 {
+                        Color32::from_rgb(251, 146, 60)
+                    } else {
+                        style::TEXT_SECONDARY
+                    };
                     ui.add(
                         egui::Label::new(
                             RichText::new(state.volume.formatted_percentage())
                                 .monospace()
                                 .size(12.0)
-                                .color(style::TEXT_SECONDARY),
+                                .color(vol_color),
                         ),
                     );
                 }
 
-                // Volume Slider (0.0 to 1.0, compact width on narrow viewports)
+                // Volume Slider (0.0 to 2.0 with soft-knee saturation, compact width on narrow viewports)
                 let mut vol = state.volume.volume;
-                let slider = egui::Slider::new(&mut vol, 0.0..=1.0)
+                let slider = egui::Slider::new(&mut vol, 0.0..=VolumeControlState::MAX_VOLUME)
                     .show_value(false)
                     .trailing_fill(true);
                 let slider_width = if is_ultra_compact { 50.0 } else { 80.0 };
@@ -813,7 +914,7 @@ impl PlaybackControlsBar {
                 } else if slider_resp.hovered() {
                     let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll_y >= 2.0 {
-                        let new_vol = (state.volume.volume + 0.05).min(1.0);
+                        let new_vol = (state.volume.volume + 0.05).min(VolumeControlState::MAX_VOLUME);
                         state.volume.set_volume(new_vol);
                         actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
                     } else if scroll_y <= -2.0 {

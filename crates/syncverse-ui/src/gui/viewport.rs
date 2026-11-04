@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, Context, Rect, TextureHandle, TextureOptions, Ui, Vec2};
 use syncverse_clock::{MasterClock, PresentationAction, SpscRingBuffer};
 use syncverse_codecs::VideoFrameRGBA;
-use crate::gui::aspect_ratio::{AspectRatioOverride, IntoDimension};
+use crate::gui::aspect_ratio::{AspectRatioOverride, IntoDimension, ZoomMode};
 
 /// Geometric display mode for the video viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,9 @@ impl ViewportGeometry {
             AspectRatioOverride::Original => vw / vh,
             AspectRatioOverride::Ratio16_9 => 16.0 / 9.0,
             AspectRatioOverride::Ratio4_3 => 4.0 / 3.0,
+            AspectRatioOverride::Ratio16_10 => 16.0 / 10.0,
             AspectRatioOverride::Ratio21_9 => 21.0 / 9.0,
+            AspectRatioOverride::Ratio2_35_1 => 2.35,
             AspectRatioOverride::Ratio1_1 => 1.0,
             AspectRatioOverride::FillStretch => unreachable!(),
         };
@@ -152,6 +154,55 @@ impl ViewportGeometry {
                 mode: ViewportDisplayMode::Exact,
             }
         }
+    }
+
+    /// Computes display rectangle taking into account both an aspect ratio override and a zoom mode.
+    pub fn compute_with_aspect_and_zoom<W: IntoDimension, H: IntoDimension>(
+        available_w: f32,
+        available_h: f32,
+        video_w: W,
+        video_h: H,
+        aspect_override: AspectRatioOverride,
+        zoom_mode: ZoomMode,
+    ) -> Self {
+        let vw = video_w.into_dimension();
+        let vh = video_h.into_dimension();
+
+        if available_w <= 0.0 || available_h <= 0.0 || vw <= 0.0 || vh <= 0.0 {
+            return Self {
+                render_width: 0.0,
+                render_height: 0.0,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                mode: ViewportDisplayMode::Empty,
+            };
+        }
+
+        if let Some(scale) = zoom_mode.scale() {
+            let effective_aspect = match aspect_override {
+                AspectRatioOverride::Original => vw / vh,
+                AspectRatioOverride::Ratio16_9 => 16.0 / 9.0,
+                AspectRatioOverride::Ratio4_3 => 4.0 / 3.0,
+                AspectRatioOverride::Ratio16_10 => 16.0 / 10.0,
+                AspectRatioOverride::Ratio21_9 => 21.0 / 9.0,
+                AspectRatioOverride::Ratio2_35_1 => 2.35,
+                AspectRatioOverride::Ratio1_1 => 1.0,
+                AspectRatioOverride::FillStretch => vw / vh,
+            };
+            let render_h = vh * scale;
+            let render_w = render_h * effective_aspect;
+            let offset_x = (available_w - render_w) / 2.0;
+            let offset_y = (available_h - render_h) / 2.0;
+            return Self {
+                render_width: render_w,
+                render_height: render_h,
+                offset_x,
+                offset_y,
+                mode: ViewportDisplayMode::Exact,
+            };
+        }
+
+        Self::compute_with_aspect(available_w, available_h, video_w, video_h, aspect_override)
     }
 }
 
@@ -219,6 +270,7 @@ pub struct VideoViewport {
     pending_frame: Option<VideoFrameRGBA>,
     last_frame: Option<VideoFrameRGBA>,
     aspect_override: AspectRatioOverride,
+    zoom_mode: ZoomMode,
     last_video_rect: Option<Rect>,
     pending_click: Option<(Instant, bool)>,
     last_double_click: Option<Instant>,
@@ -242,6 +294,7 @@ impl VideoViewport {
             pending_frame: None,
             last_frame: None,
             aspect_override: AspectRatioOverride::Original,
+            zoom_mode: ZoomMode::Fit,
             last_video_rect: None,
             pending_click: None,
             last_double_click: None,
@@ -327,6 +380,7 @@ impl VideoViewport {
         self.current_pts_ms = None;
         self.video_width = 0;
         self.video_height = 0;
+        self.zoom_mode = ZoomMode::Fit;
         self.last_video_rect = None;
         self.pending_click = None;
         self.last_double_click = None;
@@ -385,6 +439,22 @@ impl VideoViewport {
         self.aspect_override
     }
 
+    /// Returns the currently active zoom mode.
+    pub fn zoom_mode(&self) -> ZoomMode {
+        self.zoom_mode
+    }
+
+    /// Sets the active zoom mode.
+    pub fn set_zoom_mode(&mut self, zoom_mode: ZoomMode) {
+        self.zoom_mode = zoom_mode;
+    }
+
+    /// Cycles sequentially to the next zoom mode preset and returns the new mode.
+    pub fn cycle_zoom_mode(&mut self) -> ZoomMode {
+        self.zoom_mode = self.zoom_mode.cycle_next();
+        self.zoom_mode
+    }
+
     /// Returns the active video frame rectangle computed during the last frame presentation, if any.
     pub fn last_video_rect(&self) -> Option<Rect> {
         self.last_video_rect
@@ -395,12 +465,13 @@ impl VideoViewport {
         if self.video_width == 0 || self.video_height == 0 {
             return None;
         }
-        let geom = ViewportGeometry::compute_with_aspect(
+        let geom = ViewportGeometry::compute_with_aspect_and_zoom(
             available_rect.width(),
             available_rect.height(),
             self.video_width,
             self.video_height,
             self.aspect_override,
+            self.zoom_mode,
         );
         if geom.mode == ViewportDisplayMode::Empty {
             None
@@ -437,13 +508,14 @@ impl VideoViewport {
         // 2. Black background fill (letterbox/pillarbox margins)
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
-        // 3. Aspect ratio calculation
-        let geom = ViewportGeometry::compute_with_aspect(
+        // 3. Aspect ratio and zoom calculation
+        let geom = ViewportGeometry::compute_with_aspect_and_zoom(
             available_w,
             available_h,
             self.video_width,
             self.video_height,
             self.aspect_override,
+            self.zoom_mode,
         );
 
         let video_rect = if geom.mode != ViewportDisplayMode::Empty {
@@ -703,5 +775,31 @@ mod tests {
         assert!(!action.toggle_play_pause);
         assert!(!action.open_file);
         assert_eq!(action.scroll_delta, 0.0);
+    }
+
+    #[test]
+    fn test_video_viewport_zoom_mode_and_geometry() {
+        let mut viewport = VideoViewport::new();
+        assert_eq!(viewport.zoom_mode(), ZoomMode::Fit);
+        viewport.set_zoom_mode(ZoomMode::Quarter);
+        assert_eq!(viewport.zoom_mode(), ZoomMode::Quarter);
+
+        let cycled = viewport.cycle_zoom_mode();
+        assert_eq!(cycled, ZoomMode::Half);
+        assert_eq!(viewport.zoom_mode(), ZoomMode::Half);
+
+        // Test zoom geometry calculation at 50% scale
+        let geom = ViewportGeometry::compute_with_aspect_and_zoom(
+            1920.0,
+            1080.0,
+            1920u32,
+            1080u32,
+            AspectRatioOverride::Original,
+            ZoomMode::Half,
+        );
+        assert_eq!(geom.render_width, 960.0);
+        assert_eq!(geom.render_height, 540.0);
+        assert_eq!(geom.offset_x, 480.0);
+        assert_eq!(geom.offset_y, 270.0);
     }
 }
