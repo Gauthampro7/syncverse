@@ -10,6 +10,9 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "wav", "aac", "opus",
 ];
 
+/// Supported playlist file extensions.
+pub const PLAYLIST_EXTENSIONS: &[&str] = &["m3u", "m3u8"];
+
 /// Supported subtitle file extensions.
 pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa"];
 
@@ -18,6 +21,14 @@ pub fn is_supported_media(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Checks if the given path is a supported playlist file (.m3u, .m3u8).
+pub fn is_supported_playlist(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| PLAYLIST_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -36,27 +47,32 @@ pub enum DroppedFileAction {
     OpenMedia(PathBuf),
     /// Load an external subtitle file for the current media.
     LoadSubtitle(PathBuf),
+    /// Load an external M3U playlist file into the playlist queue.
+    LoadPlaylist(PathBuf),
 }
 
 /// Handler for window drag-and-drop operations and hover rendering.
 pub struct DragDropHandler;
 
 impl DragDropHandler {
-    /// Inspects egui raw input and returns all dropped media and subtitle file actions, prioritizing media first.
+    /// Inspects egui raw input and returns all dropped media, playlist, and subtitle file actions.
     pub fn handle_dropped_files(ctx: &Context) -> Vec<DroppedFileAction> {
         let mut actions = Vec::new();
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in &dropped {
             let path = file.path();
-            if is_supported_media(path) {
+            if is_supported_playlist(path) {
+                actions.push(DroppedFileAction::LoadPlaylist(path.to_path_buf()));
+            } else if is_supported_media(path) {
                 actions.push(DroppedFileAction::OpenMedia(path.to_path_buf()));
             } else if is_supported_subtitle(path) {
                 actions.push(DroppedFileAction::LoadSubtitle(path.to_path_buf()));
             }
         }
         actions.sort_by_key(|a| match a {
-            DroppedFileAction::OpenMedia(_) => 0,
-            DroppedFileAction::LoadSubtitle(_) => 1,
+            DroppedFileAction::LoadPlaylist(_) => 0,
+            DroppedFileAction::OpenMedia(_) => 1,
+            DroppedFileAction::LoadSubtitle(_) => 2,
         });
         actions
     }

@@ -271,6 +271,7 @@ pub struct VideoViewport {
     last_frame: Option<VideoFrameRGBA>,
     aspect_override: AspectRatioOverride,
     zoom_mode: ZoomMode,
+    pan_offset: Vec2,
     last_video_rect: Option<Rect>,
     pending_click: Option<(Instant, bool)>,
     last_double_click: Option<Instant>,
@@ -295,6 +296,7 @@ impl VideoViewport {
             last_frame: None,
             aspect_override: AspectRatioOverride::Original,
             zoom_mode: ZoomMode::Fit,
+            pan_offset: Vec2::ZERO,
             last_video_rect: None,
             pending_click: None,
             last_double_click: None,
@@ -381,6 +383,7 @@ impl VideoViewport {
         self.video_width = 0;
         self.video_height = 0;
         self.zoom_mode = ZoomMode::Fit;
+        self.pan_offset = Vec2::ZERO;
         self.last_video_rect = None;
         self.pending_click = None;
         self.last_double_click = None;
@@ -447,12 +450,28 @@ impl VideoViewport {
     /// Sets the active zoom mode.
     pub fn set_zoom_mode(&mut self, zoom_mode: ZoomMode) {
         self.zoom_mode = zoom_mode;
+        if zoom_mode == ZoomMode::Fit {
+            self.pan_offset = Vec2::ZERO;
+        }
     }
 
     /// Cycles sequentially to the next zoom mode preset and returns the new mode.
     pub fn cycle_zoom_mode(&mut self) -> ZoomMode {
         self.zoom_mode = self.zoom_mode.cycle_next();
+        if self.zoom_mode == ZoomMode::Fit {
+            self.pan_offset = Vec2::ZERO;
+        }
         self.zoom_mode
+    }
+
+    /// Resets video frame pan offset to zero.
+    pub fn reset_pan(&mut self) {
+        self.pan_offset = Vec2::ZERO;
+    }
+
+    /// Returns current video frame pan offset.
+    pub fn pan_offset(&self) -> Vec2 {
+        self.pan_offset
     }
 
     /// Returns the active video frame rectangle computed during the last frame presentation, if any.
@@ -476,8 +495,9 @@ impl VideoViewport {
         if geom.mode == ViewportDisplayMode::Empty {
             None
         } else {
+            let pan = if self.zoom_mode == ZoomMode::Fit { Vec2::ZERO } else { self.pan_offset };
             Some(Rect::from_min_size(
-                available_rect.min + egui::vec2(geom.offset_x, geom.offset_y),
+                available_rect.min + egui::vec2(geom.offset_x + pan.x, geom.offset_y + pan.y),
                 Vec2::new(geom.render_width, geom.render_height),
             ))
         }
@@ -500,7 +520,7 @@ impl VideoViewport {
         let available_h = available_rect.height();
 
         // 1. Allocate full interactive space
-        let (rect, response) = ui.allocate_exact_size(available_rect.size(), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(available_rect.size(), egui::Sense::click_and_drag());
 
         // Context menu on right click
         response.context_menu(context_menu);
@@ -518,8 +538,14 @@ impl VideoViewport {
             self.zoom_mode,
         );
 
+        if response.dragged() && self.zoom_mode != ZoomMode::Fit {
+            self.pan_offset += response.drag_delta();
+            self.pending_click = None;
+        }
+
         let video_rect = if geom.mode != ViewportDisplayMode::Empty {
-            let video_min = rect.min + egui::vec2(geom.offset_x, geom.offset_y);
+            let pan = if self.zoom_mode == ZoomMode::Fit { Vec2::ZERO } else { self.pan_offset };
+            let video_min = rect.min + egui::vec2(geom.offset_x + pan.x, geom.offset_y + pan.y);
             Some(Rect::from_min_size(
                 video_min,
                 Vec2::new(geom.render_width, geom.render_height),

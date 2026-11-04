@@ -439,6 +439,10 @@ impl ShortcutsDialog {
                             ui.label("A-B Repeat Looping (Cycle: Set A ➔ Set B ➔ Off)");
                             ui.end_row();
 
+                            ui.label(RichText::new("Shift + R").monospace().strong());
+                            ui.label("Clear A-B Repeat Loop Immediately");
+                            ui.end_row();
+
                             ui.label(RichText::new("Ctrl + L").monospace().strong());
                             ui.label("Toggle Playlist Queue Dialog Window");
                             ui.end_row();
@@ -506,6 +510,10 @@ impl ShortcutsDialog {
                             ui.label(RichText::new("G / F").monospace().strong());
                             ui.label("Adjust Audio Delay (-50 ms / +50 ms)");
                             ui.end_row();
+
+                            ui.label(RichText::new("Shift + G").monospace().strong());
+                            ui.label("Reset Audio Delay to 0 ms (Synchronized)");
+                            ui.end_row();
                         });
 
                     ui.add_space(12.0);
@@ -523,8 +531,20 @@ impl ShortcutsDialog {
                             ui.label("Adjust Subtitle Delay (-50 ms / +50 ms)");
                             ui.end_row();
 
+                            ui.label(RichText::new("Shift + H").monospace().strong());
+                            ui.label("Reset Subtitle Delay to 0 ms (Synchronized)");
+                            ui.end_row();
+
                             ui.label(RichText::new("Z").monospace().strong());
                             ui.label("Cycle Video Zoom Mode (Fit, 1:4, 1:2, 1:1 Original, 2:1)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Shift + Z").monospace().strong());
+                            ui.label("Reset Video Zoom to Fit & Reset Pan");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Mouse Drag when Zoomed").monospace().strong());
+                            ui.label("Pan around Video Viewport");
                             ui.end_row();
 
                             ui.label(RichText::new("A").monospace().strong());

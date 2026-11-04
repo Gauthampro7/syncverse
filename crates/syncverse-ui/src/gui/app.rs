@@ -1176,7 +1176,7 @@ impl eframe::App for SyncverseApp {
         // 4. Global keyboard shortcuts (suppressed if typing in text edit or any modal dialog is open)
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus && !self.is_any_modal_open() {
-            if ctx.input(|i| i.key_pressed(egui::Key::F11) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::F))) {
+            if ctx.input(|i| i.key_pressed(egui::Key::F11) || (i.modifiers.alt && i.key_pressed(egui::Key::Enter))) {
                 self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
             }
@@ -1186,8 +1186,11 @@ impl eframe::App for SyncverseApp {
             if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
                 self.shortcuts_dialog.open();
             }
-            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::O)) {
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::O)) {
                 self.file_dialog.open_file_dialog();
+            }
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::O)) {
+                self.file_dialog.open_add_to_playlist_dialog();
             }
             if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Space)) {
                 let _ = self.command_tx.send(PlayerCommand::TogglePause);
@@ -1272,7 +1275,7 @@ impl eframe::App for SyncverseApp {
                     now,
                 );
             }
-            if ctx.input(|i| (i.modifiers.ctrl && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::L))) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::L)) {
                 self.loop_enabled = !self.loop_enabled;
                 let _ = self.command_tx.send(PlayerCommand::SetLoop(self.loop_enabled));
                 let msg = if self.loop_enabled { "Loop: Enabled" } else { "Loop: Disabled" };
@@ -1428,26 +1431,42 @@ impl eframe::App for SyncverseApp {
                 }
                 self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
             }
-            // Video Zoom mode cycling (Z)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::Z)) {
+            // Video Zoom mode cycling (Z) & Zoom Reset (Shift+Z)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+                self.viewport.set_zoom_mode(crate::gui::aspect_ratio::ZoomMode::Fit);
+                self.viewport.reset_pan();
+                self.osd_overlay.show_notification("Zoom: Fit (Reset)".to_string(), now);
+            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
                 let zm = self.viewport.cycle_zoom_mode();
                 self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
             }
-            // Audio delay adjustment (G: -50ms, F: +50ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::G)) {
+            // Audio delay adjustment (G: -50ms, F: +50ms, Shift+G: Reset 0ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::G)) {
+                self.audio_delay_ms = 0;
+                let _ = self.command_tx.send(PlayerCommand::SetAudioDelay(0));
+                self.controls_state.audio_dialog.set_delay_ms(0);
+                self.osd_overlay.show_notification("Audio Delay: 0 ms (Synchronized)".to_string(), now);
+            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::G)) {
                 self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::F)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::F)) {
                 self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            // Subtitle delay adjustment (H: -50ms, J: +50ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::H)) {
+            // Subtitle delay adjustment (H: -50ms, J: +50ms, Shift+H: Reset 0ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::H)) {
+                self.subtitle_delay_ms = 0;
+                let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(0));
+                self.controls_state.subtitle_dialog.set_delay_ms(0);
+                self.invalidate_subtitle_cache();
+                ctx.request_repaint();
+                self.osd_overlay.show_notification("Subtitle Delay: 0 ms (Synchronized)".to_string(), now);
+            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::H)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1455,7 +1474,7 @@ impl eframe::App for SyncverseApp {
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::J)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::J)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1464,8 +1483,12 @@ impl eframe::App for SyncverseApp {
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
 
-            // A-B Repeat Looping (Shift+L or R)
-            if ctx.input(|i| (i.modifiers.shift && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::R))) {
+            // A-B Repeat Looping: Clear immediately (Shift+R) or Cycle (R or Shift+L)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::R)) {
+                self.ab_repeat.clear();
+                self.controls_state.ab_repeat.clear();
+                self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
+            } else if ctx.input(|i| (i.modifiers.shift && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::R))) {
                 let current_ms = snapshot.media_position_pts / 1_000_000;
                 self.cycle_ab_repeat(current_ms, now);
             }
@@ -1528,8 +1551,72 @@ impl eframe::App for SyncverseApp {
         }
 
         // 5. Poll background native file picker & drag-and-drop
-        if let Some(picked_file) = self.file_dialog.poll_selected_file() {
-            self.load_file(picked_file);
+        if let Some(res) = self.file_dialog.poll_result() {
+            match res.purpose {
+                crate::gui::file_dialog::FileDialogPurpose::OpenMedia => {
+                    if let Some(p) = res.paths.into_iter().next() {
+                        self.load_file(p);
+                    }
+                }
+                crate::gui::file_dialog::FileDialogPurpose::AddToPlaylist => {
+                    let had_items = !self.playlist_manager.items.is_empty();
+                    let count = res.paths.len();
+                    for p in res.paths {
+                        self.playlist_manager.add_file(p);
+                    }
+                    if !had_items && self.current_file.is_none() {
+                        if let Some(first) = self.playlist_manager.select_index(0) {
+                            self.load_file(first);
+                        }
+                    } else {
+                        self.osd_overlay.show_notification(
+                            format!("Playlist: Queued {} file(s)", count),
+                            now,
+                        );
+                    }
+                }
+                crate::gui::file_dialog::FileDialogPurpose::LoadM3u => {
+                    if let Some(m3u_path) = res.paths.into_iter().next() {
+                        match self.playlist_manager.load_from_m3u(&m3u_path) {
+                            Ok(count) => {
+                                self.osd_overlay.show_notification(
+                                    format!("Playlist: Loaded {} tracks from M3U", count),
+                                    now,
+                                );
+                                if self.current_file.is_none() && count > 0 {
+                                    if let Some(first) = self.playlist_manager.select_index(0) {
+                                        self.load_file(first);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.osd_overlay.show_notification(
+                                    format!("Failed to load M3U: {}", e),
+                                    now,
+                                );
+                            }
+                        }
+                    }
+                }
+                crate::gui::file_dialog::FileDialogPurpose::SaveM3u => {
+                    if let Some(save_path) = res.paths.into_iter().next() {
+                        match self.playlist_manager.save_to_m3u(&save_path) {
+                            Ok(_) => {
+                                self.osd_overlay.show_notification(
+                                    format!("Playlist saved: {}", save_path.file_name().and_then(|f| f.to_str()).unwrap_or("playlist.m3u")),
+                                    now,
+                                );
+                            }
+                            Err(e) => {
+                                self.osd_overlay.show_notification(
+                                    format!("Failed to save M3U: {}", e),
+                                    now,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         for action in DragDropHandler::handle_dropped_files(&ctx) {
             match action {
@@ -1538,6 +1625,27 @@ impl eframe::App for SyncverseApp {
                 }
                 DroppedFileAction::LoadSubtitle(path) => {
                     self.load_external_subtitle_file(path, now);
+                }
+                DroppedFileAction::LoadPlaylist(path) => {
+                    match self.playlist_manager.load_from_m3u(&path) {
+                        Ok(count) => {
+                            self.osd_overlay.show_notification(
+                                format!("Playlist: Loaded {} tracks from {}", count, path.file_name().and_then(|f| f.to_str()).unwrap_or("M3U")),
+                                now,
+                            );
+                            if self.current_file.is_none() && count > 0 {
+                                if let Some(first) = self.playlist_manager.select_index(0) {
+                                    self.load_file(first);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.osd_overlay.show_notification(
+                                format!("Failed to load M3U: {}", e),
+                                now,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1638,6 +1746,18 @@ impl eframe::App for SyncverseApp {
                         if ui.button("Open File... (Ctrl+O)").clicked() {
                             ui.close();
                             self.file_dialog.open_file_dialog();
+                        }
+                        if ui.button("Add Files to Playlist... (Ctrl+Shift+O)").clicked() {
+                            ui.close();
+                            self.file_dialog.open_add_to_playlist_dialog();
+                        }
+                        if ui.button("Load M3U Playlist...").clicked() {
+                            ui.close();
+                            self.file_dialog.open_load_m3u_dialog();
+                        }
+                        if ui.button("Save M3U Playlist...").clicked() {
+                            ui.close();
+                            self.file_dialog.open_save_m3u_dialog();
                         }
                         if ui.button("Open Path from Clipboard (Ctrl+V)").clicked() {
                             ui.close();
@@ -1750,6 +1870,17 @@ impl eframe::App for SyncverseApp {
 
                         ui.separator();
 
+                        if ui.button("Previous Track (P)").clicked() {
+                            ui.close();
+                            self.play_previous_file(now);
+                        }
+                        if ui.button("Next Track (N)").clicked() {
+                            ui.close();
+                            self.play_next_file(now);
+                        }
+
+                        ui.separator();
+
                         if ui.button("Previous Chapter (PageUp)").clicked() {
                             ui.close();
                             let current_ms = snapshot.media_position_pts / 1_000_000;
@@ -1839,6 +1970,25 @@ impl eframe::App for SyncverseApp {
 
                         ui.separator();
 
+                        let ab_label = match self.ab_repeat {
+                            crate::gui::ab_loop::AbRepeatState::Disabled => "A-B Loop: Set Point A (R)",
+                            crate::gui::ab_loop::AbRepeatState::PointASet(_) => "A-B Loop: Set Point B (R)",
+                            crate::gui::ab_loop::AbRepeatState::Active { .. } => "A-B Loop: Clear (R)",
+                        };
+                        if ui.button(ab_label).clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.cycle_ab_repeat(current_ms, now);
+                        }
+                        if self.ab_repeat.is_active() && ui.button("A-B Loop: Clear Immediately (Shift+R)").clicked() {
+                            ui.close();
+                            self.ab_repeat.clear();
+                            self.controls_state.ab_repeat.clear();
+                            self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
+                        }
+
+                        ui.separator();
+
                         let loop_label = if self.loop_enabled {
                             "✓ Loop Playback (L)"
                         } else {
@@ -1855,38 +2005,301 @@ impl eframe::App for SyncverseApp {
                         ui.separator();
 
                         ui.menu_button("Speed", |ui| {
+                            if ui.button("Faster (+0.1x) (])").clicked() {
+                                let spd = ((self.controls_state.speed + 0.1).min(4.0) * 10.0).round() / 10.0;
+                                self.controls_state.speed = spd;
+                                let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                                self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
+                                ui.close();
+                            }
+                            if ui.button("Slower (-0.1x) ([)").clicked() {
+                                let spd = ((self.controls_state.speed - 0.1).max(0.25) * 10.0).round() / 10.0;
+                                self.controls_state.speed = spd;
+                                let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                                self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
+                                ui.close();
+                            }
+                            if ui.button("Reset Normal (1.00x) (=)").clicked() {
+                                self.controls_state.speed = 1.0;
+                                let _ = self.command_tx.send(PlayerCommand::SetSpeed(1.0));
+                                self.osd_overlay.show_notification("Speed: 1.00x".to_string(), now);
+                                ui.close();
+                            }
+                            ui.separator();
                             for &spd in &crate::gui::controls::SUPPORTED_SPEEDS {
+                                let is_active = (self.controls_state.speed - spd).abs() < 1e-3;
                                 let label = if (spd - 1.0).abs() < 1e-3 {
-                                    "1.0x (Normal)".to_string()
+                                    "1.00x (Normal)".to_string()
                                 } else {
                                     format!("{:.2}x", spd)
                                 };
-                                if ui.button(label).clicked() {
+                                if ui.selectable_label(is_active, label).clicked() {
                                     ui.close();
                                     self.controls_state.speed = spd;
                                     let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                                    self.osd_overlay.show_notification(format!("Speed: {:.2}x", spd), now);
+                                }
+                            }
+                        });
+                    });
+
+                    // --- AUDIO MENU ---
+                    ui.menu_button("Audio", |ui| {
+                        ui.menu_button("Audio Track (B)", |ui| {
+                            if self.audio_tracks.is_empty() {
+                                ui.label(egui::RichText::new("Default Track").italics().color(egui::Color32::GRAY));
+                            } else {
+                                for (idx, track_name) in self.audio_tracks.iter().enumerate() {
+                                    let is_selected = self.audio_track_index == idx;
+                                    let display_label = format!("Track {} - {}", idx + 1, track_name);
+                                    if ui.selectable_label(is_selected, display_label).clicked() {
+                                        ui.close();
+                                        self.audio_track_index = idx;
+                                        if idx < self.controls_state.audio_dialog.tracks.len() {
+                                            let id = self.controls_state.audio_dialog.tracks[idx].id;
+                                            self.controls_state.audio_dialog.select_track(id);
+                                        }
+                                        let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(idx as u64));
+                                        self.osd_overlay.show_notification(
+                                            format!("Audio: Track {}/{} - {}", idx + 1, self.audio_tracks.len(), track_name),
+                                            now,
+                                        );
+                                    }
                                 }
                             }
                         });
 
-                        ui.menu_button("Volume", |ui| {
-                            let mute_label = if self.controls_state.volume.is_muted { "Unmute (M)" } else { "Mute (M)" };
-                            if ui.button(mute_label).clicked() {
-                                ui.close();
-                                self.controls_state.volume.toggle_mute();
-                                let _ = self.command_tx.send(PlayerCommand::ToggleMute);
-                            }
-                            if ui.button("Volume Up (+5%) (↑)").clicked() {
-                                let new_vol = (self.controls_state.volume.volume + 0.05).min(1.0);
-                                self.controls_state.volume.set_volume(new_vol);
-                                let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
-                            }
-                            if ui.button("Volume Down (-5%) (↓)").clicked() {
-                                let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
-                                self.controls_state.volume.set_volume(new_vol);
-                                let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                        ui.separator();
+
+                        if ui.button("Audio Delay -50ms (G)").clicked() {
+                            self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
+                            let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
+                            self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
+                            self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
+                        }
+                        if ui.button("Audio Delay +50ms (F)").clicked() {
+                            self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
+                            let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
+                            self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
+                            self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
+                        }
+                        if ui.button("Reset Audio Delay 0ms (Shift+G)").clicked() {
+                            self.audio_delay_ms = 0;
+                            let _ = self.command_tx.send(PlayerCommand::SetAudioDelay(0));
+                            self.controls_state.audio_dialog.set_delay_ms(0);
+                            self.osd_overlay.show_notification("Audio Delay: 0 ms (Synchronized)".to_string(), now);
+                        }
+
+                        ui.separator();
+
+                        let mute_label = if self.controls_state.volume.is_muted { "Unmute (M)" } else { "Mute (M)" };
+                        if ui.button(mute_label).clicked() {
+                            ui.close();
+                            self.controls_state.volume.toggle_mute();
+                            let _ = self.command_tx.send(PlayerCommand::ToggleMute);
+                            let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
+                            self.osd_overlay.show_notification(toast.to_string(), now);
+                        }
+                        if ui.button("Volume Up (+5%) (↑)").clicked() {
+                            let new_vol = (self.controls_state.volume.volume + 0.05).min(crate::gui::controls::VolumeControlState::MAX_VOLUME);
+                            self.controls_state.volume.set_volume(new_vol);
+                            let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                            let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
+                            self.osd_overlay.show_notification(
+                                format!("Volume: {}%{}", (new_vol * 100.0).round() as u32, boost_str),
+                                now,
+                            );
+                        }
+                        if ui.button("Volume Down (-5%) (↓)").clicked() {
+                            let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
+                            self.controls_state.volume.set_volume(new_vol);
+                            let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                            self.osd_overlay.show_notification(
+                                format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                                now,
+                            );
+                        }
+
+                        ui.separator();
+
+                        if ui.button("Audio Settings & Track Selection...").clicked() {
+                            ui.close();
+                            self.controls_state.audio_dialog.open();
+                        }
+                    });
+
+                    // --- VIDEO MENU ---
+                    ui.menu_button("Video", |ui| {
+                        ui.menu_button("Aspect Ratio (A)", |ui| {
+                            for &ar in &crate::gui::aspect_ratio::AspectRatioOverride::ALL {
+                                let is_selected = self.viewport.aspect_override() == ar;
+                                if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                                    ui.close();
+                                    self.viewport.set_aspect_override(ar);
+                                    self.controls_state.aspect_ratio = ar;
+                                    self.controls_state.video_dialog.set_aspect_ratio(ar);
+                                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
+                                        self.aspect_ratio_index = pos;
+                                    }
+                                    self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
+                                }
                             }
                         });
+
+                        ui.menu_button("Zoom (Z)", |ui| {
+                            for &zm in &crate::gui::aspect_ratio::ZoomMode::ALL {
+                                let is_selected = self.viewport.zoom_mode() == zm;
+                                if ui.selectable_label(is_selected, zm.display_name()).clicked() {
+                                    ui.close();
+                                    self.viewport.set_zoom_mode(zm);
+                                    self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Reset Zoom & Pan (Shift+Z)").clicked() {
+                                ui.close();
+                                self.viewport.set_zoom_mode(crate::gui::aspect_ratio::ZoomMode::Fit);
+                                self.viewport.reset_pan();
+                                self.osd_overlay.show_notification("Zoom: Fit (Reset)".to_string(), now);
+                            }
+                        });
+
+                        ui.separator();
+
+                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F11)" } else { "Fullscreen (F11)" };
+                        if ui.button(fs_label).clicked() {
+                            ui.close();
+                            self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
+                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
+                        }
+                        if ui.button("📸 Take Snapshot (F8 / Ctrl+S)").clicked() {
+                            ui.close();
+                            self.take_screenshot(now);
+                        }
+
+                        ui.separator();
+
+                        if ui.button("Video Adjustments & Filters...").clicked() {
+                            ui.close();
+                            self.controls_state.video_dialog.open();
+                        }
+                    });
+
+                    // --- SUBTITLE MENU ---
+                    ui.menu_button("Subtitle", |ui| {
+                        ui.menu_button("Subtitle Track (V / C)", |ui| {
+                            let is_off = self.subtitle_track_index.is_none();
+                            if ui.selectable_label(is_off, "Off / None").clicked() {
+                                ui.close();
+                                self.subtitle_track_index = None;
+                                self.controls_state.subtitle_dialog.select_track(None);
+                                self.active_subtitle_cues.clear();
+                                self.invalidate_subtitle_cache();
+                                ctx.request_repaint();
+                                self.osd_overlay.show_notification("Subtitles: Off".to_string(), now);
+                            }
+                            for (idx, track_name) in self.subtitle_tracks.iter().enumerate() {
+                                let is_selected = self.subtitle_track_index == Some(idx);
+                                let display_label = format!("Track {} - {}", idx + 1, track_name);
+                                if ui.selectable_label(is_selected, display_label).clicked() {
+                                    ui.close();
+                                    self.subtitle_track_index = Some(idx);
+                                    self.controls_state.subtitle_dialog.select_track(Some(idx));
+                                    if idx < self.subtitle_track_data.len() {
+                                        self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
+                                    }
+                                    self.invalidate_subtitle_cache();
+                                    ctx.request_repaint();
+                                    self.osd_overlay.show_notification(
+                                        format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track_name),
+                                        now,
+                                    );
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        if ui.button("Subtitle Delay -50ms (H)").clicked() {
+                            self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
+                            let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
+                            self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
+                            self.invalidate_subtitle_cache();
+                            ctx.request_repaint();
+                            self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
+                        }
+                        if ui.button("Subtitle Delay +50ms (J)").clicked() {
+                            self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
+                            let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
+                            self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
+                            self.invalidate_subtitle_cache();
+                            ctx.request_repaint();
+                            self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
+                        }
+                        if ui.button("Reset Subtitle Delay 0ms (Shift+H)").clicked() {
+                            self.subtitle_delay_ms = 0;
+                            let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(0));
+                            self.controls_state.subtitle_dialog.set_delay_ms(0);
+                            self.invalidate_subtitle_cache();
+                            ctx.request_repaint();
+                            self.osd_overlay.show_notification("Subtitle Delay: 0 ms (Synchronized)".to_string(), now);
+                        }
+
+                        ui.separator();
+
+                        if ui.button("Subtitle Styling & Synchronization...").clicked() {
+                            ui.close();
+                            self.controls_state.subtitle_dialog.open();
+                        }
+                    });
+
+                    // --- TOOLS MENU ---
+                    ui.menu_button("Tools", |ui| {
+                        if ui.button("📑 Playlist Queue (Ctrl+L)").clicked() {
+                            ui.close();
+                            self.playlist_dialog.toggle();
+                        }
+                        if ui.button("ℹ Media Information & Codec Statistics (Ctrl+I)").clicked() {
+                            ui.close();
+                            self.media_info_dialog.toggle();
+                        }
+                    });
+
+                    // --- VIEW MENU ---
+                    ui.menu_button("View", |ui| {
+                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F11)" } else { "Fullscreen (F11)" };
+                        if ui.button(fs_label).clicked() {
+                            ui.close();
+                            self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
+                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
+                        }
+
+                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        let max_label = if is_maximized { "Restore Window" } else { "Maximize Window" };
+                        if ui.button(max_label).clicked() {
+                            ui.close();
+                            ctx.send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
+                        }
+                        if ui.button("Minimize Window").clicked() {
+                            ui.close();
+                            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                        }
+
+                        ui.separator();
+
+                        let sb_label = if self.sidebar_state.is_expanded { "Hide Watch Party Sidebar (Tab)" } else { "Show Watch Party Sidebar (Tab)" };
+                        if ui.button(sb_label).clicked() {
+                            ui.close();
+                            self.sidebar_state.toggle();
+                        }
+                        if ui.button("Playlist Queue (Ctrl+L)").clicked() {
+                            ui.close();
+                            self.playlist_dialog.toggle();
+                        }
+                        if ui.button("Media Information (Ctrl+I)").clicked() {
+                            ui.close();
+                            self.media_info_dialog.toggle();
+                        }
                     });
 
                     // --- WATCH PARTY MENU ---
@@ -1917,51 +2330,6 @@ impl eframe::App for SyncverseApp {
                             }
                             ui.separator();
                         }
-
-                        let sb_label = if self.sidebar_state.is_expanded { "Hide Sidebar (Tab)" } else { "Show Sidebar (Tab)" };
-                        if ui.button(sb_label).clicked() {
-                            ui.close();
-                            self.sidebar_state.toggle();
-                        }
-                    });
-
-                    // --- VIEW MENU ---
-                    ui.menu_button("View", |ui| {
-                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F11)" } else { "Fullscreen (F11)" };
-                        if ui.button(fs_label).clicked() {
-                            ui.close();
-                            self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
-                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
-                        }
-
-                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                        let max_label = if is_maximized { "Restore Window" } else { "Maximize Window" };
-                        if ui.button(max_label).clicked() {
-                            ui.close();
-                            ctx.send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
-                        }
-                        if ui.button("Minimize Window").clicked() {
-                            ui.close();
-                            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                        }
-
-                        ui.separator();
-
-                        ui.menu_button("Aspect Ratio", |ui| {
-                            for &ar in &crate::gui::aspect_ratio::AspectRatioOverride::ALL {
-                                let is_selected = self.viewport.aspect_override() == ar;
-                                if ui.selectable_label(is_selected, ar.display_name()).clicked() {
-                                    ui.close();
-                                    self.viewport.set_aspect_override(ar);
-                                    self.controls_state.aspect_ratio = ar;
-                                    self.controls_state.video_dialog.set_aspect_ratio(ar);
-                                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
-                                        self.aspect_ratio_index = pos;
-                                    }
-                                    self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
-                                }
-                            }
-                        });
 
                         let sb_label = if self.sidebar_state.is_expanded { "Hide Sidebar (Tab)" } else { "Show Sidebar (Tab)" };
                         if ui.button(sb_label).clicked() {
@@ -2398,11 +2766,12 @@ impl eframe::App for SyncverseApp {
                     }
                     if action.scroll_delta != 0.0 {
                         let step = action.scroll_delta.signum() * 0.05;
-                        let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, 1.0);
+                        let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, crate::gui::controls::VolumeControlState::MAX_VOLUME);
                         self.controls_state.volume.set_volume(new_vol);
                         let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                        let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
                         self.osd_overlay.show_notification(
-                            format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                            format!("Volume: {}%{}", (new_vol * 100.0).round() as u32, boost_str),
                             now,
                         );
                     }
@@ -2500,7 +2869,13 @@ impl eframe::App for SyncverseApp {
                     self.load_file(path);
                 }
                 crate::gui::playlist::PlaylistAction::AddMediaFiles => {
-                    self.file_dialog.open_file_dialog();
+                    self.file_dialog.open_add_to_playlist_dialog();
+                }
+                crate::gui::playlist::PlaylistAction::LoadM3u => {
+                    self.file_dialog.open_load_m3u_dialog();
+                }
+                crate::gui::playlist::PlaylistAction::SaveM3u => {
+                    self.file_dialog.open_save_m3u_dialog();
                 }
                 crate::gui::playlist::PlaylistAction::ClearQueue => {
                     self.playlist_manager.clear();

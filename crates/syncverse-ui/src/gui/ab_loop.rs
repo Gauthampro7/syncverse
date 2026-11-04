@@ -25,11 +25,15 @@ impl AbRepeatState {
         match self {
             Self::Disabled => "A-B Loop: Off".to_string(),
             Self::PointASet(a) => format!("A-B Loop: Set A ({})", ControlsBarState::format_timestamp(*a)),
-            Self::Active { a_ms, b_ms } => format!(
-                "A-B Loop: {} ➔ {} (Looping)",
-                ControlsBarState::format_timestamp(*a_ms),
-                ControlsBarState::format_timestamp(*b_ms)
-            ),
+            Self::Active { a_ms, b_ms } => {
+                let dur_s = (*b_ms as f64 - *a_ms as f64) / 1000.0;
+                format!(
+                    "A-B Loop: {} ➔ {} ({:.1}s)",
+                    ControlsBarState::format_timestamp(*a_ms),
+                    ControlsBarState::format_timestamp(*b_ms),
+                    dur_s
+                )
+            }
         }
     }
 
@@ -102,6 +106,32 @@ impl AbRepeatState {
         };
     }
 
+    /// Nudges Point A by `delta_ms` milliseconds, ensuring bounds validity.
+    pub fn nudge_point_a(&mut self, delta_ms: i64) {
+        if let Self::Active { a_ms, b_ms } = *self {
+            let new_a = (a_ms as i64 + delta_ms).max(0) as u64;
+            if new_a + 100 < b_ms {
+                *self = Self::Active { a_ms: new_a, b_ms };
+            }
+        } else if let Self::PointASet(a) = *self {
+            let new_a = (a as i64 + delta_ms).max(0) as u64;
+            *self = Self::PointASet(new_a);
+        }
+    }
+
+    /// Nudges Point B by `delta_ms` milliseconds, ensuring bounds validity.
+    pub fn nudge_point_b(&mut self, delta_ms: i64, max_duration_ms: u64) {
+        if let Self::Active { a_ms, b_ms } = *self {
+            let mut new_b = (b_ms as i64 + delta_ms).max(0) as u64;
+            if max_duration_ms > 0 {
+                new_b = new_b.min(max_duration_ms);
+            }
+            if new_b > a_ms + 100 {
+                *self = Self::Active { a_ms, b_ms: new_b };
+            }
+        }
+    }
+
     /// Clears the A-B repeat state back to `Disabled`.
     pub fn clear(&mut self) {
         *self = Self::Disabled;
@@ -111,6 +141,14 @@ impl AbRepeatState {
     #[inline]
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active { .. })
+    }
+
+    /// Returns duration of active A-B loop segment in milliseconds, or `None` if inactive.
+    pub fn duration_ms(&self) -> Option<u64> {
+        match self {
+            Self::Active { a_ms, b_ms } => Some(b_ms.saturating_sub(*a_ms)),
+            _ => None,
+        }
     }
 
     /// Returns Point A in milliseconds if set.
@@ -175,7 +213,8 @@ mod tests {
         assert!(state.is_active());
         assert_eq!(state.point_a(), Some(10_000));
         assert_eq!(state.point_b(), Some(25_000));
-        assert!(state.status_text().contains("Looping"));
+        assert_eq!(state.duration_ms(), Some(15_000));
+        assert!(state.status_text().contains("15.0s"));
 
         // Evaluate loop:
         // Before B: No seek
@@ -188,6 +227,7 @@ mod tests {
         state = state.cycle(18_000);
         assert_eq!(state, AbRepeatState::Disabled);
         assert!(!state.is_active());
+        assert_eq!(state.duration_ms(), None);
     }
 
     #[test]
@@ -198,8 +238,33 @@ mod tests {
 
         state.set_point_b(12000);
         assert_eq!(state, AbRepeatState::Active { a_ms: 5000, b_ms: 12000 });
+        assert_eq!(state.duration_ms(), Some(7000));
 
         state.clear();
         assert_eq!(state, AbRepeatState::Disabled);
+        assert_eq!(state.duration_ms(), None);
+    }
+
+    #[test]
+    fn test_ab_repeat_duration_and_nudging() {
+        let mut state = AbRepeatState::Active { a_ms: 2000, b_ms: 8000 };
+        assert_eq!(state.duration_ms(), Some(6000));
+
+        // Nudge Point A forward by 500ms -> [2500, 8000]
+        state.nudge_point_a(500);
+        assert_eq!(state.point_a(), Some(2500));
+        assert_eq!(state.duration_ms(), Some(5500));
+
+        // Nudge Point A backward by 1000ms -> [1500, 8000]
+        state.nudge_point_a(-1000);
+        assert_eq!(state.point_a(), Some(1500));
+
+        // Nudge Point B forward by 1000ms with max limit 10000 -> [1500, 9000]
+        state.nudge_point_b(1000, 10000);
+        assert_eq!(state.point_b(), Some(9000));
+
+        // Nudge Point B past max limit clamps to 10000
+        state.nudge_point_b(3000, 10000);
+        assert_eq!(state.point_b(), Some(10000));
     }
 }
