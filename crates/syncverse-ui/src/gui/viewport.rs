@@ -469,6 +469,17 @@ impl VideoViewport {
         self.pan_offset = Vec2::ZERO;
     }
 
+    /// Sets active video dimensions `(width, height)`.
+    pub fn set_video_dimensions(&mut self, width: u32, height: u32) {
+        self.video_width = width;
+        self.video_height = height;
+    }
+
+    /// Sets current video frame pan offset.
+    pub fn set_pan_offset(&mut self, offset: Vec2) {
+        self.pan_offset = offset;
+    }
+
     /// Returns current video frame pan offset.
     pub fn pan_offset(&self) -> Vec2 {
         self.pan_offset
@@ -495,7 +506,16 @@ impl VideoViewport {
         if geom.mode == ViewportDisplayMode::Empty {
             None
         } else {
-            let pan = if self.zoom_mode == ZoomMode::Fit { Vec2::ZERO } else { self.pan_offset };
+            let max_pan_x = ((geom.render_width - available_rect.width()) / 2.0).max(0.0);
+            let max_pan_y = ((geom.render_height - available_rect.height()) / 2.0).max(0.0);
+            let pan = if self.zoom_mode == ZoomMode::Fit {
+                Vec2::ZERO
+            } else {
+                egui::vec2(
+                    self.pan_offset.x.clamp(-max_pan_x, max_pan_x),
+                    self.pan_offset.y.clamp(-max_pan_y, max_pan_y),
+                )
+            };
             Some(Rect::from_min_size(
                 available_rect.min + egui::vec2(geom.offset_x + pan.x, geom.offset_y + pan.y),
                 Vec2::new(geom.render_width, geom.render_height),
@@ -538,9 +558,18 @@ impl VideoViewport {
             self.zoom_mode,
         );
 
-        if response.dragged() && self.zoom_mode != ZoomMode::Fit {
-            self.pan_offset += response.drag_delta();
-            self.pending_click = None;
+        let max_pan_x = ((geom.render_width - available_w) / 2.0).max(0.0);
+        let max_pan_y = ((geom.render_height - available_h) / 2.0).max(0.0);
+
+        if self.zoom_mode == ZoomMode::Fit {
+            self.pan_offset = Vec2::ZERO;
+        } else {
+            if response.dragged() {
+                self.pan_offset += response.drag_delta();
+                self.pending_click = None;
+            }
+            self.pan_offset.x = self.pan_offset.x.clamp(-max_pan_x, max_pan_x);
+            self.pan_offset.y = self.pan_offset.y.clamp(-max_pan_y, max_pan_y);
         }
 
         let video_rect = if geom.mode != ViewportDisplayMode::Empty {
@@ -555,11 +584,11 @@ impl VideoViewport {
         };
         self.last_video_rect = video_rect;
 
-        // 4. Render video frame texture if available
+        // 4. Render video frame texture if available (clipped to viewport rect to prevent bleed)
         if let Some(ref texture) = self.texture {
             if let Some(v_rect) = video_rect {
                 let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                ui.painter().image(texture.id(), v_rect, uv, Color32::WHITE);
+                ui.painter().with_clip_rect(rect).image(texture.id(), v_rect, uv, Color32::WHITE);
             }
         } else {
             // Sleek centered placeholder when no media is playing
@@ -828,4 +857,35 @@ mod tests {
         assert_eq!(geom.offset_x, 480.0);
         assert_eq!(geom.offset_y, 270.0);
     }
+
+    #[test]
+    fn test_video_viewport_pan_offset_and_clamping() {
+        let mut viewport = VideoViewport::new();
+        viewport.video_width = 1920;
+        viewport.video_height = 1080;
+        viewport.set_zoom_mode(ZoomMode::Double); // 200% zoom -> 3840 x 2160 in 1920x1080 viewport
+        assert_eq!(viewport.pan_offset(), Vec2::ZERO);
+
+        let available = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1920.0, 1080.0));
+        let base_rect = viewport.compute_video_rect(available).expect("must compute rect");
+        // Center offset: (1920 - 3840)/2 = -960, (1080 - 2160)/2 = -540
+        assert_eq!(base_rect.min, egui::pos2(-960.0, -540.0));
+
+        // When pan offset is within bounds (e.g. +200, +100)
+        viewport.pan_offset = Vec2::new(200.0, 100.0);
+        let panned_rect = viewport.compute_video_rect(available).expect("must compute rect");
+        assert_eq!(panned_rect.min, egui::pos2(-760.0, -440.0));
+
+        // When pan offset exceeds maximum bounds (e.g. +5000, -5000), it is clamped to +/-960 and +/-540
+        viewport.pan_offset = Vec2::new(5000.0, -5000.0);
+        let clamped_rect = viewport.compute_video_rect(available).expect("must compute rect");
+        assert_eq!(clamped_rect.min, egui::pos2(0.0, -1080.0));
+
+        // Returning to Fit resets pan to zero
+        viewport.set_zoom_mode(ZoomMode::Fit);
+        assert_eq!(viewport.pan_offset(), Vec2::ZERO);
+        let fit_rect = viewport.compute_video_rect(available).expect("must compute rect");
+        assert_eq!(fit_rect.min, egui::pos2(0.0, 0.0));
+    }
 }
+

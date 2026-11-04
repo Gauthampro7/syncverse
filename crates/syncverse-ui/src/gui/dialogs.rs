@@ -367,7 +367,7 @@ impl ShortcutsDialog {
                             ui.label("Toggle Play / Pause");
                             ui.end_row();
 
-                            ui.label(RichText::new("F / F11 / Double-Click").monospace().strong());
+                            ui.label(RichText::new("F11 / Alt + Enter / Double-Click").monospace().strong());
                             ui.label("Toggle Fullscreen Mode");
                             ui.end_row();
 
@@ -441,6 +441,14 @@ impl ShortcutsDialog {
 
                             ui.label(RichText::new("Shift + R").monospace().strong());
                             ui.label("Clear A-B Repeat Loop Immediately");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Alt + [ / Alt + ]").monospace().strong());
+                            ui.label("Nudge A-B Repeat Point A (-100 ms / +100 ms)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Alt + Shift + [ / ]").monospace().strong());
+                            ui.label("Nudge A-B Repeat Point B (-100 ms / +100 ms)");
                             ui.end_row();
 
                             ui.label(RichText::new("Ctrl + L").monospace().strong());

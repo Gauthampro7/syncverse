@@ -976,6 +976,26 @@ pub fn run_playback_worker(
                         }
                         Err(err) => {
                             eprintln!("[ERROR] PlaybackSession failed to open {:?}: {}", path, err);
+                            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("media");
+                            session = None;
+                            current_file_name = None;
+                            current_file_size = 0;
+                            current_media_hash = [0u8; 32];
+                            clock.set_state(Instant::now(), PlaybackState::Paused);
+                            clock.seek_to(0.0, Instant::now());
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            let snap = PlayerUiSnapshot {
+                                monotonic_timestamp: 0,
+                                media_position_pts: 0,
+                                media_duration_pts: 0,
+                                playback_state: 0,
+                                ..Default::default()
+                            };
+                            exchange.publish(snap);
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Error opening {}: {}", fname, err),
+                                timestamp: Instant::now(),
+                            });
                         }
                     }
                 }

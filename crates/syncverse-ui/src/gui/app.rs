@@ -36,11 +36,13 @@ struct CachedSubtitleLookup {
 }
 
 /// Preset aspect ratio modes for sequential cycling.
-pub const ASPECT_RATIO_PRESETS: [&str; 6] = [
-    "Original (Fit)",
+pub const ASPECT_RATIO_PRESETS: [&str; 8] = [
+    "Original",
     "16:9",
     "4:3",
+    "16:10",
     "21:9",
+    "2.35:1",
     "1:1",
     "Fill / Stretch",
 ];
@@ -482,7 +484,7 @@ impl SyncverseApp {
 
     /// Returns the current aspect ratio preset label.
     pub fn aspect_ratio_preset(&self) -> &'static str {
-        ASPECT_RATIO_PRESETS[self.aspect_ratio_index % ASPECT_RATIO_PRESETS.len()]
+        self.viewport.aspect_override().display_name()
     }
 
     /// Shows a transient OSD HUD notification banner.
@@ -998,13 +1000,16 @@ impl eframe::App for SyncverseApp {
                     self.controls_state.chapters = chapters;
                 }
                 UiEvent::PlaybackEofReached => {
-                    if !self.ab_repeat.is_active() {
-                        if self.playlist_manager.repeat_mode == crate::gui::playlist::PlaylistRepeatMode::Track {
-                            self.seek_to(0, now, Some("Repeating Track".to_string()));
+                    if self.ab_repeat.is_active() {
+                        if let Some(a_ms) = self.ab_repeat.point_a() {
+                            self.seek_to(a_ms, now, Some("A-B Loop Restart".to_string()));
                             let _ = self.command_tx.send(PlayerCommand::TogglePause);
-                        } else if self.playlist_manager.items.len() > 1 {
-                            self.play_next_file(now);
                         }
+                    } else if self.playlist_manager.repeat_mode == crate::gui::playlist::PlaylistRepeatMode::Track {
+                        self.seek_to(0, now, Some("Repeating Track".to_string()));
+                        let _ = self.command_tx.send(PlayerCommand::TogglePause);
+                    } else {
+                        self.play_next_file(now);
                     }
                 }
             }
@@ -1293,22 +1298,49 @@ impl eframe::App for SyncverseApp {
                 if let Some(text) = clipboard_text {
                     let trimmed = text.trim().trim_matches('"').trim_matches('\'');
                     if !trimmed.is_empty() {
-                        let path_str = if let Some(stripped) = trimmed.strip_prefix("file://") {
-                            stripped
+                        let unescaped = if let Some(after) = trimmed.strip_prefix("file://") {
+                            let path_part = after.strip_prefix("localhost").unwrap_or(after);
+                            let mut decoded = crate::gui::playlist::decode_percent_encoded(path_part);
+                            if decoded.starts_with('/') && decoded.len() >= 3 && decoded.as_bytes()[2] == b':' {
+                                decoded.remove(0);
+                            }
+                            decoded
                         } else {
-                            trimmed
+                            crate::gui::playlist::decode_percent_encoded(trimmed)
                         };
-                        let pb = PathBuf::from(path_str);
+                        let pb = PathBuf::from(&unescaped);
                         if pb.exists() {
-                            self.load_file(pb.clone());
-                            let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(path_str);
-                            self.osd_overlay.show_notification(
-                                format!("Loaded from clipboard: {}", fname),
-                                now,
-                            );
+                            if crate::gui::drag_drop::is_supported_playlist(&pb) {
+                                match self.playlist_manager.load_from_m3u(&pb) {
+                                    Ok(count) => {
+                                        self.osd_overlay.show_notification(
+                                            format!("Playlist: Loaded {} tracks from {}", count, pb.file_name().and_then(|f| f.to_str()).unwrap_or("M3U")),
+                                            now,
+                                        );
+                                        if self.current_file.is_none() && count > 0 {
+                                            if let Some(first) = self.playlist_manager.select_index(0) {
+                                                self.load_file(first);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.osd_overlay.show_notification(
+                                            format!("Failed to load M3U: {}", e),
+                                            now,
+                                        );
+                                    }
+                                }
+                            } else {
+                                self.load_file(pb.clone());
+                                let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(&unescaped);
+                                self.osd_overlay.show_notification(
+                                    format!("Loaded from clipboard: {}", fname),
+                                    now,
+                                );
+                            }
                         } else {
                             self.osd_overlay.show_notification(
-                                format!("File not found: {}", path_str),
+                                format!("File not found: {}", unescaped),
                                 now,
                             );
                         }
@@ -1329,8 +1361,9 @@ impl eframe::App for SyncverseApp {
                 let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
+                let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
                 self.osd_overlay.show_notification(
-                    format!("Volume: {}%", (new_vol * 100.0).round() as u32),
+                    format!("Volume: {}%{}", (new_vol * 100.0).round() as u32, boost_str),
                     now,
                 );
             }
@@ -1489,8 +1522,30 @@ impl eframe::App for SyncverseApp {
                 self.controls_state.ab_repeat.clear();
                 self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
             } else if ctx.input(|i| (i.modifiers.shift && i.key_pressed(egui::Key::L)) || (!i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::R))) {
-                let current_ms = snapshot.media_position_pts / 1_000_000;
+                let current_ms = self.controls_state.effective_position_ms(snapshot.media_position_pts / 1_000_000, now);
                 self.cycle_ab_repeat(current_ms, now);
+            }
+
+            // A-B Repeat Fine-Tuning: Alt+[ / Alt+] nudges Point A (-100ms / +100ms); Alt+Shift+[ / Alt+Shift+] nudges Point B (-100ms / +100ms)
+            if self.ab_repeat != crate::gui::ab_loop::AbRepeatState::Disabled {
+                let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                if ctx.input(|i| i.modifiers.alt && !i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::OpenBracket)) {
+                    self.ab_repeat.nudge_point_a(-100);
+                    self.controls_state.ab_repeat = self.ab_repeat;
+                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                } else if ctx.input(|i| i.modifiers.alt && !i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::CloseBracket)) {
+                    self.ab_repeat.nudge_point_a(100);
+                    self.controls_state.ab_repeat = self.ab_repeat;
+                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                } else if self.ab_repeat.is_active() && ctx.input(|i| i.modifiers.alt && i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::OpenBracket)) {
+                    self.ab_repeat.nudge_point_b(-100, dur_ms);
+                    self.controls_state.ab_repeat = self.ab_repeat;
+                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                } else if self.ab_repeat.is_active() && ctx.input(|i| i.modifiers.alt && i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::CloseBracket)) {
+                    self.ab_repeat.nudge_point_b(100, dur_ms);
+                    self.controls_state.ab_repeat = self.ab_repeat;
+                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                }
             }
 
             // Playlist Queue Dialog Toggle (Ctrl+L)
@@ -1600,6 +1655,11 @@ impl eframe::App for SyncverseApp {
                 }
                 crate::gui::file_dialog::FileDialogPurpose::SaveM3u => {
                     if let Some(save_path) = res.paths.into_iter().next() {
+                        let save_path = if save_path.extension().is_none() {
+                            save_path.with_extension("m3u")
+                        } else {
+                            save_path
+                        };
                         match self.playlist_manager.save_to_m3u(&save_path) {
                             Ok(_) => {
                                 self.osd_overlay.show_notification(
@@ -1618,10 +1678,13 @@ impl eframe::App for SyncverseApp {
                 }
             }
         }
-        for action in DragDropHandler::handle_dropped_files(&ctx) {
+
+        let dropped_actions = DragDropHandler::handle_dropped_files(&ctx);
+        let mut dropped_media = Vec::new();
+        for action in dropped_actions {
             match action {
                 DroppedFileAction::OpenMedia(path) => {
-                    self.load_file(path);
+                    dropped_media.push(path);
                 }
                 DroppedFileAction::LoadSubtitle(path) => {
                     self.load_external_subtitle_file(path, now);
@@ -1646,6 +1709,28 @@ impl eframe::App for SyncverseApp {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        if !dropped_media.is_empty() {
+            if dropped_media.len() == 1 {
+                self.load_file(dropped_media.remove(0));
+            } else {
+                let count = dropped_media.len();
+                let had_items = !self.playlist_manager.items.is_empty();
+                for p in dropped_media {
+                    self.playlist_manager.add_file(p);
+                }
+                if !had_items && self.current_file.is_none() {
+                    if let Some(first) = self.playlist_manager.select_index(0) {
+                        self.load_file(first);
+                    }
+                } else {
+                    self.osd_overlay.show_notification(
+                        format!("Playlist: Queued {} file(s)", count),
+                        now,
+                    );
                 }
             }
         }
@@ -1772,22 +1857,49 @@ impl eframe::App for SyncverseApp {
                             if let Some(text) = clipboard_text {
                                 let trimmed = text.trim().trim_matches('"').trim_matches('\'');
                                 if !trimmed.is_empty() {
-                                    let path_str = if let Some(stripped) = trimmed.strip_prefix("file://") {
-                                        stripped
+                                    let unescaped = if let Some(after) = trimmed.strip_prefix("file://") {
+                                        let path_part = after.strip_prefix("localhost").unwrap_or(after);
+                                        let mut decoded = crate::gui::playlist::decode_percent_encoded(path_part);
+                                        if decoded.starts_with('/') && decoded.len() >= 3 && decoded.as_bytes()[2] == b':' {
+                                            decoded.remove(0);
+                                        }
+                                        decoded
                                     } else {
-                                        trimmed
+                                        crate::gui::playlist::decode_percent_encoded(trimmed)
                                     };
-                                    let pb = PathBuf::from(path_str);
+                                    let pb = PathBuf::from(&unescaped);
                                     if pb.exists() {
-                                        self.load_file(pb.clone());
-                                        let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(path_str);
-                                        self.osd_overlay.show_notification(
-                                            format!("Loaded from clipboard: {}", fname),
-                                            now,
-                                        );
+                                        if crate::gui::drag_drop::is_supported_playlist(&pb) {
+                                            match self.playlist_manager.load_from_m3u(&pb) {
+                                                Ok(count) => {
+                                                    self.osd_overlay.show_notification(
+                                                        format!("Playlist: Loaded {} tracks from {}", count, pb.file_name().and_then(|f| f.to_str()).unwrap_or("M3U")),
+                                                        now,
+                                                    );
+                                                    if self.current_file.is_none() && count > 0 {
+                                                        if let Some(first) = self.playlist_manager.select_index(0) {
+                                                            self.load_file(first);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    self.osd_overlay.show_notification(
+                                                        format!("Failed to load M3U: {}", e),
+                                                        now,
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            self.load_file(pb.clone());
+                                            let fname = pb.file_name().and_then(|n| n.to_str()).unwrap_or(&unescaped);
+                                            self.osd_overlay.show_notification(
+                                                format!("Loaded from clipboard: {}", fname),
+                                                now,
+                                            );
+                                        }
                                     } else {
                                         self.osd_overlay.show_notification(
-                                            format!("File not found: {}", path_str),
+                                            format!("File not found: {}", unescaped),
                                             now,
                                         );
                                     }
@@ -1977,14 +2089,42 @@ impl eframe::App for SyncverseApp {
                         };
                         if ui.button(ab_label).clicked() {
                             ui.close();
-                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            let current_ms = self.controls_state.effective_position_ms(snapshot.media_position_pts / 1_000_000, now);
                             self.cycle_ab_repeat(current_ms, now);
                         }
-                        if self.ab_repeat.is_active() && ui.button("A-B Loop: Clear Immediately (Shift+R)").clicked() {
-                            ui.close();
-                            self.ab_repeat.clear();
-                            self.controls_state.ab_repeat.clear();
-                            self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
+                        if self.ab_repeat != crate::gui::ab_loop::AbRepeatState::Disabled {
+                            if ui.button("A-B Loop: Clear Immediately (Shift+R)").clicked() {
+                                ui.close();
+                                self.ab_repeat.clear();
+                                self.controls_state.ab_repeat.clear();
+                                self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
+                            }
+                            ui.menu_button("Fine-Tune A-B Loop Points", |ui| {
+                                let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                                if ui.button("Nudge Point A (-100ms) (Alt+[)").clicked() {
+                                    self.ab_repeat.nudge_point_a(-100);
+                                    self.controls_state.ab_repeat = self.ab_repeat;
+                                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                                }
+                                if ui.button("Nudge Point A (+100ms) (Alt+])").clicked() {
+                                    self.ab_repeat.nudge_point_a(100);
+                                    self.controls_state.ab_repeat = self.ab_repeat;
+                                    self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                                }
+                                if self.ab_repeat.is_active() {
+                                    ui.separator();
+                                    if ui.button("Nudge Point B (-100ms) (Alt+Shift+[)").clicked() {
+                                        self.ab_repeat.nudge_point_b(-100, dur_ms);
+                                        self.controls_state.ab_repeat = self.ab_repeat;
+                                        self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                                    }
+                                    if ui.button("Nudge Point B (+100ms) (Alt+Shift+])").clicked() {
+                                        self.ab_repeat.nudge_point_b(100, dur_ms);
+                                        self.controls_state.ab_repeat = self.ab_repeat;
+                                        self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
+                                    }
+                                }
+                            });
                         }
 
                         ui.separator();
@@ -2447,6 +2587,11 @@ impl eframe::App for SyncverseApp {
                             let current_ms = snapshot.media_position_pts / 1_000_000;
                             self.cycle_ab_repeat(current_ms, now);
                         }
+                        ControlsBarAction::ClearAbRepeat => {
+                            self.ab_repeat.clear();
+                            self.controls_state.ab_repeat.clear();
+                            self.osd_overlay.show_notification("A-B Loop: Off (Cleared)".to_string(), now);
+                        }
                         ControlsBarAction::TogglePlaylist => {
                             self.playlist_dialog.toggle();
                         }
@@ -2522,7 +2667,7 @@ impl eframe::App for SyncverseApp {
                         self.file_dialog.open_file_dialog();
                     }
 
-                    let fs_label = if self.controls_state.is_fullscreen { "⛶ Exit Fullscreen (F / Esc)" } else { "⛶ Fullscreen (F / F11)" };
+                    let fs_label = if self.controls_state.is_fullscreen { "⛶ Exit Fullscreen (F11 / Esc)" } else { "⛶ Fullscreen (F11 / Alt+Enter)" };
                     if ui.button(fs_label).clicked() {
                         ui.close();
                         self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
@@ -2764,7 +2909,7 @@ impl eframe::App for SyncverseApp {
                         let toast = if self.controls_state.volume.is_muted { "Muted" } else { "Unmuted" };
                         self.osd_overlay.show_notification(toast.to_string(), now);
                     }
-                    if action.scroll_delta != 0.0 {
+                    if action.scroll_delta.abs() >= 2.0 {
                         let step = action.scroll_delta.signum() * 0.05;
                         let new_vol = (self.controls_state.volume.volume + step).clamp(0.0, crate::gui::controls::VolumeControlState::MAX_VOLUME);
                         self.controls_state.volume.set_volume(new_vol);
@@ -2879,6 +3024,7 @@ impl eframe::App for SyncverseApp {
                 }
                 crate::gui::playlist::PlaylistAction::ClearQueue => {
                     self.playlist_manager.clear();
+                    self.osd_overlay.show_notification("Playlist cleared".to_string(), now);
                 }
             }
         }

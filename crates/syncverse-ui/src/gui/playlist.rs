@@ -60,6 +60,11 @@ impl PlaylistItem {
             .to_string();
         Self { path, filename }
     }
+
+    /// Constructs a `PlaylistItem` with an explicit display title.
+    pub fn with_title(path: PathBuf, title: String) -> Self {
+        Self { path, filename: title }
+    }
 }
 
 /// Manages media queue order, directory auto-scan, shuffle randomization, and track advancement.
@@ -230,29 +235,70 @@ impl PlaylistManager {
     }
 
     /// Loads multimedia items from an M3U / M3U8 playlist file at `path`.
-    /// Returns the number of newly added tracks.
+    ///
+    /// Supports `#EXTINF` metadata directives, `file://` URI decoding, URL percent-decoding,
+    /// and relative path resolution against the playlist directory. Returns the number of newly added tracks.
     pub fn load_from_m3u(&mut self, path: &Path) -> std::io::Result<usize> {
         use std::io::BufRead;
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut added = 0;
+        let mut last_title = None;
 
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() {
                 continue;
             }
-            let p = PathBuf::from(trimmed);
-            let full_path = if p.is_absolute() {
+            if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
+                if let Some((_dur, title)) = rest.split_once(',') {
+                    let t = title.trim();
+                    if !t.is_empty() {
+                        last_title = Some(t.to_string());
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                continue;
+            }
+
+            let unescaped = if let Some(after) = trimmed.strip_prefix("file://") {
+                let path_part = after.strip_prefix("localhost").unwrap_or(after);
+                let mut decoded = decode_percent_encoded(path_part);
+                if decoded.starts_with('/') && decoded.len() >= 3 && decoded.as_bytes()[2] == b':' {
+                    decoded.remove(0);
+                }
+                decoded
+            } else {
+                decode_percent_encoded(trimmed)
+            };
+
+            let is_abs = unescaped.is_empty()
+                || Path::new(&unescaped).is_absolute()
+                || (unescaped.len() >= 3
+                    && unescaped.as_bytes()[0].is_ascii_alphabetic()
+                    && unescaped.as_bytes()[1] == b':'
+                    && (unescaped.as_bytes()[2] == b'/' || unescaped.as_bytes()[2] == b'\\'));
+
+            let p = PathBuf::from(unescaped);
+            let full_path = if is_abs {
                 p
             } else {
                 parent.join(p)
             };
+
             if !self.contains(&full_path) {
-                self.items.push(PlaylistItem::new(full_path));
+                let item = match last_title.take() {
+                    Some(t) => PlaylistItem::with_title(full_path, t),
+                    None => PlaylistItem::new(full_path),
+                };
+                self.items.push(item);
                 added += 1;
+            } else {
+                last_title = None;
             }
         }
         if added > 0 {
@@ -595,6 +641,28 @@ impl PlaylistDialog {
     }
 }
 
+/// Decodes URL percent-encoded characters (e.g. `%20` to space).
+pub fn decode_percent_encoded(s: &str) -> String {
+    let raw = s.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let (Some(h1), Some(h2)) = (
+                (raw[i + 1] as char).to_digit(16),
+                (raw[i + 2] as char).to_digit(16),
+            ) {
+                bytes.push(((h1 << 4) | h2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        bytes.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +788,52 @@ mod tests {
         assert_eq!(loaded_mgr.items[0].filename, "song1.mp3");
         assert_eq!(loaded_mgr.items[1].filename, "song2.flac");
         assert_eq!(loaded_mgr.items[2].filename, "video.mkv");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_decode_percent_encoded() {
+        assert_eq!(decode_percent_encoded("hello%20world.mp3"), "hello world.mp3");
+        assert_eq!(decode_percent_encoded("Artist%20-%20Song%20%28Remix%29.flac"), "Artist - Song (Remix).flac");
+        assert_eq!(decode_percent_encoded("plain_text.mkv"), "plain_text.mkv");
+        assert_eq!(decode_percent_encoded("percent%25symbol.mp3"), "percent%symbol.mp3");
+    }
+
+    #[test]
+    fn test_playlist_m3u_extinf_and_file_uri_parsing() {
+        let dir = std::env::temp_dir().join(format!("syncverse_m3u_extinf_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let m3u_path = dir.join("playlist.m3u8");
+
+        let m3u_content = "\
+#EXTM3U
+#EXTINF:210,Queen - Bohemian Rhapsody
+file:///media/Music/Queen%20-%20Bohemian%20Rhapsody.mp3
+#EXTINF:180,Track Two Custom Title
+relative_song.flac
+#EXTVLCOPT:network-caching=1000
+# Comment line
+/absolute/path/song3.opus
+";
+        std::fs::write(&m3u_path, m3u_content).expect("write test m3u must succeed");
+
+        let mut mgr = PlaylistManager::new();
+        let loaded = mgr.load_from_m3u(&m3u_path).expect("load m3u must succeed");
+        assert_eq!(loaded, 3);
+        assert_eq!(mgr.items.len(), 3);
+
+        // Check track 1: EXTINF title parsed, file:// stripped, percent-decoding applied
+        assert_eq!(mgr.items[0].filename, "Queen - Bohemian Rhapsody");
+        assert_eq!(mgr.items[0].path, PathBuf::from("/media/Music/Queen - Bohemian Rhapsody.mp3"));
+
+        // Check track 2: EXTINF title parsed, relative path resolved against m3u directory
+        assert_eq!(mgr.items[1].filename, "Track Two Custom Title");
+        assert_eq!(mgr.items[1].path, dir.join("relative_song.flac"));
+
+        // Check track 3: no EXTINF title, falls back to file_name "song3.opus"
+        assert_eq!(mgr.items[2].filename, "song3.opus");
+        assert_eq!(mgr.items[2].path, PathBuf::from("/absolute/path/song3.opus"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

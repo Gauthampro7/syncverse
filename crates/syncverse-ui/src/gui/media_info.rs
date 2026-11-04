@@ -127,6 +127,9 @@ impl MediaInfoDialog {
                             ctx.copy_text(text);
                             self.status_message = Some("Copied to clipboard!".to_string());
                         }
+                        if ui.button("🔄 Refresh").clicked() {
+                            self.status_message = Some("Refreshed statistics".to_string());
+                        }
                     });
                 });
 
@@ -337,6 +340,11 @@ impl MediaInfoDialog {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "None".to_string());
         report.push_str(&format!("- **File:** {}\n", path_str));
+        if let Some(p) = current_file {
+            if let Ok(meta) = std::fs::metadata(p) {
+                report.push_str(&format!("- **File Size:** {}\n", format_file_size(meta.len())));
+            }
+        }
         let dur_ms = snapshot.media_duration_pts / 1_000_000;
         let pos_ms = snapshot.media_position_pts / 1_000_000;
         report.push_str(&format!("- **Position:** {}\n", crate::overlay::format_timecode_hud(pos_ms, dur_ms)));
@@ -355,10 +363,20 @@ impl MediaInfoDialog {
         report.push_str(&format!("- **Frame Rate:** {}\n", video_meta.frame_rate_str()));
 
         report.push_str("\n**Audio Stream:**\n");
+        let track_str = if let Some(idx) = active_audio_track {
+            if idx < audio_tracks.len() {
+                let t = &audio_tracks[idx];
+                format!("{} ({})", t.title, t.codec)
+            } else {
+                "Default".to_string()
+            }
+        } else {
+            "None".to_string()
+        };
+        report.push_str(&format!("- **Active Track:** {}\n", track_str));
         if let Some(idx) = active_audio_track {
             if idx < audio_tracks.len() {
                 let t = &audio_tracks[idx];
-                report.push_str(&format!("- **Active Track:** {} ({})\n", t.title, t.codec));
                 if let Some(sr) = t.sample_rate {
                     report.push_str(&format!("- **Sample Rate:** {:.0} Hz\n", sr));
                 }
@@ -369,7 +387,9 @@ impl MediaInfoDialog {
         }
         report.push_str(&format!("- **Audio Delay:** {:+} ms\n", audio_delay_ms));
         report.push_str(&format!("- **Subtitle Delay:** {:+} ms\n", subtitle_delay_ms));
-        report.push_str(&format!("- **Volume:** {:.0}%\n", volume * 100.0));
+        let vol_pct = (volume * 100.0).round() as u32;
+        let boost_str = if volume > 1.0 { " [Boost]" } else { "" };
+        report.push_str(&format!("- **Volume:** {}%{}\n", vol_pct, boost_str));
 
         report.push_str("\n**Synchronization Diagnostics:**\n");
         report.push_str(&format!("- **RTT:** {:.2} ms\n", snapshot.network_rtt_nanos as f64 / 1_000_000.0));
@@ -404,5 +424,10 @@ mod tests {
         assert!(!dlg.is_open);
         dlg.toggle();
         assert!(dlg.is_open);
+
+        dlg.status_message = Some("Refreshed statistics".to_string());
+        assert_eq!(dlg.status_message.as_deref(), Some("Refreshed statistics"));
+        dlg.open();
+        assert_eq!(dlg.status_message, None);
     }
 }

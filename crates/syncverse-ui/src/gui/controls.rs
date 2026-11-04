@@ -287,6 +287,8 @@ pub enum ControlsBarAction {
     TakeScreenshot,
     /// Advance A-B repeat playback looping state machine.
     CycleAbRepeat,
+    /// Clear A-B repeat playback looping immediately.
+    ClearAbRepeat,
     /// Toggle playlist queue dialog window.
     TogglePlaylist,
     /// Toggle technical media and codec statistics dialog window.
@@ -691,12 +693,13 @@ impl PlaybackControlsBar {
                 .fill(style::BUTTON_BG)
                 .corner_radius(6.0);
 
-                if ui
+                let resp = ui
                     .add(ab_btn)
-                    .on_hover_text(format!("{} (Press Shift+L or R to cycle)", state.ab_repeat.status_text()))
-                    .clicked()
-                {
+                    .on_hover_text(format!("{} (Left-click: cycle, Right-click: clear)", state.ab_repeat.status_text()));
+                if resp.clicked() {
                     actions.push(ControlsBarAction::CycleAbRepeat);
+                } else if resp.secondary_clicked() {
+                    actions.push(ControlsBarAction::ClearAbRepeat);
                 }
             }
 
@@ -1106,4 +1109,11 @@ mod tests {
         assert_eq!(state.effective_position_ms(12_000, now), 12_000);
         assert_eq!(state.pending_seek_ms, None);
     }
+
+    #[test]
+    fn test_controls_clear_ab_repeat_action() {
+        let action = ControlsBarAction::ClearAbRepeat;
+        assert!(matches!(action, ControlsBarAction::ClearAbRepeat));
+    }
 }
+

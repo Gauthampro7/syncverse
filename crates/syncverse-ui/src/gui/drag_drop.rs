@@ -61,7 +61,25 @@ impl DragDropHandler {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in &dropped {
             let path = file.path();
-            if is_supported_playlist(path) {
+            if path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    let mut dir_media = Vec::new();
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() {
+                            if is_supported_playlist(&p) {
+                                actions.push(DroppedFileAction::LoadPlaylist(p));
+                            } else if is_supported_media(&p) {
+                                dir_media.push(p);
+                            }
+                        }
+                    }
+                    dir_media.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                    for p in dir_media {
+                        actions.push(DroppedFileAction::OpenMedia(p));
+                    }
+                }
+            } else if is_supported_playlist(path) {
                 actions.push(DroppedFileAction::LoadPlaylist(path.to_path_buf()));
             } else if is_supported_media(path) {
                 actions.push(DroppedFileAction::OpenMedia(path.to_path_buf()));
@@ -134,3 +152,44 @@ impl DragDropHandler {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_supported_extensions() {
+        assert!(is_supported_media(Path::new("video.mkv")));
+        assert!(is_supported_media(Path::new("movie.MP4")));
+        assert!(is_supported_media(Path::new("song.flac")));
+        assert!(!is_supported_media(Path::new("notes.txt")));
+        assert!(!is_supported_media(Path::new("playlist.m3u")));
+
+        assert!(is_supported_playlist(Path::new("queue.m3u")));
+        assert!(is_supported_playlist(Path::new("stream.M3U8")));
+        assert!(!is_supported_playlist(Path::new("song.mp3")));
+
+        assert!(is_supported_subtitle(Path::new("subs.srt")));
+        assert!(is_supported_subtitle(Path::new("subs.vtt")));
+        assert!(is_supported_subtitle(Path::new("subs.ass")));
+        assert!(!is_supported_subtitle(Path::new("subs.pdf")));
+    }
+
+    #[test]
+    fn test_dropped_file_action_sorting() {
+        let mut actions = [
+            DroppedFileAction::LoadSubtitle(PathBuf::from("sub.srt")),
+            DroppedFileAction::OpenMedia(PathBuf::from("movie.mkv")),
+            DroppedFileAction::LoadPlaylist(PathBuf::from("list.m3u")),
+        ];
+        actions.sort_by_key(|a| match a {
+            DroppedFileAction::LoadPlaylist(_) => 0,
+            DroppedFileAction::OpenMedia(_) => 1,
+            DroppedFileAction::LoadSubtitle(_) => 2,
+        });
+        assert!(matches!(actions[0], DroppedFileAction::LoadPlaylist(_)));
+        assert!(matches!(actions[1], DroppedFileAction::OpenMedia(_)));
+        assert!(matches!(actions[2], DroppedFileAction::LoadSubtitle(_)));
+    }
+}
+
