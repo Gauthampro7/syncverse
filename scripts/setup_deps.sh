@@ -54,8 +54,8 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
 done
 
 # Check if runtime ffmpeg-libs is present on Fedora host
-if [ ! -f "/usr/lib64/libavcodec.so.62" ] || [ ! -f "/usr/lib64/libavformat.so.62" ]; then
-  echo "[WARN] Pre-installed /usr/lib64/libavcodec.so.62 not found. Ensure ffmpeg-libs package is available." >&2
+if ! ls /usr/lib64/libavcodec.so.* >/dev/null 2>&1 || ! ls /usr/lib64/libavformat.so.* >/dev/null 2>&1; then
+  echo "[WARN] Pre-installed /usr/lib64/libavcodec.so.* not found. Ensure ffmpeg-libs package is available." >&2
 fi
 
 # ------------------------------------------------------------------------------
@@ -97,7 +97,7 @@ echo ">>> [3/6] Extracting RPM packages into user-space sysroot..."
 for rpm in "$RPM_CACHE_DIR"/*.rpm; do
   [ -f "$rpm" ] || continue
   echo "  [EXTRACT] Unpacking $(basename "$rpm")..."
-  rpm2cpio "$rpm" | (cd "$DEPS_DIR" && cpio -idm --quiet)
+  rpm2cpio "$rpm" | (cd "$DEPS_DIR" && cpio -idmu --quiet)
 done
 
 # ------------------------------------------------------------------------------

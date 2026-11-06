@@ -21,6 +21,7 @@ Thumbs.db
 /tmp/
 
 # Dependency caches and builds
+.deps/
 .deps/usr/
 .deps/.rpm_cache/
 
