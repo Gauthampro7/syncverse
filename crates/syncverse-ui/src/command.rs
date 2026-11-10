@@ -92,6 +92,21 @@ pub enum PlayerCommand {
     ToggleLoop,
     /// Explicitly enable or disable loop / repeat playback mode.
     SetLoop(bool),
+    /// Update audio equalizer settings (pre-amp, 10 band gains, enable toggle).
+    SetAudioEqualizer(syncverse_codecs::audio::AudioEqualizerConfig),
+    /// Update dynamic range compressor / night mode settings.
+    SetAudioCompressor {
+        /// Whether compressor is enabled.
+        enabled: bool,
+        /// Threshold in dBFS (e.g. -16.0).
+        threshold_db: f32,
+        /// Ratio (e.g. 4.0).
+        ratio: f32,
+        /// Makeup gain in dBFS (e.g. 2.0).
+        makeup_gain_db: f32,
+    },
+    /// Set audio stereo balance / panning in range [-1.0, 1.0].
+    SetAudioStereoPan(f32),
 }
 
 #[cfg(test)]
@@ -114,6 +129,14 @@ mod tests {
         let cmd_step_bwd = PlayerCommand::StepFrame { forward: false };
         let cmd_toggle_loop = PlayerCommand::ToggleLoop;
         let cmd_set_loop = PlayerCommand::SetLoop(true);
+        let cmd_eq = PlayerCommand::SetAudioEqualizer(syncverse_codecs::audio::AudioEqualizerConfig::flat());
+        let cmd_comp = PlayerCommand::SetAudioCompressor {
+            enabled: true,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            makeup_gain_db: 2.0,
+        };
+        let cmd_pan = PlayerCommand::SetAudioStereoPan(0.5);
 
         assert_eq!(cmd_audio, PlayerCommand::SelectAudioTrack(1));
         assert_eq!(cmd_cycle_audio, PlayerCommand::CycleAudioTrack);
@@ -128,10 +151,22 @@ mod tests {
         assert_eq!(cmd_step_fwd, PlayerCommand::StepFrame { forward: true });
         assert_eq!(cmd_toggle_loop, PlayerCommand::ToggleLoop);
         assert_eq!(cmd_set_loop, PlayerCommand::SetLoop(true));
+        assert_eq!(cmd_eq, PlayerCommand::SetAudioEqualizer(syncverse_codecs::audio::AudioEqualizerConfig::flat()));
+        assert_eq!(cmd_pan, PlayerCommand::SetAudioStereoPan(0.5));
+        assert_ne!(cmd_comp, cmd_eq);
+
+        let cmd_comp_diff = PlayerCommand::SetAudioCompressor {
+            enabled: false,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            makeup_gain_db: 2.0,
+        };
+        assert_ne!(cmd_comp, cmd_comp_diff);
 
         assert_ne!(cmd_audio, cmd_cycle_audio);
         assert_ne!(cmd_sub, cmd_sub_off);
         assert_ne!(cmd_step_fwd, cmd_step_bwd);
         assert_ne!(cmd_set_loop, PlayerCommand::SetLoop(false));
+        assert_ne!(cmd_pan, PlayerCommand::SetAudioStereoPan(-0.5));
     }
 }

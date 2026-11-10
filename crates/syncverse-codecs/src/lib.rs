@@ -13,8 +13,9 @@ pub mod universal_video;
 pub use audio::{
     apply_gain, calculate_peak, calculate_rms, db_to_linear, linear_to_db, soft_clip_sample,
     unpack_opus_packet, unpack_pcm, unpack_vorbis_audio_packet, AudioCodec, AudioDecoder,
-    AudioDynamicsCompressor, AudioStereoPan, LinearResampler, OpusBandwidth, OpusMode, OpusToc,
-    PcmFormat, UniversalAudioDecoder, UniversalAudioError, VorbisIdentificationHeader,
+    AudioDynamicsCompressor, AudioEqualizer10Band, AudioEqualizerConfig, AudioStereoPan,
+    EqualizerPreset, LinearResampler, OpusBandwidth, OpusMode, OpusToc, PcmFormat,
+    UniversalAudioDecoder, UniversalAudioError, VorbisIdentificationHeader, BAND_FREQUENCIES,
 };
 pub use color::{
     clamp_u8, convert_rgba_to_terminal, convert_yuv420p_to_rgba, convert_yuv420p_to_terminal,

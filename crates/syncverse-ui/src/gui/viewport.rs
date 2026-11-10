@@ -5,6 +5,7 @@ use egui::{Color32, Context, Rect, TextureHandle, TextureOptions, Ui, Vec2};
 use syncverse_clock::{MasterClock, PresentationAction, SpscRingBuffer};
 use syncverse_codecs::VideoFrameRGBA;
 use crate::gui::aspect_ratio::{AspectRatioOverride, IntoDimension, ZoomMode};
+use crate::gui::video_effects::VideoColorAdjustments;
 
 /// Geometric display mode for the video viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,24 +223,38 @@ impl VideoTextureBuffer {
 
     /// Returns a packed RGBA byte slice, unpacking row padding if stride exceeds `width * 4`.
     pub fn prepare<'a>(&'a mut self, frame: &'a VideoFrameRGBA) -> &'a [u8] {
+        self.prepare_with_adjustments(frame, &VideoColorAdjustments::default())
+    }
+
+    /// Returns a packed RGBA byte slice applying real-time color adjustments and unpacking row padding.
+    pub fn prepare_with_adjustments<'a>(
+        &'a mut self,
+        frame: &'a VideoFrameRGBA,
+        adjustments: &VideoColorAdjustments,
+    ) -> &'a [u8] {
         let w = frame.width as usize;
         let h = frame.height as usize;
         let stride = frame.stride;
         let total_packed = w * h * 4;
 
-        if stride == w * 4 {
-            // Fast-path: zero row padding, borrow directly
-            &frame.data[..total_packed]
-        } else {
-            // Unpack row padding into scratch buffer
-            self.packed_rgba.clear();
-            self.packed_rgba.reserve(total_packed);
-            let src = &frame.data;
-            for y in 0..h {
-                let start = y * stride;
-                let end = start + w * 4;
-                self.packed_rgba.extend_from_slice(&src[start..end]);
+        if adjustments.is_identity() {
+            if stride == w * 4 {
+                // Fast-path: zero row padding, borrow directly
+                &frame.data[..total_packed]
+            } else {
+                // Unpack row padding into scratch buffer
+                self.packed_rgba.clear();
+                self.packed_rgba.reserve(total_packed);
+                let src = &frame.data;
+                for y in 0..h {
+                    let start = y * stride;
+                    let end = start + w * 4;
+                    self.packed_rgba.extend_from_slice(&src[start..end]);
+                }
+                &self.packed_rgba
             }
+        } else {
+            adjustments.apply_to_rgba(&frame.data, &mut self.packed_rgba, w, h, stride);
             &self.packed_rgba
         }
     }
@@ -275,6 +290,7 @@ pub struct VideoViewport {
     last_video_rect: Option<Rect>,
     pending_click: Option<(Instant, bool)>,
     last_double_click: Option<Instant>,
+    video_adjustments: VideoColorAdjustments,
 }
 
 impl Default for VideoViewport {
@@ -300,6 +316,7 @@ impl VideoViewport {
             last_video_rect: None,
             pending_click: None,
             last_double_click: None,
+            video_adjustments: VideoColorAdjustments::default(),
         }
     }
 
@@ -397,7 +414,7 @@ impl VideoViewport {
 
         let w = frame.width as usize;
         let h = frame.height as usize;
-        let bytes = self.texture_buffer.prepare(frame);
+        let bytes = self.texture_buffer.prepare_with_adjustments(frame, &self.video_adjustments);
         let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], bytes);
 
         if let Some(ref mut handle) = self.texture {
@@ -414,6 +431,21 @@ impl VideoViewport {
         self.current_pts_ms = Some(frame.pts_ms);
         self.video_width = frame.width;
         self.video_height = frame.height;
+    }
+
+    /// Sets video color adjustments and immediately refreshes the current frame texture.
+    pub fn set_video_adjustments(&mut self, ctx: &Context, adjustments: VideoColorAdjustments) {
+        self.video_adjustments = adjustments;
+        if let Some(frame) = self.last_frame.clone() {
+            self.current_pts_ms = None;
+            self.upload_texture(ctx, &frame);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Returns the currently active video color adjustments.
+    pub fn video_adjustments(&self) -> VideoColorAdjustments {
+        self.video_adjustments
     }
 
     /// Returns a copy of the most recently presented video frame for lossless screenshot saving.

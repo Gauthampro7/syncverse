@@ -119,6 +119,8 @@ pub struct SyncverseApp {
     playlist_manager: crate::gui::playlist::PlaylistManager,
     playlist_dialog: crate::gui::playlist::PlaylistDialog,
     media_info_dialog: crate::gui::media_info::MediaInfoDialog,
+    effects_dialog: crate::gui::effects_dialog::EffectsDialog,
+    jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog,
 }
 
 /// Backwards-compatible type alias for [`SyncverseApp`].
@@ -184,6 +186,8 @@ impl Default for SyncverseApp {
             playlist_manager: crate::gui::playlist::PlaylistManager::new(),
             playlist_dialog: crate::gui::playlist::PlaylistDialog::new(),
             media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
+            effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
+            jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
         };
         app.controls_state
             .subtitle_dialog
@@ -289,6 +293,8 @@ impl SyncverseApp {
             playlist_manager: crate::gui::playlist::PlaylistManager::new(),
             playlist_dialog: crate::gui::playlist::PlaylistDialog::new(),
             media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
+            effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
+            jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
         };
         app.controls_state
             .subtitle_dialog
@@ -312,6 +318,8 @@ impl SyncverseApp {
             || self.controls_state.video_dialog.is_open
             || self.playlist_dialog.is_open
             || self.media_info_dialog.is_open
+            || self.effects_dialog.is_open
+            || self.jump_time_dialog.is_open
     }
 
     /// Returns a reference to the active OSD HUD overlay.
@@ -1202,8 +1210,10 @@ impl eframe::App for SyncverseApp {
                 let toast = if snapshot.is_playing() { "Pause" } else { "Play" };
                 self.osd_overlay.show_notification(toast.to_string(), now);
             }
-            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
-                let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                let offset_ms = if ctx.input(|i| i.modifiers.alt) {
+                    -300_000
+                } else if ctx.input(|i| i.modifiers.ctrl) {
                     -60_000
                 } else if ctx.input(|i| i.modifiers.shift) {
                     -30_000
@@ -1218,8 +1228,10 @@ impl eframe::App for SyncverseApp {
                     Some(format!("Seek: {} ({:+}s)", ControlsBarState::format_timestamp(target), offset_ms / 1000)),
                 );
             }
-            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
-                let offset_ms = if ctx.input(|i| i.modifiers.ctrl) {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                let offset_ms = if ctx.input(|i| i.modifiers.alt) {
+                    300_000
+                } else if ctx.input(|i| i.modifiers.ctrl) {
                     60_000
                 } else if ctx.input(|i| i.modifiers.shift) {
                     30_000
@@ -1347,8 +1359,9 @@ impl eframe::App for SyncverseApp {
                     }
                 }
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)) {
-                let new_vol = (self.controls_state.volume.volume + 0.05).min(crate::gui::controls::VolumeControlState::MAX_VOLUME);
+            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)) {
+                let delta = if ctx.input(|i| i.modifiers.ctrl) { 0.01 } else { 0.05 };
+                let new_vol = (self.controls_state.volume.volume + delta).min(crate::gui::controls::VolumeControlState::MAX_VOLUME);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
                 let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
@@ -1357,8 +1370,9 @@ impl eframe::App for SyncverseApp {
                     now,
                 );
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)) {
-                let new_vol = (self.controls_state.volume.volume - 0.05).max(0.0);
+            if ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)) {
+                let delta = if ctx.input(|i| i.modifiers.ctrl) { 0.01 } else { 0.05 };
+                let new_vol = (self.controls_state.volume.volume - delta).max(0.0);
                 self.controls_state.volume.set_volume(new_vol);
                 let _ = self.command_tx.send(PlayerCommand::SetVolume(new_vol));
                 let boost_str = if new_vol > 1.0 { " [Boost]" } else { "" };
@@ -1366,6 +1380,19 @@ impl eframe::App for SyncverseApp {
                     format!("Volume: {}%{}", (new_vol * 100.0).round() as u32, boost_str),
                     now,
                 );
+            }
+            // Ctrl+E: Effects and Filters dialog (Audio Equalizer & Video Adjustments)
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::E)) {
+                if self.effects_dialog.is_open {
+                    self.effects_dialog.close();
+                } else {
+                    self.effects_dialog.open(crate::gui::effects_dialog::EffectsTab::Audio);
+                }
+            }
+            // Ctrl+T: Jump to Specific Time dialog
+            if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::T)) {
+                let current_ms = snapshot.media_position_pts / 1_000_000;
+                self.jump_time_dialog.open(current_ms);
             }
             if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::M)) {
                 self.controls_state.volume.toggle_mute();
@@ -2045,6 +2072,24 @@ impl eframe::App for SyncverseApp {
                             let target = (current_ms + 60_000).max(0) as u64;
                             self.seek_to(target.min(dur_ms), now, Some(format!("Seek: {} (+60s)", ControlsBarState::format_timestamp(target.min(dur_ms)))));
                         }
+                        if ui.button("Seek -5m (Alt+←)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
+                            let target = (current_ms - 300_000).max(0) as u64;
+                            self.seek_to(target, now, Some(format!("Seek: {} (-5m)", ControlsBarState::format_timestamp(target))));
+                        }
+                        if ui.button("Seek +5m (Alt+→)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts as i64 / 1_000_000;
+                            let dur_ms = snapshot.media_duration_pts / 1_000_000;
+                            let target = (current_ms + 300_000).max(0) as u64;
+                            self.seek_to(target.min(dur_ms), now, Some(format!("Seek: {} (+5m)", ControlsBarState::format_timestamp(target.min(dur_ms)))));
+                        }
+                        if ui.button("⏱ Jump to Specific Time... (Ctrl+T)").clicked() {
+                            ui.close();
+                            let current_ms = snapshot.media_position_pts / 1_000_000;
+                            self.jump_time_dialog.open(current_ms);
+                        }
 
                         ui.separator();
 
@@ -2262,6 +2307,11 @@ impl eframe::App for SyncverseApp {
 
                         ui.separator();
 
+                        if ui.button("🎛 Equalizer & Audio Effects... (Ctrl+E)").clicked() {
+                            ui.close();
+                            self.effects_dialog.open(crate::gui::effects_dialog::EffectsTab::Audio);
+                        }
+
                         if ui.button("Audio Settings & Track Selection...").clicked() {
                             ui.close();
                             self.controls_state.audio_dialog.open();
@@ -2319,7 +2369,12 @@ impl eframe::App for SyncverseApp {
 
                         ui.separator();
 
-                        if ui.button("Video Adjustments & Filters...").clicked() {
+                        if ui.button("🎛 Video Effects & Picture Adjustments... (Ctrl+E)").clicked() {
+                            ui.close();
+                            self.effects_dialog.open(crate::gui::effects_dialog::EffectsTab::Video);
+                        }
+
+                        if ui.button("Video Aspect & Stream Details...").clicked() {
                             ui.close();
                             self.controls_state.video_dialog.open();
                         }
@@ -2395,6 +2450,10 @@ impl eframe::App for SyncverseApp {
 
                     // --- TOOLS MENU ---
                     ui.menu_button("Tools", |ui| {
+                        if ui.button("🎛 Effects and Filters (Ctrl+E)").clicked() {
+                            ui.close();
+                            self.effects_dialog.open(crate::gui::effects_dialog::EffectsTab::Audio);
+                        }
                         if ui.button("📑 Playlist Queue (Ctrl+L)").clicked() {
                             ui.close();
                             self.playlist_dialog.toggle();
@@ -2639,6 +2698,8 @@ impl eframe::App for SyncverseApp {
                 let mut request_jump_prev_chapter = false;
                 let mut request_jump_next_chapter = false;
                 let mut request_toggle_loop = false;
+                let mut request_toggle_effects = false;
+                let mut request_open_jump_time = false;
                 let mut request_select_audio_track: Option<usize> = None;
                 let mut request_select_subtitle_track: Option<Option<usize>> = None;
 
@@ -2804,6 +2865,16 @@ impl eframe::App for SyncverseApp {
                         request_toggle_media_info = true;
                     }
 
+                    if ui.button("🎛 Effects and Filters (Ctrl+E)").clicked() {
+                        ui.close();
+                        request_toggle_effects = true;
+                    }
+
+                    if ui.button("⏱ Jump to Specific Time (Ctrl+T)").clicked() {
+                        ui.close();
+                        request_open_jump_time = true;
+                    }
+
                     ui.separator();
                     if ui.button("Video Stream Details...").clicked() {
                         ui.close();
@@ -2828,6 +2899,17 @@ impl eframe::App for SyncverseApp {
                 }
                 if request_toggle_media_info {
                     self.media_info_dialog.toggle();
+                }
+                if request_toggle_effects {
+                    if self.effects_dialog.is_open {
+                        self.effects_dialog.close();
+                    } else {
+                        self.effects_dialog.open(crate::gui::effects_dialog::EffectsTab::Audio);
+                    }
+                }
+                if request_open_jump_time {
+                    let current_ms = snapshot.media_position_pts / 1_000_000;
+                    self.jump_time_dialog.open(current_ms);
                 }
 
                 if request_take_screenshot {
@@ -3104,6 +3186,44 @@ impl eframe::App for SyncverseApp {
                 }
                 crate::gui::SubtitleConfigAction::UpdateConfig(config) => {
                     *self.subtitle_overlay.config_mut() = config;
+                }
+            }
+        }
+
+        let current_pos_ms = snapshot.media_position_pts / 1_000_000;
+        let total_dur_ms = snapshot.media_duration_pts / 1_000_000;
+        if let Some(target_pts_ms) = self.jump_time_dialog.show(&ctx, current_pos_ms, total_dur_ms) {
+            self.seek_to(
+                target_pts_ms,
+                now,
+                Some(format!("Jump: {}", ControlsBarState::format_timestamp(target_pts_ms))),
+            );
+        }
+
+        let effects_actions = self.effects_dialog.show(&ctx);
+        for action in effects_actions {
+            match action {
+                crate::gui::EffectsAction::AudioEqualizerChanged(cfg) => {
+                    let _ = self.command_tx.send(PlayerCommand::SetAudioEqualizer(cfg));
+                }
+                crate::gui::EffectsAction::AudioCompressorChanged {
+                    enabled,
+                    threshold_db,
+                    ratio,
+                    makeup_gain_db,
+                } => {
+                    let _ = self.command_tx.send(PlayerCommand::SetAudioCompressor {
+                        enabled,
+                        threshold_db,
+                        ratio,
+                        makeup_gain_db,
+                    });
+                }
+                crate::gui::EffectsAction::AudioStereoPanChanged(pan) => {
+                    let _ = self.command_tx.send(PlayerCommand::SetAudioStereoPan(pan));
+                }
+                crate::gui::EffectsAction::VideoAdjustmentsChanged(adj) => {
+                    self.viewport.set_video_adjustments(&ctx, adj);
                 }
             }
         }

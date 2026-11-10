@@ -6,8 +6,10 @@ pub mod aspect_ratio;
 pub mod controls;
 pub mod dialogs;
 pub mod drag_drop;
+pub mod effects_dialog;
 pub mod file_dialog;
 pub mod inhibit;
+pub mod jump_time;
 pub mod media_info;
 pub mod mpris;
 pub mod playlist;
@@ -16,6 +18,7 @@ pub mod recent_files;
 pub mod sidebar;
 pub mod subtitle_overlay;
 pub mod updater;
+pub mod video_effects;
 pub mod viewport;
 
 pub use ab_loop::AbRepeatState;
@@ -33,8 +36,10 @@ pub use dialogs::{
     SubtitleTrackItem, VideoConfigAction, VideoConfigDialog, VideoStreamMetadata,
 };
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
+pub use effects_dialog::{EffectsAction, EffectsDialog, EffectsTab};
 pub use file_dialog::FileDialogManager;
 pub use inhibit::IdleInhibitor;
+pub use jump_time::{parse_time_input, JumpToTimeDialog};
 pub use media_info::{format_file_size, MediaInfoContext, MediaInfoDialog};
 pub use mpris::MprisManager;
 pub use playlist::{
@@ -54,6 +59,7 @@ pub use subtitle_overlay::{
 pub use updater::{
     check_for_updates, open_browser_url, spawn_update_check, UpdateError, UpdateInfo,
 };
+pub use video_effects::VideoColorAdjustments;
 pub use viewport::{
     VideoTextureBuffer, VideoViewport, ViewportAction, ViewportDisplayMode, ViewportGeometry,
 };

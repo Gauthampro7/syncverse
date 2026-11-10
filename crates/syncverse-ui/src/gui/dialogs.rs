@@ -416,11 +416,27 @@ impl ShortcutsDialog {
                             ui.end_row();
 
                             ui.label(RichText::new("Ctrl + Left Arrow").monospace().strong());
-                            ui.label("Seek Backward 60 seconds");
+                            ui.label("Seek Backward 60 seconds (1 minute)");
                             ui.end_row();
 
                             ui.label(RichText::new("Ctrl + Right Arrow").monospace().strong());
-                            ui.label("Seek Forward 60 seconds");
+                            ui.label("Seek Forward 60 seconds (1 minute)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Alt + Left Arrow").monospace().strong());
+                            ui.label("Seek Backward 300 seconds (5 minutes)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Alt + Right Arrow").monospace().strong());
+                            ui.label("Seek Forward 300 seconds (5 minutes)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + T").monospace().strong());
+                            ui.label("Jump to Specific Timecode Dialog");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + E").monospace().strong());
+                            ui.label("Effects and Filters (10-Band Equalizer & Video Adjustments)");
                             ui.end_row();
 
                             ui.label(RichText::new("Home / End").monospace().strong());
@@ -505,6 +521,10 @@ impl ShortcutsDialog {
 
                             ui.label(RichText::new("Down Arrow (↓)").monospace().strong());
                             ui.label("Decrease Volume (-5%)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Ctrl + Up / Down Arrow").monospace().strong());
+                            ui.label("Fine Volume Tuning (±1%)");
                             ui.end_row();
 
                             ui.label(RichText::new("M").monospace().strong());

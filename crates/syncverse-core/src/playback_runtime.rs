@@ -57,6 +57,12 @@ pub enum AudioWorkerCommand {
     Resume,
     /// Resets the audio sink, instantly terminating stale playback streams.
     Reset,
+    /// Update 10-band audio equalizer settings.
+    SetEqualizer(syncverse_codecs::audio::AudioEqualizerConfig),
+    /// Update audio dynamic compressor (night mode) settings.
+    SetCompressor(Option<syncverse_codecs::audio::AudioDynamicsCompressor>),
+    /// Update stereo balance panning [-1.0, 1.0].
+    SetStereoPan(f32),
 }
 
 
@@ -70,12 +76,21 @@ fn run_audio_sink_worker(
     let mut local_generation: u64 = 0;
     let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(128);
     let mut needs_fade_in = false;
+    let mut equalizer = syncverse_codecs::audio::AudioEqualizer10Band::default();
+    let mut compressor: Option<syncverse_codecs::audio::AudioDynamicsCompressor> = None;
+    let mut stereo_pan: f32 = 0.0;
 
     let handle_reset = |local_gen: &mut u64,
                         queue: &mut VecDeque<(u64, Vec<f32>, u64)>,
                         sink: &mut AutoAudioSink,
-                        fade_in: &mut bool| {
+                        fade_in: &mut bool,
+                        eq: &mut syncverse_codecs::audio::AudioEqualizer10Band,
+                        comp: &mut Option<syncverse_codecs::audio::AudioDynamicsCompressor>| {
         *local_gen = local_gen.wrapping_add(1);
+        eq.reset();
+        if let Some(ref mut c) = comp {
+            c.reset();
+        }
         // Smooth micro-fade-out of remaining front audio to eliminate DC offset clicks/pops
         if let Some((_, ref samples, _)) = queue.front() {
             let fade_len = samples.len().min(256);
@@ -102,6 +117,8 @@ fn run_audio_sink_worker(
                         &mut pending_queue,
                         &mut sink,
                         &mut needs_fade_in,
+                        &mut equalizer,
+                        &mut compressor,
                     );
                 }
                 AudioWorkerCommand::Pause => {
@@ -109,6 +126,15 @@ fn run_audio_sink_worker(
                 }
                 AudioWorkerCommand::Resume => {
                     let _ = sink.resume();
+                }
+                AudioWorkerCommand::SetEqualizer(cfg) => {
+                    equalizer.set_config(cfg);
+                }
+                AudioWorkerCommand::SetCompressor(comp) => {
+                    compressor = comp;
+                }
+                AudioWorkerCommand::SetStereoPan(pan) => {
+                    stereo_pan = pan;
                 }
                 AudioWorkerCommand::TimestampedSamples {
                     pts_ms,
@@ -144,6 +170,8 @@ fn run_audio_sink_worker(
                             &mut pending_queue,
                             &mut sink,
                             &mut needs_fade_in,
+                            &mut equalizer,
+                            &mut compressor,
                         );
                     }
                     AudioWorkerCommand::Pause => {
@@ -151,6 +179,15 @@ fn run_audio_sink_worker(
                     }
                     AudioWorkerCommand::Resume => {
                         let _ = sink.resume();
+                    }
+                    AudioWorkerCommand::SetEqualizer(cfg) => {
+                        equalizer.set_config(cfg);
+                    }
+                    AudioWorkerCommand::SetCompressor(comp) => {
+                        compressor = comp;
+                    }
+                    AudioWorkerCommand::SetStereoPan(pan) => {
+                        stereo_pan = pan;
                     }
                     AudioWorkerCommand::TimestampedSamples {
                         pts_ms,
@@ -207,6 +244,18 @@ fn run_audio_sink_worker(
                 }
                 needs_fade_in = false;
             }
+
+            // Apply stereo panning, dynamic compression, and 10-band equalizer before soundcard delivery
+            if stereo_pan.abs() > 0.01 {
+                syncverse_codecs::audio::AudioStereoPan::pan_interleaved(&mut samples, stereo_pan);
+            }
+            if let Some(ref mut c) = compressor {
+                c.process(&mut samples);
+            }
+            if equalizer.is_active() {
+                equalizer.process_interleaved(&mut samples);
+            }
+
             if sink.write_samples(&samples).is_err() {
                 sink = AutoAudioSink::new();
                 let _ = sink.write_samples(&samples);
@@ -2041,6 +2090,32 @@ pub fn run_playback_worker(
                         text: format!("Repeat: {}", if is_loop_enabled { "On" } else { "Off" }),
                         timestamp: Instant::now(),
                     });
+                }
+                PlayerCommand::SetAudioEqualizer(cfg) => {
+                    let _ = audio_tx.send(AudioWorkerCommand::SetEqualizer(cfg));
+                }
+                PlayerCommand::SetAudioCompressor {
+                    enabled,
+                    threshold_db,
+                    ratio,
+                    makeup_gain_db,
+                } => {
+                    let comp = if enabled {
+                        Some(syncverse_codecs::audio::AudioDynamicsCompressor::new(
+                            threshold_db,
+                            ratio,
+                            10.0,
+                            100.0,
+                            makeup_gain_db,
+                            48000,
+                        ))
+                    } else {
+                        None
+                    };
+                    let _ = audio_tx.send(AudioWorkerCommand::SetCompressor(comp));
+                }
+                PlayerCommand::SetAudioStereoPan(pan) => {
+                    let _ = audio_tx.send(AudioWorkerCommand::SetStereoPan(pan));
                 }
             }
         }

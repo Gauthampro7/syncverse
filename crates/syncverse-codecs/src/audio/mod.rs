@@ -2,6 +2,7 @@
 
 pub mod decoder;
 pub mod dsp;
+pub mod equalizer;
 pub mod opus;
 pub mod pcm;
 pub mod resampler;
@@ -12,6 +13,9 @@ pub use decoder::{AudioCodec, AudioDecoder};
 pub use dsp::{
     apply_gain, calculate_peak, calculate_rms, db_to_linear, linear_to_db, AudioDynamicsCompressor,
     AudioStereoPan, DB_FLOOR, LINEAR_FLOOR,
+};
+pub use equalizer::{
+    AudioEqualizer10Band, AudioEqualizerConfig, EqualizerPreset, BAND_FREQUENCIES,
 };
 pub use opus::{unpack_opus_packet, OpusBandwidth, OpusMode, OpusToc};
 pub use pcm::{unpack_pcm, PcmFormat};

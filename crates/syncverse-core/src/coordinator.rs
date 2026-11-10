@@ -212,7 +212,10 @@ impl PlayerCoordinator {
             | PlayerCommand::LoadExternalSubtitle(_)
             | PlayerCommand::StepFrame { .. }
             | PlayerCommand::ToggleLoop
-            | PlayerCommand::SetLoop(_) => {
+            | PlayerCommand::SetLoop(_)
+            | PlayerCommand::SetAudioEqualizer(_)
+            | PlayerCommand::SetAudioCompressor { .. }
+            | PlayerCommand::SetAudioStereoPan(_) => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }
