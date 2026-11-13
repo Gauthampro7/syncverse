@@ -1085,3 +1085,149 @@ fn test_pause_preserves_lookahead_and_paused_seek_same_pts_uploads() {
         assert_eq!(ring.try_pop().map(|f| (f.pts_ms, f.generation)), Some((40, 1)));
     }
 }
+
+#[test]
+fn test_subtitle_delay_sign_convention_delayed_later_and_earlier() {
+    let mut harn = HeadlessHarness::new();
+    let ctx = Context::default();
+    let mut now = Instant::now();
+
+    harn.app.add_subtitle_track(SubtitleTrack::new(
+        0,
+        "Track 0",
+        Some("eng".to_string()),
+        vec![SubtitleCue::new(1000, 2000, "Delayed line")],
+    ));
+    harn.app.select_subtitle_track(Some(0));
+    harn.app.apply_track_subtitle_event(
+        TrackSubtitleEvent::BitmapCue {
+            track_index: 0,
+            cue: SubtitleBitmapCue {
+                start_ms: 1000,
+                end_ms: 2000,
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                canvas_width: 1280,
+                canvas_height: 720,
+                rgba: Arc::from(vec![255u8; 16 * 16 * 4]),
+            },
+        },
+        now,
+    );
+
+    // +500ms delay (H x10): "Subtitles Delayed / Later" shifts [1000, 2000] -> [1500, 2500].
+    for _ in 0..10 {
+        let _ = run_app_frame(
+            &ctx,
+            &mut harn.app,
+            1280.0,
+            720.0,
+            1.0,
+            vec![key_press_event(Key::H, Modifiers::NONE)],
+            now,
+        );
+        now += Duration::from_millis(16);
+    }
+    assert_eq!(harn.app.subtitle_delay_ms(), 500);
+    assert_eq!(harn.app.current_active_subtitle(1000), None);
+    assert_eq!(
+        harn.app.current_active_subtitle(1500),
+        Some("Delayed line".to_string())
+    );
+    assert_eq!(
+        harn.app.current_active_subtitle(2500),
+        Some("Delayed line".to_string())
+    );
+    assert_eq!(harn.app.current_active_subtitle(2501), None);
+    assert!(harn.app.current_active_bitmap_subtitle(1000).is_none());
+    assert!(harn.app.current_active_bitmap_subtitle(1500).is_some());
+    assert!(harn.app.current_active_bitmap_subtitle(2500).is_some());
+
+    // -500ms delay (Shift+G reset, then G x10): shifts [1000, 2000] -> [500, 1500].
+    let _ = run_app_frame(
+        &ctx,
+        &mut harn.app,
+        1280.0,
+        720.0,
+        1.0,
+        vec![key_press_event(Key::G, Modifiers::SHIFT)],
+        now,
+    );
+    now += Duration::from_millis(16);
+    for _ in 0..10 {
+        let _ = run_app_frame(
+            &ctx,
+            &mut harn.app,
+            1280.0,
+            720.0,
+            1.0,
+            vec![key_press_event(Key::G, Modifiers::NONE)],
+            now,
+        );
+        now += Duration::from_millis(16);
+    }
+    assert_eq!(harn.app.subtitle_delay_ms(), -500);
+    assert_eq!(
+        harn.app.current_active_subtitle(500),
+        Some("Delayed line".to_string())
+    );
+    assert_eq!(
+        harn.app.current_active_subtitle(1500),
+        Some("Delayed line".to_string())
+    );
+    assert_eq!(harn.app.current_active_subtitle(1501), None);
+    assert!(harn.app.current_active_bitmap_subtitle(500).is_some());
+    assert!(harn.app.current_active_bitmap_subtitle(1501).is_none());
+}
+
+#[test]
+fn test_standalone_load_file_fallback_vs_connected_worker() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "syncverse_wave2_load_file_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let media_path = temp_dir.join("movie.mkv");
+    std::fs::write(&media_path, b"dummy").unwrap();
+    std::fs::write(
+        temp_dir.join("movie.eng.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nEnglish line\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.join("movie.fra.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nLigne francaise\n",
+    )
+    .unwrap();
+
+    // 1. Standalone SyncverseApp::default() (dropped command_rx): synchronously discovers subtitles.
+    let mut standalone = SyncverseApp::default();
+    standalone.load_file(media_path.clone());
+    assert!(
+        standalone.subtitle_tracks().len() >= 2,
+        "Standalone SyncverseApp::default().load_file() should populate >= 2 co-located subtitles, got {}",
+        standalone.subtitle_tracks().len()
+    );
+    assert_eq!(standalone.subtitle_track_index(), None);
+
+    // 2. Connected HeadlessHarness (live command_rx): dispatches OpenFile without UI-thread scan.
+    let mut harn = HeadlessHarness::new();
+    harn.app.load_file(media_path.clone());
+    assert!(
+        harn.app.subtitle_tracks().is_empty(),
+        "Connected worker load_file must not block UI thread scanning external subtitles"
+    );
+    let cmds = harn.drain_commands();
+    assert!(
+        cmds.contains(&PlayerCommand::OpenFile(media_path)),
+        "Expected PlayerCommand::OpenFile to be sent to connected worker, got {:?}",
+        cmds
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

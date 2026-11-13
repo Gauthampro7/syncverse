@@ -710,7 +710,7 @@ impl SyncverseApp {
     /// allocations across frames.
     pub fn current_active_subtitle(&self, pts_ms: u64) -> Option<String> {
         let track_idx = self.subtitle_track_index?;
-        let query_ms = (pts_ms as i64).saturating_add(self.subtitle_delay_ms);
+        let query_ms = (pts_ms as i64).saturating_sub(self.subtitle_delay_ms);
 
         // 1. Fast-path: Check cached subtitle interval
         if let Ok(cache_ref) = self.cached_subtitle.try_borrow() {
@@ -862,7 +862,7 @@ impl SyncverseApp {
     ) -> Option<(u64, &SubtitleBitmapCue)> {
         let track_idx = self.subtitle_track_index?;
         let bmps = self.bitmap_subtitle_cues.get(&track_idx)?;
-        let query_ms = (pts_ms as i64).saturating_add(self.subtitle_delay_ms);
+        let query_ms = (pts_ms as i64).saturating_sub(self.subtitle_delay_ms);
         if query_ms < 0 || bmps.is_empty() {
             return None;
         }
@@ -879,11 +879,42 @@ impl SyncverseApp {
         None
     }
 
-    /// Loads and opens a media file without blocking the UI thread on directory or subtitle scans.
+    /// Synchronizes `subtitle_tracks` and `subtitle_dialog` items from `subtitle_track_data`.
+    fn sync_subtitle_tracks_ui(&mut self) {
+        self.subtitle_tracks = self
+            .subtitle_track_data
+            .iter()
+            .map(|t| t.title.clone())
+            .collect();
+        if let Some(i) = self.subtitle_track_index {
+            if i >= self.subtitle_track_data.len() {
+                self.subtitle_track_index = None;
+                self.controls_state.subtitle_dialog.select_track(None);
+            }
+        }
+        let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
+            .subtitle_track_data
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
+                id: i,
+                title: t.title.clone(),
+                language: t.language.clone(),
+                format: t.format.clone(),
+                is_external: t.is_external,
+                file_path: None,
+            })
+            .collect();
+        self.controls_state.subtitle_dialog.set_tracks(dialog_items);
+        self.invalidate_subtitle_cache();
+    }
+
+    /// Loads and opens a media file without blocking the UI thread on directory or subtitle scans
+    /// when a playback worker is connected; falls back to synchronous discovery for standalone callers.
     pub fn load_file(&mut self, path: PathBuf) {
         self.viewport.reset();
         self.recent_files.add_file(&path);
-        let _ = self.command_tx.send(PlayerCommand::OpenFile(path.clone()));
+        let worker_connected = self.command_tx.send(PlayerCommand::OpenFile(path.clone())).is_ok();
         self.current_file = Some(path.clone());
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("Media");
         self.current_window_title = format!("{} — Syncverse", filename);
@@ -904,36 +935,64 @@ impl SyncverseApp {
         self.controls_state.drag_pts_ms = None;
         self.ab_repeat.clear();
         self.controls_state.ab_repeat.clear();
-        if !self.playlist_manager.set_current_file(&path) {
-            let scan_tx = self.bg_folder_scan_tx.clone();
-            let scan_path = path;
-            let _ = std::thread::Builder::new()
-                .name("syncverse-folder-scan".to_string())
-                .spawn(move || {
-                    let Some(parent) = scan_path.parent() else {
-                        return;
-                    };
-                    let mut discovered = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(parent) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_file() {
-                                let ext = p
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase();
-                                if crate::gui::playlist::SUPPORTED_PLAYLIST_EXTENSIONS
-                                    .contains(&ext.as_str())
-                                {
-                                    discovered.push(p);
+        if worker_connected {
+            if !self.playlist_manager.set_current_file(&path) {
+                let scan_tx = self.bg_folder_scan_tx.clone();
+                let scan_path = path;
+                let _ = std::thread::Builder::new()
+                    .name("syncverse-folder-scan".to_string())
+                    .spawn(move || {
+                        let Some(parent) = scan_path.parent() else {
+                            return;
+                        };
+                        let mut discovered = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.is_file() {
+                                    let ext = p
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_ascii_lowercase();
+                                    if crate::gui::playlist::SUPPORTED_PLAYLIST_EXTENSIONS
+                                        .contains(&ext.as_str())
+                                    {
+                                        discovered.push(p);
+                                    }
                                 }
                             }
                         }
-                    }
-                    discovered.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-                    let _ = scan_tx.send((scan_path, discovered));
-                });
+                        discovered.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                        let _ = scan_tx.send((scan_path, discovered));
+                    });
+            }
+        } else {
+            if !self.playlist_manager.set_current_file(&path) {
+                self.playlist_manager.scan_folder_of_file(&path);
+            }
+            let scanned = syncverse_demux::subtitles::scan_external_subtitles(&path);
+            for (idx, t) in scanned.into_iter().enumerate() {
+                let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = t
+                    .cues
+                    .into_iter()
+                    .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
+                        start_ms: c.start.as_millis() as i64,
+                        end_ms: c.end.as_millis() as i64,
+                        text: c.text,
+                    })
+                    .collect();
+                let is_ext = t.source == syncverse_common::subtitles::SubtitleSource::External;
+                self.subtitle_track_data.push(SubtitleTrack::with_format_and_origin(
+                    idx,
+                    t.title,
+                    t.language,
+                    ui_cues,
+                    t.format.to_uppercase(),
+                    is_ext,
+                ));
+            }
+            self.sync_subtitle_tracks_ui();
         }
     }
 
@@ -1205,32 +1264,7 @@ impl SyncverseApp {
                         }
                     }
                     self.subtitle_track_data = merged;
-                    self.subtitle_tracks = self
-                        .subtitle_track_data
-                        .iter()
-                        .map(|t| t.title.clone())
-                        .collect();
-                    if let Some(i) = self.subtitle_track_index {
-                        if i >= self.subtitle_track_data.len() {
-                            self.subtitle_track_index = None;
-                            self.controls_state.subtitle_dialog.select_track(None);
-                        }
-                    }
-                    let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
-                        .subtitle_track_data
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
-                            id: i,
-                            title: t.title.clone(),
-                            language: t.language.clone(),
-                            format: t.format.clone(),
-                            is_external: t.is_external,
-                            file_path: None,
-                        })
-                        .collect();
-                    self.controls_state.subtitle_dialog.set_tracks(dialog_items);
-                    self.invalidate_subtitle_cache();
+                    self.sync_subtitle_tracks_ui();
                     ctx.request_repaint();
                 }
                 UiEvent::SubtitleCueDemuxed(cue) => {
@@ -3546,6 +3580,8 @@ impl SyncverseApp {
                 crate::gui::SubtitleConfigAction::SetDelayMs(delay_ms) => {
                     self.subtitle_delay_ms = delay_ms;
                     let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(delay_ms));
+                    self.invalidate_subtitle_cache();
+                    ctx.request_repaint();
                 }
                 crate::gui::SubtitleConfigAction::UpdateConfig(config) => {
                     *self.subtitle_overlay.config_mut() = config;
