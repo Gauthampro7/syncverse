@@ -5,42 +5,61 @@ use syncverse_common::time::MediaTime;
 
 use crate::subtitles::SubtitleParseError;
 
-/// Strips WebVTT styling/voice tags (`<...>`, `<v Speaker>`) and unescapes basic HTML entities.
+/// Strips WebVTT styling, voice (`<v Speaker>`), and inline timestamp (`<00:01.000>`) tags,
+/// and unescapes basic HTML entities.
 pub fn clean_vtt_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut in_tag = false;
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
 
-    for ch in raw.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    while i < chars.len() {
+        if chars[i] == '<' {
+            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '>') {
+                let end = i + 1 + rel_end;
+                if !chars[i + 1..end].contains(&'\n') {
+                    i = end + 1;
+                    continue;
+                }
+            }
+            out.push('<');
+            i += 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
         }
     }
 
     let unescaped = out
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&");
 
     unescaped.trim().to_string()
 }
 
 /// Parses a WebVTT timestamp in `HH:MM:SS.mmm` or `MM:SS.mmm` format into a `MediaTime`.
+///
+/// Properly normalizes 1-, 2-, and 3+ digit fractional seconds
+/// (`"00:01.5"` -> `1500ms`, `"00:01.05"` -> `1050ms`, `"00:01.5000"` -> `1500ms`).
 pub fn parse_vtt_timestamp(s: &str) -> Option<MediaTime> {
     let s = s.trim();
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 2 {
+    let (hms_part, frac_part) = s.split_once('.')?;
+    let frac_str = frac_part.trim();
+    if frac_str.is_empty() || !frac_str.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
 
-    let ms: u64 = parts[1].trim().parse().ok()?;
-    let hms: Vec<&str> = parts[0].trim().split(':').collect();
+    let ms: u64 = match frac_str.len() {
+        1 => frac_str.parse::<u64>().ok()? * 100,
+        2 => frac_str.parse::<u64>().ok()? * 10,
+        _ => frac_str[..3].parse::<u64>().ok()?,
+    };
+
+    let hms: Vec<&str> = hms_part.trim().split(':').collect();
 
     let (hours, mins, secs) = match hms.len() {
         3 => {
@@ -81,14 +100,50 @@ fn parse_vtt_timestamp_line(line: &str) -> Option<(MediaTime, MediaTime)> {
     Some((start, end))
 }
 
+#[inline]
+fn is_vtt_block_keyword(line: &str, keyword: &str) -> bool {
+    if let Some(rest) = line.strip_prefix(keyword) {
+        rest.is_empty() || rest.starts_with([' ', '\t', ':'])
+    } else {
+        false
+    }
+}
+
+/// Updates CSS brace depth and `/* ... */` comment state across a line inside a `STYLE` block.
+fn update_css_block_state(line: &str, brace_depth: &mut usize, in_comment: &mut bool) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if *in_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                *in_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            *in_comment = true;
+            i += 2;
+        } else {
+            if bytes[i] == b'{' {
+                *brace_depth = brace_depth.saturating_add(1);
+            } else if bytes[i] == b'}' {
+                *brace_depth = brace_depth.saturating_sub(1);
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Parses WebVTT text content into a chronologically sorted sequence of `SubtitleCue`s.
 ///
 /// Handles:
 /// - Leading `WEBVTT` magic header (with optional BOM or header commentary)
-/// - Comments (`NOTE` blocks) and style/region blocks (`STYLE`, `REGION`)
-/// - Short timestamps (`MM:SS.mmm`) and full timestamps (`HH:MM:SS.mmm`)
+/// - Comments (`NOTE` blocks) and style/region blocks (`STYLE`, `REGION`), including
+///   multi-paragraph `STYLE` blocks containing blank lines or CSS comments
+/// - Short timestamps (`MM:SS.mmm`) and full timestamps (`HH:MM:SS.mmm`) with 1–3+ fractional digits
 /// - Cue identifiers and cue settings
-/// - HTML/WebVTT tag cleaning (`<v Alice>`, `<b>`, `<i>`, `<c.color>`)
+/// - HTML/WebVTT tag cleaning (`<v Alice>`, `<00:01.000>`, `<b>`, `<i>`, `<c.color>`)
 pub fn parse_vtt(content: &str) -> Result<Vec<SubtitleCue>, SubtitleParseError> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let trimmed = content.trim_start();
@@ -102,6 +157,9 @@ pub fn parse_vtt(content: &str) -> Result<Vec<SubtitleCue>, SubtitleParseError> 
     let mut cues = Vec::new();
     let lines: Vec<&str> = content.lines().map(|l| l.trim_end_matches('\r')).collect();
     let mut block_lines: Vec<&str> = Vec::new();
+    let mut in_style_block = false;
+    let mut style_brace_depth: usize = 0;
+    let mut in_css_comment = false;
 
     // Skip the first line containing WEBVTT
     let mut line_iter = lines.into_iter();
@@ -109,13 +167,27 @@ pub fn parse_vtt(content: &str) -> Result<Vec<SubtitleCue>, SubtitleParseError> 
 
     for line in line_iter {
         if line.trim().is_empty() {
+            if in_style_block && (style_brace_depth > 0 || in_css_comment) {
+                // Keep accumulating multi-paragraph CSS inside STYLE blocks
+                block_lines.push(line);
+                continue;
+            }
             if !block_lines.is_empty() {
                 if let Some(cue) = process_vtt_block(&block_lines) {
                     cues.push(cue);
                 }
                 block_lines.clear();
             }
+            in_style_block = false;
+            style_brace_depth = 0;
+            in_css_comment = false;
         } else {
+            if block_lines.is_empty() && is_vtt_block_keyword(line.trim(), "STYLE") {
+                in_style_block = true;
+            }
+            if in_style_block {
+                update_css_block_state(line, &mut style_brace_depth, &mut in_css_comment);
+            }
             block_lines.push(line);
         }
     }
@@ -139,7 +211,10 @@ fn process_vtt_block(lines: &[&str]) -> Option<SubtitleCue> {
 
     // Skip NOTE, STYLE, and REGION blocks
     let first = lines[0].trim();
-    if first.starts_with("NOTE") || first.starts_with("STYLE") || first.starts_with("REGION") {
+    if is_vtt_block_keyword(first, "NOTE")
+        || is_vtt_block_keyword(first, "STYLE")
+        || is_vtt_block_keyword(first, "REGION")
+    {
         return None;
     }
 
@@ -204,5 +279,49 @@ cue-2
     fn test_parse_vtt_invalid_header_rejection() {
         let bad = "NOT A WEBVTT FILE\n00:00:01.000 --> 00:00:02.000\nText";
         assert!(parse_vtt(bad).is_err());
+    }
+
+    #[test]
+    fn test_parse_vtt_short_fractional_ms_and_multiparagraph_headers() {
+        assert_eq!(
+            parse_vtt_timestamp("00:01.5").map(|t| t.as_millis()),
+            Some(1_500)
+        );
+        assert_eq!(
+            parse_vtt_timestamp("00:01.05").map(|t| t.as_millis()),
+            Some(1_050)
+        );
+        assert_eq!(
+            parse_vtt_timestamp("01:00:02.25").map(|t| t.as_millis()),
+            Some(3_602_250)
+        );
+
+        let vtt = r#"WEBVTT
+
+STYLE
+::cue {
+  color: white;
+
+  /* 00:01.000 --> 00:02.000 comment inside CSS must not leak! */
+  background: black;
+}
+
+REGION
+id:top-banner
+width:80%
+
+NOTE Multi-line note
+
+Second note paragraph without timestamps
+
+1
+00:01.5 --> 00:03.05
+<v Speaker>Hello <00:02.000>world!
+"#;
+        let cues = parse_vtt(vtt).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start, MediaTime::from_millis(1_500));
+        assert_eq!(cues[0].end, MediaTime::from_millis(3_050));
+        assert_eq!(cues[0].text, "Hello world!");
     }
 }

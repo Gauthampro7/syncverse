@@ -5,27 +5,49 @@ use syncverse_common::time::MediaTime;
 
 use crate::subtitles::SubtitleParseError;
 
-/// Strips ASS style override tags (`{\...}`) and replaces ASS escape sequences (`\N`, `\n`, `\h`).
+/// Strips ASS style override tags (`{\...}`), suppresses vector drawing payloads (`\p1`..`\p0`/`\r`),
+/// and replaces ASS escape sequences (`\N`, `\n`, `\h`).
 pub fn clean_ass_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut in_override = false;
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0;
+    let mut in_drawing_mode = false;
 
     while i < chars.len() {
         let ch = chars[i];
         if ch == '{' {
-            in_override = true;
-            i += 1;
-            continue;
-        }
-        if ch == '}' {
-            in_override = false;
-            i += 1;
+            // Find matching '}' or consume to end if unclosed
+            let block_start = i + 1;
+            let mut block_end = block_start;
+            while block_end < chars.len() && chars[block_end] != '}' {
+                block_end += 1;
+            }
+            let block: String = chars[block_start..block_end].iter().collect();
+            for raw_tag in block.split('\\').skip(1) {
+                let tag = raw_tag.trim();
+                if let Some(after_p) = tag.strip_prefix('p') {
+                    let digit_len = after_p
+                        .bytes()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if digit_len > 0 {
+                        if let Ok(scale) = after_p[..digit_len].parse::<u32>() {
+                            in_drawing_mode = scale > 0;
+                        }
+                    }
+                } else if tag == "r" || tag.starts_with('r') {
+                    in_drawing_mode = false;
+                }
+            }
+            i = if block_end < chars.len() {
+                block_end + 1
+            } else {
+                block_end
+            };
             continue;
         }
 
-        if in_override {
+        if in_drawing_mode {
             i += 1;
             continue;
         }
@@ -52,6 +74,45 @@ pub fn clean_ass_text(raw: &str) -> String {
     }
 
     out.trim().to_string()
+}
+
+/// Parses a Matroska ASS/SSA packet (`ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`)
+/// or a full `Dialogue:` event line into cleaned subtitle text.
+///
+/// Validates integer `ReadOrder` and `Layer` on 8-comma Matroska packets with no prefix length
+/// cap (supporting arbitrarily long `Style` / `Name` fields), and returns `None` if the input is
+/// not a valid ASS packet or if its cleaned text is empty (e.g., vector drawing-only events).
+pub fn parse_matroska_ass_packet(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(after_prefix) = trimmed.strip_prefix("Dialogue:") {
+        let parts: Vec<&str> = after_prefix.trim_start().splitn(10, ',').collect();
+        if parts.len() == 10 {
+            let cleaned = clean_ass_text(parts[9]);
+            if cleaned.is_empty() {
+                return None;
+            }
+            return Some(cleaned);
+        }
+        return None;
+    }
+
+    let parts: Vec<&str> = trimmed.splitn(9, ',').collect();
+    if parts.len() == 9
+        && parts[0].trim().parse::<i64>().is_ok()
+        && parts[1].trim().parse::<i64>().is_ok()
+    {
+        let cleaned = clean_ass_text(parts[8]);
+        if cleaned.is_empty() {
+            return None;
+        }
+        return Some(cleaned);
+    }
+
+    None
 }
 
 /// Parses an ASS/SSA timestamp in `H:MM:SS.cs` or `HH:MM:SS.cs` format into a `MediaTime`.
@@ -253,5 +314,45 @@ Dialogue: 0,0:01:26.10,0:01:28.00,Default,,0,0,0,,Second dialogue with, embedded
         let raw = r#"{\fad(200,200)\c&H0000FF&}Colored Text\NSecond Line\hWith Non-Breaking Space"#;
         let clean = clean_ass_text(raw);
         assert_eq!(clean, "Colored Text\nSecond Line With Non-Breaking Space");
+    }
+
+    #[test]
+    fn test_clean_ass_text_drawing_mode_suppression() {
+        // \p1 enters drawing mode, \p0 exits
+        let drawing_only = r#"{\an7\pos(100,200)\p1}m 0 0 l 100 0 100 100 0 100{\p0}"#;
+        assert_eq!(clean_ass_text(drawing_only), "");
+
+        // Mixed text and \p2 ... \r reset
+        let mixed = r#"Before{\p2\bord0}m 0 0 b 10 20 30 40 50 60{\r}After"#;
+        assert_eq!(clean_ass_text(mixed), "BeforeAfter");
+
+        // \pos and \pbo must NOT trigger drawing mode
+        let pos_only = r#"{\pos(120,340)\pbo-5}Visible Dialogue\nNext Line"#;
+        assert_eq!(clean_ass_text(pos_only), "Visible Dialogue\nNext Line");
+    }
+
+    #[test]
+    fn test_parse_matroska_ass_packet_long_style_and_dialogue() {
+        // Long style and speaker name (> 30 chars before 8th comma)
+        let pkt = r#"42,0,VeryLongCustomAnimeDialogueStyleName,VeryLongSpeakerCharacterName,0010,0010,0020,,{\i1}Long style works!\NLine 2"#;
+        assert_eq!(
+            parse_matroska_ass_packet(pkt).as_deref(),
+            Some("Long style works!\nLine 2")
+        );
+
+        // Drawing-only Matroska ASS packet returns None
+        let drawing_pkt = r#"10,0,SignStyle,SignLayer,0,0,0,,{\p1}m 0 0 l 50 0 50 50 0 50{\p0}"#;
+        assert_eq!(parse_matroska_ass_packet(drawing_pkt), None);
+
+        // Full Dialogue: line
+        let dialogue = r#"Dialogue: 0,0:01:00.00,0:01:02.50,Default,,0,0,0,,{\b1}Hello, world!"#;
+        assert_eq!(
+            parse_matroska_ass_packet(dialogue).as_deref(),
+            Some("Hello, world!")
+        );
+
+        // Invalid ReadOrder (non-integer) returns None
+        let invalid = "not_an_int,0,Default,,0,0,0,,Hello";
+        assert_eq!(parse_matroska_ass_packet(invalid), None);
     }
 }

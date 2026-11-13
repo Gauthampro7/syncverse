@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack};
+use syncverse_common::subtitles::{SubtitleCue, SubtitleSource, SubtitleTrack};
 
 use crate::subtitles::ass::parse_ass;
 use crate::subtitles::microdvd::parse_microdvd;
@@ -240,19 +240,55 @@ fn decode_windows_1252_byte(b: u8) -> char {
     }
 }
 
-/// Reads a subtitle file from filesystem with robust character encoding detection and fallback.
-pub fn read_subtitle_to_string<P: AsRef<Path>>(path: P) -> Result<String, SubtitleParseError> {
-    let path = path.as_ref();
-    let bytes = fs::read(path)
-        .map_err(|e| SubtitleParseError::Io(format!("{}: {}", path.display(), e)))?;
+/// Reads a subtitle file from disk into UTF-8 text, stripping any BOM and falling back to
+/// UTF-16 or Windows-1252 / ISO-8859-1 (Latin-1) so legacy `.srt`/`.sub` files never fail.
+pub fn read_subtitle_text_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
     Ok(decode_subtitle_bytes(&bytes))
 }
 
-/// Parses a subtitle file from the filesystem into a `SubtitleTrack`.
-pub fn parse_subtitle_file<P: AsRef<Path>>(
+/// Reads a subtitle file from filesystem with robust character encoding detection and fallback.
+pub fn read_subtitle_to_string<P: AsRef<Path>>(path: P) -> Result<String, SubtitleParseError> {
+    let path = path.as_ref();
+    read_subtitle_text_lossy(path)
+        .map_err(|e| SubtitleParseError::Io(format!("{}: {}", path.display(), e)))
+}
+
+/// Parses subtitle text content according to file extension (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`).
+///
+/// For frame-based MicroDVD (`.sub`) subtitles, `fps` supplies the fallback framerate when no
+/// embedded `{1}{1}FPS` header is present (defaults to `25.0` if `fps <= 0.0` or non-finite).
+pub fn parse_subtitle_by_extension(
+    ext: &str,
+    content: &str,
+    fps: f64,
+) -> Result<Vec<SubtitleCue>, SubtitleParseError> {
+    let norm = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    match norm.as_str() {
+        "srt" => parse_srt(content),
+        "vtt" => parse_vtt(content),
+        "ass" | "ssa" => parse_ass(content),
+        "sub" => {
+            let opt_fps = if fps > 0.0 && fps.is_finite() {
+                Some(fps)
+            } else {
+                None
+            };
+            parse_microdvd(content, opt_fps)
+        }
+        other => Err(SubtitleParseError::InvalidFormat(format!(
+            "Unsupported subtitle extension: .{other}"
+        ))),
+    }
+}
+
+/// Parses a subtitle file from the filesystem into a `SubtitleTrack`, using `video_fps` as the
+/// fallback framerate for frame-based formats like MicroDVD (`.sub`).
+pub fn parse_subtitle_file_with_fps<P: AsRef<Path>>(
     path: P,
     track_id: usize,
     media_stem: Option<&str>,
+    video_fps: Option<f64>,
 ) -> Result<SubtitleTrack, SubtitleParseError> {
     let path = path.as_ref();
     let content = read_subtitle_to_string(path)?;
@@ -263,17 +299,7 @@ pub fn parse_subtitle_file<P: AsRef<Path>>(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let (cues, format) = match ext.as_str() {
-        "srt" => (parse_srt(&content)?, "srt".to_string()),
-        "vtt" => (parse_vtt(&content)?, "vtt".to_string()),
-        "ass" | "ssa" => (parse_ass(&content)?, ext),
-        "sub" => (parse_microdvd(&content, None)?, "sub".to_string()),
-        other => {
-            return Err(SubtitleParseError::InvalidFormat(format!(
-                "Unsupported subtitle extension: .{other}"
-            )))
-        }
-    };
+    let cues = parse_subtitle_by_extension(&ext, &content, video_fps.unwrap_or(25.0))?;
 
     let filename = path
         .file_name()
@@ -286,19 +312,38 @@ pub fn parse_subtitle_file<P: AsRef<Path>>(
     Ok(SubtitleTrack::new(
         track_id,
         SubtitleSource::External,
-        format,
+        ext,
         language,
         title,
         cues,
     ))
 }
 
+/// Parses a subtitle file from the filesystem into a `SubtitleTrack`.
+pub fn parse_subtitle_file<P: AsRef<Path>>(
+    path: P,
+    track_id: usize,
+    media_stem: Option<&str>,
+) -> Result<SubtitleTrack, SubtitleParseError> {
+    parse_subtitle_file_with_fps(path, track_id, media_stem, None)
+}
+
 /// Automatically scans the directory of `media_path` and standard subtitle subdirectories
 /// (`subtitles/`, `Subtitles/`, `subs/`, `Subs/`) for matching external subtitles.
 ///
 /// Matches any file where the filename starts with the media file stem and has a supported
-/// extension (`.srt`, `.vtt`, `.ass`, `.ssa`).
+/// extension (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`).
 pub fn scan_external_subtitles<P: AsRef<Path>>(media_path: P) -> Vec<SubtitleTrack> {
+    scan_external_subtitles_with_fps(media_path, None)
+}
+
+/// Automatically scans the directory of `media_path` and standard subtitle subdirectories
+/// (`subtitles/`, `Subtitles/`, `subs/`, `Subs/`) for matching external subtitles, using
+/// `video_fps` as the fallback framerate for MicroDVD (`.sub`) files.
+pub fn scan_external_subtitles_with_fps<P: AsRef<Path>>(
+    media_path: P,
+    video_fps: Option<f64>,
+) -> Vec<SubtitleTrack> {
     let media_path = media_path.as_ref();
     let parent_dir = match media_path.parent() {
         Some(dir) if dir.exists() => dir,
@@ -365,7 +410,9 @@ pub fn scan_external_subtitles<P: AsRef<Path>>(media_path: P) -> Vec<SubtitleTra
                 continue;
             }
 
-            if let Ok(track) = parse_subtitle_file(&path, track_id, Some(media_stem)) {
+            if let Ok(track) =
+                parse_subtitle_file_with_fps(&path, track_id, Some(media_stem), video_fps)
+            {
                 tracks.push(track);
                 track_id += 1;
             }
@@ -529,6 +576,52 @@ mod tests {
         assert!(decoded_corrupt.starts_with("Valid prefix "));
         assert!(decoded_corrupt.ends_with(" suffix"));
         assert!(!decoded_corrupt.contains("ï»¿"));
+    }
+
+    #[test]
+    fn test_read_lossy_latin1_srt_and_scan_with_fps_for_sub() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("syncverse_latin1_sub_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let movie_path = temp_dir.join("film.mkv");
+        fs::write(&movie_path, b"video").unwrap();
+
+        // Latin-1 / Windows-1252 SRT file (0xE9 = 'é')
+        let latin1_srt = temp_dir.join("film.fr.srt");
+        let mut srt_bytes = b"1\n00:00:01,000 --> 00:00:03,000\nCaf".to_vec();
+        srt_bytes.push(0xE9);
+        srt_bytes.extend_from_slice(b" cr");
+        srt_bytes.push(0xE8);
+        srt_bytes.extend_from_slice(b"me\n");
+        fs::write(&latin1_srt, &srt_bytes).unwrap();
+
+        let lossy_text = read_subtitle_text_lossy(&latin1_srt).unwrap();
+        assert!(lossy_text.contains("Café crème"));
+
+        // MicroDVD .sub file without FPS header, scanned with 24.0 fps
+        let sub_path = temp_dir.join("film.en.sub");
+        fs::write(&sub_path, "{24}{48}Twenty-four fps line\n").unwrap();
+
+        let tracks = scan_external_subtitles_with_fps(&movie_path, Some(24.0));
+        assert_eq!(tracks.len(), 2);
+
+        let sub_track = tracks.iter().find(|t| t.format == "sub").unwrap();
+        assert_eq!(sub_track.language.as_deref(), Some("en"));
+        assert_eq!(sub_track.cues.len(), 1);
+        assert_eq!(sub_track.cues[0].start.as_millis(), 1000);
+        assert_eq!(sub_track.cues[0].end.as_millis(), 2000);
+        assert_eq!(sub_track.cues[0].text, "Twenty-four fps line");
+
+        let fr_track = tracks.iter().find(|t| t.format == "srt").unwrap();
+        assert_eq!(fr_track.cues[0].text, "Café crème");
+
+        // Direct parse_subtitle_by_extension checks
+        let parsed_sub = parse_subtitle_by_extension("sub", "{30}{60}Thirty fps", 30.0).unwrap();
+        assert_eq!(parsed_sub[0].start.as_millis(), 1000);
+        assert_eq!(parsed_sub[0].end.as_millis(), 2000);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 

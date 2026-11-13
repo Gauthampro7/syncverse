@@ -1,4 +1,4 @@
-//! Subtitle demuxing, pure-Rust parsers (SRT, WebVTT, ASS/SSA), and external file scanner.
+//! Subtitle demuxing, pure-Rust parsers (SRT, WebVTT, ASS/SSA, MicroDVD), and external file scanner.
 
 pub mod ass;
 pub mod microdvd;
@@ -6,11 +6,16 @@ pub mod scanner;
 pub mod srt;
 pub mod vtt;
 
-pub use ass::{clean_ass_text, parse_ass, parse_ass_dialogue_line, parse_ass_timestamp};
+pub use ass::{
+    clean_ass_text, parse_ass, parse_ass_dialogue_line, parse_ass_timestamp,
+    parse_matroska_ass_packet,
+};
 pub use microdvd::{clean_microdvd_text, parse_microdvd, parse_microdvd_line};
 pub use scanner::{
-    decode_subtitle_bytes, detect_subtitle_language, lookup_language, parse_subtitle_file,
-    read_subtitle_to_string, scan_external_subtitles, SUBTITLE_EXTENSIONS,
+    decode_subtitle_bytes, detect_subtitle_language, lookup_language, parse_subtitle_by_extension,
+    parse_subtitle_file, parse_subtitle_file_with_fps, read_subtitle_text_lossy,
+    read_subtitle_to_string, scan_external_subtitles, scan_external_subtitles_with_fps,
+    SUBTITLE_EXTENSIONS,
 };
 pub use srt::{clean_srt_text, parse_srt, parse_srt_timestamp};
 pub use vtt::{clean_vtt_text, parse_vtt, parse_vtt_timestamp};

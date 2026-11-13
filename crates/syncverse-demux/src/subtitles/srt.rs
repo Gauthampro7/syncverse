@@ -8,43 +8,73 @@ use crate::subtitles::SubtitleParseError;
 /// Strips HTML-like formatting tags (`<...>`, `{...}`) and unescapes basic HTML entities.
 pub fn clean_srt_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut in_tag = false;
-    let mut in_curly = false;
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
 
-    for ch in raw.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            '{' => in_curly = true,
-            '}' => in_curly = false,
-            _ if !in_tag && !in_curly => out.push(ch),
-            _ => {}
+    while i < chars.len() {
+        match chars[i] {
+            '<' => {
+                if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '>') {
+                    let end = i + 1 + rel_end;
+                    if !chars[i + 1..end].contains(&'\n') {
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                out.push('<');
+                i += 1;
+            }
+            '{' => {
+                if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') {
+                    let end = i + 1 + rel_end;
+                    if !chars[i + 1..end].contains(&'\n') {
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                out.push('{');
+                i += 1;
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
         }
     }
 
-    // Unescape standard HTML entities
+    // Unescape standard HTML entities (&amp; decoded last so &amp;lt; stays &lt;)
     let unescaped = out
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&");
 
     unescaped.trim().to_string()
 }
 
-/// Parses an SRT timestamp in `HH:MM:SS,mmm` or `MM:SS,mmm` format into a `MediaTime`.
+/// Parses an SRT timestamp in `H:MM:SS,mmm`, `HH:MM:SS,mmm`, `HH:MM:SS.mmm`, or `MM:SS,mmm`
+/// format into a `MediaTime`.
+///
+/// Supports both `,` and `.` fractional separators and normalizes 1-, 2-, or 3+ digit
+/// fractional seconds (`"5"` -> `500ms`, `"05"` -> `50ms`, `"500"` -> `500ms`, `"5000"` -> `500ms`).
 pub fn parse_srt_timestamp(s: &str) -> Option<MediaTime> {
     let s = s.trim();
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 2 {
+    let (hms_part, frac_part) = s.split_once([',', '.'])?;
+    let frac_str = frac_part.trim();
+    if frac_str.is_empty() || !frac_str.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
 
-    let ms: u64 = parts[1].trim().parse().ok()?;
-    let hms: Vec<&str> = parts[0].trim().split(':').collect();
+    let ms: u64 = match frac_str.len() {
+        1 => frac_str.parse::<u64>().ok()? * 100,
+        2 => frac_str.parse::<u64>().ok()? * 10,
+        _ => frac_str[..3].parse::<u64>().ok()?,
+    };
+
+    let hms: Vec<&str> = hms_part.trim().split(':').collect();
 
     let (hours, mins, secs) = match hms.len() {
         3 => {
@@ -214,5 +244,32 @@ Valid Third
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "Valid First");
         assert_eq!(cues[1].text, "Valid Third");
+    }
+
+    #[test]
+    fn test_parse_srt_fractional_ms_dot_separator_and_positioning() {
+        assert_eq!(
+            parse_srt_timestamp("0:01:20,5").map(|t| t.as_millis()),
+            Some(80_500)
+        );
+        assert_eq!(
+            parse_srt_timestamp("0:01:20,05").map(|t| t.as_millis()),
+            Some(80_050)
+        );
+        assert_eq!(
+            parse_srt_timestamp("00:01:20.500").map(|t| t.as_millis()),
+            Some(80_500)
+        );
+        assert_eq!(
+            parse_srt_timestamp("00:01:20,5000").map(|t| t.as_millis()),
+            Some(80_500)
+        );
+
+        let srt = "1\n0:00:01.5 --> 0:00:03,05 X1:40 X2:600 Y1:20 Y2:440\n&quot;Hello&quot;&nbsp;it&#39;s &lt;me&gt; &amp; you\n";
+        let cues = parse_srt(srt).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start, MediaTime::from_millis(1_500));
+        assert_eq!(cues[0].end, MediaTime::from_millis(3_050));
+        assert_eq!(cues[0].text, "\"Hello\" it's <me> & you");
     }
 }

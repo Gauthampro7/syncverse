@@ -1,8 +1,64 @@
 //! Events delivered from the background runtime engine to the graphical UI presentation thread.
 
+use std::sync::Arc;
 use std::time::Instant;
 use syncverse_chat::ChatRecord;
 use crate::gui::RoomMember;
+
+/// Rasterized RGBA bitmap subtitle cue ready for GPU overlay texture upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleBitmapCue {
+    /// Presentation start timestamp in milliseconds.
+    pub start_ms: u64,
+    /// Presentation end timestamp in milliseconds.
+    pub end_ms: u64,
+    /// Horizontal offset on the video canvas in pixels.
+    pub x: u32,
+    /// Vertical offset on the video canvas in pixels.
+    pub y: u32,
+    /// Width of the bitmap rectangle in pixels.
+    pub width: u32,
+    /// Height of the bitmap rectangle in pixels.
+    pub height: u32,
+    /// Reference video canvas width in pixels (`0` if unspecified).
+    pub canvas_width: u32,
+    /// Reference video canvas height in pixels (`0` if unspecified).
+    pub canvas_height: u32,
+    /// Packed 32-bit RGBA pixel data (`width * height * 4` bytes).
+    pub rgba: Arc<[u8]>,
+}
+
+/// Wave-2-ready track-scoped subtitle event supporting text cues, bitmap cues,
+/// clear-packet truncation, and initial track auto-selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackSubtitleEvent {
+    /// A decoded text subtitle cue routed to `track_index`.
+    TextCue {
+        /// Target subtitle track index.
+        track_index: usize,
+        /// Decoded text subtitle cue.
+        cue: crate::gui::subtitle_overlay::SubtitleCue,
+    },
+    /// A decoded rasterized RGBA bitmap subtitle cue routed to `track_index`.
+    BitmapCue {
+        /// Target subtitle track index.
+        track_index: usize,
+        /// Decoded bitmap subtitle cue.
+        cue: SubtitleBitmapCue,
+    },
+    /// Truncates active cues on `track_index` at `at_ms`.
+    ClearActive {
+        /// Target subtitle track index.
+        track_index: usize,
+        /// Presentation timestamp in milliseconds at which active cues expire.
+        at_ms: u64,
+    },
+    /// Selects the initial subtitle track chosen by auto-selection (`None` disables subtitles).
+    AutoSelectTrack {
+        /// Selected subtitle track index, or `None` for Off.
+        track_index: Option<usize>,
+    },
+}
 
 /// Events delivered from the background engine to the graphical UI thread.
 #[derive(Debug, Clone)]
@@ -171,5 +227,41 @@ mod tests {
         assert!(matches!(audio_data, UiEvent::AudioDataDiscovered(..)));
         assert!(matches!(video_meta, UiEvent::VideoMetadataDiscovered(..)));
         assert!(matches!(sub_cue, UiEvent::SubtitleCueDemuxed(..)));
+    }
+
+    #[test]
+    fn test_wave2_track_subtitle_event_types() {
+        let bmp = SubtitleBitmapCue {
+            start_ms: 1000,
+            end_ms: 4000,
+            x: 100,
+            y: 800,
+            width: 2,
+            height: 2,
+            canvas_width: 1920,
+            canvas_height: 1080,
+            rgba: Arc::from([255u8; 16]),
+        };
+
+        let text_ev = TrackSubtitleEvent::TextCue {
+            track_index: 0,
+            cue: crate::gui::subtitle_overlay::SubtitleCue::new(500, 1500, "Line"),
+        };
+        let bmp_ev = TrackSubtitleEvent::BitmapCue {
+            track_index: 1,
+            cue: bmp.clone(),
+        };
+        let clear_ev = TrackSubtitleEvent::ClearActive {
+            track_index: 1,
+            at_ms: 2500,
+        };
+        let auto_ev = TrackSubtitleEvent::AutoSelectTrack {
+            track_index: Some(0),
+        };
+
+        assert!(matches!(text_ev, TrackSubtitleEvent::TextCue { track_index: 0, .. }));
+        assert!(matches!(bmp_ev, TrackSubtitleEvent::BitmapCue { track_index: 1, .. }));
+        assert!(matches!(clear_ev, TrackSubtitleEvent::ClearActive { track_index: 1, at_ms: 2500 }));
+        assert!(matches!(auto_ev, TrackSubtitleEvent::AutoSelectTrack { track_index: Some(0) }));
     }
 }
