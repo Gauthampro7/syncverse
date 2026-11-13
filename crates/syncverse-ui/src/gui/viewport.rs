@@ -280,6 +280,7 @@ pub struct VideoViewport {
     texture: Option<TextureHandle>,
     texture_buffer: VideoTextureBuffer,
     current_pts_ms: Option<u64>,
+    last_uploaded_generation: Option<u64>,
     video_width: u32,
     video_height: u32,
     pending_frame: Option<VideoFrameRGBA>,
@@ -306,6 +307,7 @@ impl VideoViewport {
             texture: None,
             texture_buffer: VideoTextureBuffer::new(),
             current_pts_ms: None,
+            last_uploaded_generation: None,
             video_width: 0,
             video_height: 0,
             pending_frame: None,
@@ -321,6 +323,10 @@ impl VideoViewport {
     }
 
     /// Consumes incoming video frames from SPSC ring buffer according to MasterClock pacing.
+    ///
+    /// Filters frames against `clock.seek_generation()` so stale pre-seek frames are discarded
+    /// immediately without flashing, never mutates `MasterClock` from the UI thread, and avoids
+    /// busy repaint loops when paused or waiting for frames.
     pub fn update_playback(
         &mut self,
         ctx: &Context,
@@ -328,14 +334,34 @@ impl VideoViewport {
         clock: &MasterClock,
         now: Instant,
     ) {
+        let current_gen = clock.seek_generation();
+
+        if self
+            .pending_frame
+            .as_ref()
+            .is_some_and(|f| f.generation != current_gen)
+        {
+            self.pending_frame = None;
+        }
+
         if !clock.is_playing() {
-            let mut latest_frame = self.pending_frame.take().or_else(|| video_ring.try_pop());
-            while let Some(newer) = video_ring.try_pop() {
-                latest_frame = Some(newer);
-            }
-            if let Some(frame) = latest_frame {
-                self.upload_texture(ctx, &frame);
-                ctx.request_repaint();
+            if self.last_uploaded_generation != Some(current_gen) || self.texture.is_none() {
+                let next_frame = if let Some(pending) = self.pending_frame.take() {
+                    Some(pending)
+                } else {
+                    let mut found = None;
+                    while let Some(candidate) = video_ring.try_pop() {
+                        if candidate.generation == current_gen {
+                            found = Some(candidate);
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some(frame) = next_frame {
+                    self.upload_frame(ctx, frame);
+                    ctx.request_repaint();
+                }
             }
             return;
         }
@@ -348,15 +374,23 @@ impl VideoViewport {
             let frame = match self.pending_frame.take() {
                 Some(f) => f,
                 None => {
-                    ctx.request_repaint_after(Duration::from_millis(8));
+                    let delay = if self.video_width > 0 {
+                        Duration::from_millis(16)
+                    } else {
+                        Duration::from_millis(100)
+                    };
+                    ctx.request_repaint_after(delay);
                     break;
                 }
             };
 
-            // First frame presentation: Anchor presentation clock to frame timestamp for zero startup jitter
+            if frame.generation != current_gen {
+                continue;
+            }
+
+            // First frame presentation: upload and present immediately without racing MasterClock.
             if self.texture.is_none() {
-                clock.seek_to(frame.pts_ms as f64, now);
-                self.upload_texture(ctx, &frame);
+                self.upload_frame(ctx, frame);
                 ctx.request_repaint();
                 break;
             }
@@ -370,11 +404,13 @@ impl VideoViewport {
                         continue;
                     }
                     self.pending_frame = Some(frame);
-                    ctx.request_repaint_after(duration);
+                    ctx.request_repaint_after(
+                        duration.clamp(Duration::from_millis(1), Duration::from_millis(40)),
+                    );
                     break;
                 }
                 PresentationAction::PresentNow | PresentationAction::PresentNowLate => {
-                    self.upload_texture(ctx, &frame);
+                    self.upload_frame(ctx, frame);
                     ctx.request_repaint();
                     break;
                 }
@@ -389,6 +425,7 @@ impl VideoViewport {
     pub fn clear_pending(&mut self) {
         self.pending_frame = None;
         self.current_pts_ms = None;
+        self.last_uploaded_generation = None;
     }
 
     /// Resets the viewport state and texture handle for a newly opened media stream.
@@ -397,6 +434,7 @@ impl VideoViewport {
         self.pending_frame = None;
         self.last_frame = None;
         self.current_pts_ms = None;
+        self.last_uploaded_generation = None;
         self.video_width = 0;
         self.video_height = 0;
         self.zoom_mode = ZoomMode::Fit;
@@ -406,15 +444,20 @@ impl VideoViewport {
         self.last_double_click = None;
     }
 
-    /// Uploads frame RGBA data to the `egui::TextureHandle`.
-    pub fn upload_texture(&mut self, ctx: &Context, frame: &VideoFrameRGBA) {
-        if self.current_pts_ms == Some(frame.pts_ms) && self.texture.is_some() {
+    /// Uploads an owned frame's RGBA data to the `egui::TextureHandle` with zero heap clones.
+    pub fn upload_frame(&mut self, ctx: &Context, frame: VideoFrameRGBA) {
+        if self.current_pts_ms == Some(frame.pts_ms)
+            && self.last_uploaded_generation == Some(frame.generation)
+            && self.texture.is_some()
+        {
             return;
         }
 
         let w = frame.width as usize;
         let h = frame.height as usize;
-        let bytes = self.texture_buffer.prepare_with_adjustments(frame, &self.video_adjustments);
+        let bytes = self
+            .texture_buffer
+            .prepare_with_adjustments(&frame, &self.video_adjustments);
         let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], bytes);
 
         if let Some(ref mut handle) = self.texture {
@@ -427,18 +470,31 @@ impl VideoViewport {
             self.texture = Some(ctx.load_texture("video_surface", color_image, TextureOptions::LINEAR));
         }
 
-        self.last_frame = Some(frame.clone());
         self.current_pts_ms = Some(frame.pts_ms);
+        self.last_uploaded_generation = Some(frame.generation);
         self.video_width = frame.width;
         self.video_height = frame.height;
+        self.last_frame = Some(frame);
+    }
+
+    /// Uploads frame RGBA data to the `egui::TextureHandle`.
+    pub fn upload_texture(&mut self, ctx: &Context, frame: &VideoFrameRGBA) {
+        if self.current_pts_ms == Some(frame.pts_ms)
+            && self.last_uploaded_generation == Some(frame.generation)
+            && self.texture.is_some()
+        {
+            return;
+        }
+        self.upload_frame(ctx, frame.clone());
     }
 
     /// Sets video color adjustments and immediately refreshes the current frame texture.
     pub fn set_video_adjustments(&mut self, ctx: &Context, adjustments: VideoColorAdjustments) {
         self.video_adjustments = adjustments;
-        if let Some(frame) = self.last_frame.clone() {
+        if let Some(frame) = self.last_frame.take() {
             self.current_pts_ms = None;
-            self.upload_texture(ctx, &frame);
+            self.last_uploaded_generation = None;
+            self.upload_frame(ctx, frame);
             ctx.request_repaint();
         }
     }
@@ -571,8 +627,13 @@ impl VideoViewport {
         let available_w = available_rect.width();
         let available_h = available_rect.height();
 
-        // 1. Allocate full interactive space
-        let (rect, response) = ui.allocate_exact_size(available_rect.size(), egui::Sense::click_and_drag());
+        // 1. Allocate full interactive space (drag only active when zoomed so clicks in Fit mode aren't swallowed)
+        let sense = if self.zoom_mode == ZoomMode::Fit {
+            egui::Sense::click()
+        } else {
+            egui::Sense::click_and_drag()
+        };
+        let (rect, response) = ui.allocate_exact_size(available_rect.size(), sense);
 
         // Context menu on right click
         response.context_menu(context_menu);

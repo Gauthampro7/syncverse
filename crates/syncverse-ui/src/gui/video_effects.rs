@@ -112,9 +112,7 @@ impl VideoColorAdjustments {
         let has_saturation = (sat - 1.0).abs() >= 0.01;
         let sat_q8 = (sat * 256.0 + 0.5) as i32;
 
-        unsafe {
-            dst.set_len(total_bytes);
-        }
+        dst.resize(total_bytes, 0);
         let out = dst.as_mut_slice();
 
         for y in 0..height {
