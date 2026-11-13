@@ -2836,6 +2836,7 @@ mod tests {
             sample_rate: Some(48000.0),
             channels: Some(2),
             codec_private: None,
+            ..Default::default()
         };
         let desc1 = format_track_info(&t1);
         assert_eq!(desc1, "English Commentary - ENG - aac - Stereo");
@@ -2851,6 +2852,7 @@ mod tests {
             sample_rate: Some(48000.0),
             channels: Some(6),
             codec_private: None,
+            ..Default::default()
         };
         let desc2 = format_track_info(&t2);
         assert_eq!(desc2, "Track 2 - opus - 6ch");
@@ -2866,6 +2868,7 @@ mod tests {
             sample_rate: Some(44100.0),
             channels: Some(1),
             codec_private: None,
+            ..Default::default()
         };
         let desc3 = format_track_info(&t3);
         assert_eq!(desc3, "JPN - pcm_s16le - Mono");
@@ -2885,6 +2888,7 @@ mod tests {
                 sample_rate: Some(48000.0),
                 channels: Some(2),
                 codec_private: None,
+                ..Default::default()
             },
             TrackInfo {
                 track_id: 2,
@@ -2897,6 +2901,7 @@ mod tests {
                 sample_rate: Some(48000.0),
                 channels: Some(6),
                 codec_private: None,
+                ..Default::default()
             },
             TrackInfo {
                 track_id: 5,
@@ -2909,6 +2914,7 @@ mod tests {
                 sample_rate: Some(48000.0),
                 channels: Some(2),
                 codec_private: None,
+                ..Default::default()
             },
         ];
 
