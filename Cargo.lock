@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-chat"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "syncverse-common",
  "syncverse-sync",
@@ -3443,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-clock"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "syncverse-codecs",
  "thiserror 2.0.21",
@@ -3451,7 +3451,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-codecs"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ffmpeg-next",
  "syncverse-common",
@@ -3460,14 +3460,14 @@ dependencies = [
 
 [[package]]
 name = "syncverse-common"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "syncverse-core"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "cpal",
  "ffmpeg-next",
@@ -3484,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-demux"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ffmpeg-next",
  "syncverse-common",
@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-sync"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "ring",
  "syncverse-common",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "syncverse-ui"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui",
