@@ -128,6 +128,33 @@ impl Drop for UpnpMappingGuard {
     }
 }
 
+/// Spawns a non-blocking background thread (`"syncverse-upnp"`) to discover an IGD router
+/// and map the given UDP port without stalling playback or watch-party initialization.
+///
+/// The returned `mpsc::Receiver` yields `(Option<UpnpMappingGuard>, UpnpStatus)` once
+/// discovery and mapping complete or time out.
+pub fn spawn_upnp_mapping(
+    port: u16,
+) -> std::sync::mpsc::Receiver<(Option<UpnpMappingGuard>, UpnpStatus)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_worker = tx.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("syncverse-upnp".to_string())
+        .spawn(move || {
+            let (status, guard) = UpnpMappingGuard::map_port(port);
+            let _ = tx_worker.send((guard, status));
+        })
+    {
+        let _ = tx.send((
+            None,
+            UpnpStatus::Disabled {
+                reason: format!("Failed to spawn UPnP thread: {}", err),
+            },
+        ));
+    }
+    rx
+}
+
 /// Discovers an Internet Gateway Device via SSDP multicast.
 fn discover_igd(timeout: Duration) -> Result<IgdService, String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
@@ -406,5 +433,18 @@ mod tests {
         let (svc, ctrl) = parse_service_descriptor(xml).unwrap();
         assert_eq!(svc, "urn:schemas-upnp-org:service:WANIPConnection:1");
         assert_eq!(ctrl, "/ctl/IPConn");
+    }
+
+    #[test]
+    fn test_spawn_upnp_mapping_is_non_blocking() {
+        let start = std::time::Instant::now();
+        let rx = spawn_upnp_mapping(18242);
+        // Spawning must return immediately well below the 1500ms SSDP timeout.
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "spawn_upnp_mapping must not block the caller thread"
+        );
+        // Channel stays open until the background thread completes or drops.
+        drop(rx);
     }
 }

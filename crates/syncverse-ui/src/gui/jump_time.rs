@@ -1,6 +1,6 @@
 //! "Jump to Specific Time" modal dialog (Ctrl+T) with timecode parsing and quick offset buttons.
 
-use egui::{Align2, Color32, Context, CornerRadius, Key, RichText, Stroke, Vec2, Window};
+use egui::{Color32, Context, CornerRadius, Key, RichText, Stroke, Vec2, Window};
 use crate::gui::controls::ControlsBarState;
 
 /// Parses a timecode string into milliseconds.
@@ -110,18 +110,28 @@ impl JumpToTimeDialog {
 
         let mut target_seek_ms: Option<u64> = None;
         let mut close_dialog = false;
+        let mut is_open = self.is_open;
 
         // Escape cancels and closes dialog
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             close_dialog = true;
         }
 
+        let screen = ctx.content_rect();
+        let max_size = (screen.size() - Vec2::new(24.0, 24.0)).max(Vec2::new(240.0, 160.0));
+        let default_size = Vec2::new(360.0, 220.0).min(max_size);
+        let default_pos = screen.center() - default_size * 0.5;
+
         Window::new("⏱ Jump to Specific Time")
+            .open(&mut is_open)
             .collapsible(false)
-            .resizable(false)
-            .pivot(Align2::CENTER_CENTER)
-            .fixed_pos(ctx.content_rect().center())
-            .fixed_size(Vec2::new(360.0, 220.0))
+            .resizable(true)
+            .movable(true)
+            .vscroll(true)
+            .default_pos(default_pos)
+            .default_size(default_size)
+            .max_size(max_size)
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
 
@@ -205,7 +215,7 @@ impl JumpToTimeDialog {
                 });
             });
 
-        if close_dialog {
+        if close_dialog || !is_open {
             self.close();
         }
 
@@ -258,5 +268,55 @@ mod tests {
         assert!(parse_time_input("", 0, 10_000_000).is_err());
         assert!(parse_time_input("abc", 0, 10_000_000).is_err());
         assert!(parse_time_input("1:2:3:4", 0, 10_000_000).is_err());
+    }
+
+    #[test]
+    fn test_jump_to_time_dialog_viewport_bounded_and_closable() {
+        for (w, h) in [(480.0, 320.0), (1280.0, 720.0)] {
+            let ctx = Context::default();
+            let mut dlg = JumpToTimeDialog::new();
+            dlg.open(90_000);
+
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(raw.clone(), |ctx| {
+                    let _ = dlg.show(ctx, 90_000, 600_000);
+                });
+                out.textures_delta.clear();
+            }
+
+            let rect = ctx
+                .memory(|m| m.area_rect(egui::Id::unique(Some("⏱ Jump to Specific Time"))))
+                .expect("JumpToTimeDialog window rect must be recorded");
+            assert!(
+                screen.contains_rect(rect),
+                "JumpToTimeDialog {:?} escaped viewport {:?}",
+                rect,
+                screen
+            );
+
+            // Pressing Escape closes dialog cleanly
+            let esc_raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(esc_raw, |ctx| {
+                let _ = dlg.show(ctx, 90_000, 600_000);
+            });
+            out.textures_delta.clear();
+            assert!(!dlg.is_open);
+        }
     }
 }

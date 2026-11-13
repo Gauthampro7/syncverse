@@ -55,6 +55,7 @@ pub struct AudioPacer {
     last_pts_ms: AtomicU64,
     in_underrun: AtomicBool,
     audio_delay_ms: AtomicI64,
+    output_latency_ms: AtomicU64,
 }
 
 impl AudioPacer {
@@ -86,6 +87,7 @@ impl AudioPacer {
             last_pts_ms: AtomicU64::new(0),
             in_underrun: AtomicBool::new(false),
             audio_delay_ms: AtomicI64::new(0),
+            output_latency_ms: AtomicU64::new(0),
         })
     }
 
@@ -177,9 +179,25 @@ impl AudioPacer {
         self.audio_delay_ms.fetch_add(delta_ms, Ordering::AcqRel) + delta_ms
     }
 
+    /// Sets the hardware audio sink output buffer latency in milliseconds.
+    ///
+    /// Frames are scheduled earlier by this latency so they arrive at the DAC
+    /// aligned with `MasterClock`.
+    #[inline]
+    pub fn set_output_latency_ms(&self, latency_ms: u64) {
+        self.output_latency_ms.store(latency_ms, Ordering::Release);
+    }
+
+    /// Returns the currently configured hardware audio sink output buffer latency in milliseconds.
+    #[inline]
+    pub fn output_latency_ms(&self) -> u64 {
+        self.output_latency_ms.load(Ordering::Acquire)
+    }
+
     /// Evaluates the timing action for an audio frame against the `MasterClock`.
     ///
-    /// Incorporates the user-configured audio sync delay (`audio_delay_ms`), shifting effective PTS.
+    /// Incorporates the user-configured audio sync delay (`audio_delay_ms`) and the
+    /// hardware audio output buffer latency (`output_latency_ms`), shifting effective PTS.
     ///
     /// Decision Windows:
     /// - Delta > +20ms: Wait(delta - 20ms)
@@ -193,7 +211,8 @@ impl AudioPacer {
     ) -> AudioTimingAction {
         let master_pts = master_clock.current_pts(now);
         let delay_ms = self.audio_delay_ms();
-        let effective_pts = (frame_pts_ms as i64 + delay_ms) as f64;
+        let output_latency_ms = self.output_latency_ms() as i64;
+        let effective_pts = (frame_pts_ms as i64 + delay_ms - output_latency_ms) as f64;
         let delta_ms = effective_pts - master_pts;
 
         if delta_ms > 20.0 {
@@ -478,5 +497,47 @@ mod tests {
             pacer.evaluate_timing(1050, &clock, now),
             AudioTimingAction::PlayNow
         );
+    }
+
+    #[test]
+    fn test_audio_pacer_output_latency_and_reset() {
+        let pacer = AudioPacer::default_48k_stereo().unwrap();
+        let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Playing);
+        let spsc = SpscRingBuffer::<AudioFramePCM, 64>::new();
+        let now = Instant::now();
+
+        assert_eq!(pacer.output_latency_ms(), 0);
+        pacer.set_output_latency_ms(40);
+        assert_eq!(pacer.output_latency_ms(), 40);
+
+        // With 40ms output latency, frame 1040ms needs to be queued now at master_pts=1000ms
+        assert_eq!(
+            pacer.evaluate_timing(1040, &clock, now),
+            AudioTimingAction::PlayNow
+        );
+
+        // Frame 1000ms is already 40ms late relative to DAC output
+        match pacer.evaluate_timing(1000, &clock, now) {
+            AudioTimingAction::Late(d) => {
+                let ms = d.as_secs_f64() * 1000.0;
+                assert!((ms - 40.0).abs() < 1e-2);
+            }
+            other => panic!("Expected Late(40ms), got {:?}", other),
+        }
+
+        // Trigger an underrun and verify reset() clears stats & underrun state cleanly
+        let _ = pacer.pull_frame(&spsc, &clock, now);
+        assert!(pacer.is_in_underrun());
+        assert_eq!(pacer.underruns(), 1);
+        assert_eq!(pacer.silence_injected(), 1);
+
+        pacer.reset();
+        assert!(!pacer.is_in_underrun());
+        assert_eq!(pacer.underruns(), 0);
+        assert_eq!(pacer.valid_frames(), 0);
+        assert_eq!(pacer.silence_injected(), 0);
+        assert_eq!(pacer.last_pts_ms(), 0);
+        // Output latency configuration persists across seek resets
+        assert_eq!(pacer.output_latency_ms(), 40);
     }
 }

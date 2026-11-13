@@ -2,6 +2,7 @@
 
 #![deny(warnings)]
 #![deny(missing_docs)]
+#![deny(unsafe_code)]
 
 pub mod barrier;
 pub mod client;
@@ -24,7 +25,8 @@ pub use ntp::{ProbeSample, Rfc5905Filter};
 pub use pll::{PllCorrection, PllSpeedController, PllZone};
 pub use timeline::RoomState;
 pub use transport::{ClientNode, ClientSession, HostServer, UdpSyncTransport};
-pub use upnp::{UpnpMappingGuard, UpnpStatus};
+pub use upnp::{spawn_upnp_mapping, UpnpMappingGuard, UpnpStatus};
 pub use wire::{
-    ChatMessagePayload, PacketPayload, PacketType, PeerStatusPayload, ReactionPayload, WirePacket,
+    ChatMessagePayload, PacketPayload, PacketType, PeerControlAction, PeerControlPayload,
+    PeerStatusPayload, ReactionPayload, WirePacket,
 };

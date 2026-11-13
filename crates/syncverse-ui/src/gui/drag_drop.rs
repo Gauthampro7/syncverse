@@ -14,7 +14,10 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 pub const PLAYLIST_EXTENSIONS: &[&str] = &["m3u", "m3u8"];
 
 /// Supported subtitle file extensions.
-pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa"];
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt", "ass", "ssa", "sub"];
+
+/// Alias for supported subtitle file extensions.
+pub const SUPPORTED_SUBTITLE_EXTS: &[&str] = SUBTITLE_EXTENSIONS;
 
 /// Checks if the given path is a supported media file.
 pub fn is_supported_media(path: &Path) -> bool {
@@ -109,17 +112,19 @@ impl DragDropHandler {
 
         let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("drag_hover_overlay")));
         let screen_rect = ctx.content_rect();
+        let clipped = painter.with_clip_rect(screen_rect);
 
         // 1. Semi-transparent dark background
-        painter.rect_filled(screen_rect, CornerRadius::ZERO, Color32::from_rgba_premultiplied(10, 10, 15, 210));
+        clipped.rect_filled(screen_rect, CornerRadius::ZERO, Color32::from_rgba_premultiplied(10, 10, 15, 210));
 
-        // 2. Centered dashed target box
+        // 2. Centered dashed target box (constrained strictly inside screen_rect)
         let center = screen_rect.center();
-        let box_size = Vec2::new(420.0, 220.0);
-        let box_rect = Rect::from_center_size(center, box_size);
+        let max_box = (screen_rect.size() - Vec2::new(24.0, 24.0)).max(Vec2::new(160.0, 100.0));
+        let box_size = Vec2::new(420.0, 220.0).min(max_box).min(screen_rect.size());
+        let box_rect = Rect::from_center_size(center, box_size).intersect(screen_rect);
 
-        painter.rect_filled(box_rect, CornerRadius::same(16), Color32::from_rgba_premultiplied(20, 25, 35, 240));
-        painter.rect_stroke(
+        clipped.rect_filled(box_rect, CornerRadius::same(16), Color32::from_rgba_premultiplied(20, 25, 35, 240));
+        clipped.rect_stroke(
             box_rect,
             CornerRadius::same(16),
             Stroke::new(2.5, Color32::from_rgb(56, 189, 248)),
@@ -127,27 +132,31 @@ impl DragDropHandler {
         );
 
         // 3. Icon & Instructional Text
-        painter.text(
-            center - Vec2::new(0.0, 30.0),
+        let icon_size = if box_size.y < 160.0 { 32.0 } else { 54.0 };
+        let title_size = if box_size.x < 340.0 { 14.0 } else { 20.0 };
+        let sub_size = if box_size.x < 340.0 { 10.0 } else { 12.0 };
+
+        clipped.text(
+            center - Vec2::new(0.0, box_size.y * 0.16),
             Align2::CENTER_CENTER,
             "📂",
-            FontId::proportional(54.0),
+            FontId::proportional(icon_size),
             Color32::from_rgb(56, 189, 248),
         );
 
-        painter.text(
-            center + Vec2::new(0.0, 25.0),
+        clipped.text(
+            center + Vec2::new(0.0, box_size.y * 0.11),
             Align2::CENTER_CENTER,
             "Drop Media to Play or Subtitles to Load",
-            FontId::proportional(20.0),
+            FontId::proportional(title_size),
             Color32::WHITE,
         );
 
-        painter.text(
-            center + Vec2::new(0.0, 55.0),
+        clipped.text(
+            center + Vec2::new(0.0, box_size.y * 0.25),
             Align2::CENTER_CENTER,
-            "Video: MKV, MP4, WebM, AVI | Subtitles: SRT, VTT, ASS, SSA",
-            FontId::proportional(12.0),
+            "Video: MKV, MP4, WebM, AVI | Subtitles: SRT, VTT, ASS, SSA, SUB",
+            FontId::proportional(sub_size),
             Color32::from_rgb(160, 160, 175),
         );
     }
@@ -172,7 +181,25 @@ mod tests {
         assert!(is_supported_subtitle(Path::new("subs.srt")));
         assert!(is_supported_subtitle(Path::new("subs.vtt")));
         assert!(is_supported_subtitle(Path::new("subs.ass")));
+        assert!(is_supported_subtitle(Path::new("subs.ssa")));
+        assert!(is_supported_subtitle(Path::new("/tmp/movie.sub")));
+        assert!(is_supported_subtitle(Path::new("/tmp/MOVIE.SUB")));
         assert!(!is_supported_subtitle(Path::new("subs.pdf")));
+        assert!(SUPPORTED_SUBTITLE_EXTS.contains(&"sub"));
+    }
+
+    #[test]
+    fn test_drag_drop_hover_overlay_compact_viewport_headless() {
+        let ctx = Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(360.0, 240.0))),
+            hovered_files: vec![egui::HoveredFile::default()],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ctx| {
+            DragDropHandler::render_hover_overlay(ctx);
+        });
+        out.textures_delta.clear();
     }
 
     #[test]

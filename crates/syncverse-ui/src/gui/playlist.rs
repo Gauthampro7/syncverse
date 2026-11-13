@@ -514,16 +514,21 @@ impl PlaylistDialog {
 
         let mut action = None;
         let mut is_open = self.is_open;
+        let screen = ctx.content_rect();
+        let max_size = (screen.size() - Vec2::new(24.0, 24.0)).max(Vec2::new(240.0, 160.0));
+        let default_size = Vec2::new(540.0, 420.0).min(max_size);
 
         egui::Window::new("🎶 Playlist Queue")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(540.0)
-            .default_height(420.0)
+            .vscroll(true)
+            .default_size(default_size)
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("➕ Add...").on_hover_text("Add media files to queue").clicked() {
                         action = Some(PlaylistAction::AddMediaFiles);
                     }
@@ -611,7 +616,13 @@ impl PlaylistDialog {
                                     remove_idx = Some(idx);
                                 }
 
-                                let resp = ui.selectable_label(is_current, text);
+                                let resp = ui
+                                    .scope(|ui| {
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                        ui.selectable_label(is_current, text)
+                                    })
+                                    .inner
+                                    .on_hover_text(&title);
                                 if resp.clicked() || resp.double_clicked() {
                                     selected_to_play = Some(idx);
                                 }
@@ -836,5 +847,40 @@ relative_song.flac
         assert_eq!(mgr.items[2].path, PathBuf::from("/absolute/path/song3.opus"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_playlist_dialog_viewport_clamped_with_long_titles() {
+        let ctx = Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(480.0, 320.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        let mut dlg = PlaylistDialog::new();
+        dlg.open();
+        let mut mgr = PlaylistManager::new();
+        mgr.add_file(PathBuf::from(
+            "/media/movies/An.Extremely.Long.Media.Filename.2026.2160p.UHD.BluRay.REMUX.HEVC.DTS-HD.MA.7.1-GROUP.mkv",
+        ));
+        mgr.select_index(0);
+
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(raw.clone(), |ctx| {
+                let _ = dlg.show(ctx, &mut mgr);
+            });
+            out.textures_delta.clear();
+        }
+
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::unique(Some("🎶 Playlist Queue"))))
+            .expect("PlaylistDialog area_rect must exist");
+        assert!(
+            screen.contains_rect(rect),
+            "PlaylistDialog {:?} escaped 480x320 {:?}",
+            rect,
+            screen
+        );
     }
 }

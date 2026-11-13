@@ -98,11 +98,33 @@ impl OsdOverlay {
     }
 
     /// Renders the floating translucent pill banner directly inside the video viewport rect.
+    ///
+    /// Delegates to [`OsdOverlay::show_in_viewport`] so text wrapping, clipping, and margin bounds
+    /// remain strictly contained within `viewport_rect`.
     pub fn render(&self, ui: &mut egui::Ui, viewport_rect: egui::Rect, now: Instant) {
+        self.show_in_viewport(ui, viewport_rect, now);
+    }
+
+    /// Renders the floating translucent pill banner strictly bounded inside `viewport_rect.shrink(16.0)`
+    /// at the top-left of the video viewport so it never collides with top banners or the sidebar.
+    pub fn show_in_viewport(&self, ui: &mut egui::Ui, viewport_rect: egui::Rect, now: Instant) {
         let (text, alpha) = match self.active_notification(now) {
             Some((t, a)) => (t, a),
             None => return,
         };
+
+        if !viewport_rect.is_positive() || viewport_rect.width() < 24.0 || viewport_rect.height() < 24.0 {
+            return;
+        }
+
+        let bounded_rect = if viewport_rect.width() > 48.0 && viewport_rect.height() > 48.0 {
+            viewport_rect.shrink(16.0)
+        } else {
+            viewport_rect.shrink(4.0)
+        };
+
+        let padding = egui::vec2(14.0, 8.0);
+        let max_text_width = (bounded_rect.width() - padding.x * 2.0).max(40.0);
 
         let font_id = egui::FontId::proportional(15.0);
         let text_color = egui::Color32::from_rgba_premultiplied(
@@ -111,14 +133,13 @@ impl OsdOverlay {
             (255.0 * alpha).round() as u8,
             (255.0 * alpha).round() as u8,
         );
-        let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+        let galley = ui
+            .painter()
+            .layout(text.to_string(), font_id, text_color, max_text_width);
 
-        let padding = egui::vec2(14.0, 8.0);
-        let pill_size = galley.size() + padding * 2.0;
-
-        // Position at top-left of viewport_rect with 24pt inset margin
-        let top_left = viewport_rect.min + egui::vec2(24.0, 24.0);
-        let pill_rect = egui::Rect::from_min_size(top_left, pill_size);
+        let pill_w = (galley.size().x + padding.x * 2.0).min(bounded_rect.width());
+        let pill_h = (galley.size().y + padding.y * 2.0).min(bounded_rect.height());
+        let pill_rect = egui::Rect::from_min_size(bounded_rect.min, egui::vec2(pill_w, pill_h));
 
         // Dark semi-transparent background: #0f172a with ~85% opacity
         let bg_color = egui::Color32::from_rgba_premultiplied(
@@ -138,27 +159,39 @@ impl OsdOverlay {
             ),
         );
 
-        ui.painter().rect(
+        let outer_clip = bounded_rect.intersect(ui.clip_rect());
+        ui.painter().with_clip_rect(outer_clip).rect(
             pill_rect,
             egui::CornerRadius::same(6),
             bg_color,
             border_stroke,
             egui::StrokeKind::Outside,
         );
-        let text_pos = top_left + padding;
-        ui.painter().galley(text_pos, galley, egui::Color32::TRANSPARENT);
+        let text_pos = pill_rect.min + padding;
+        let text_clip = pill_rect.shrink(2.0).intersect(ui.clip_rect());
+        ui.painter()
+            .with_clip_rect(text_clip)
+            .galley(text_pos, galley, egui::Color32::TRANSPARENT);
     }
 
-    /// Renders the floating translucent pill banner using an `egui::Area` anchored at top-left.
+    /// Renders the floating translucent pill banner using an `egui::Area` constrained to
+    /// `ctx.content_rect()` on `Order::Middle` so it never overflows narrow windows or covers modals.
     pub fn show(&self, ctx: &egui::Context, now: Instant) {
         let (text, alpha) = match self.active_notification(now) {
             Some((t, a)) => (t, a),
             None => return,
         };
 
+        let content_rect = ctx.content_rect();
+        let max_pill_w = (content_rect.width() - 48.0).max(120.0);
+        let max_text_w = (max_pill_w - 28.0).max(60.0);
+        let offset_x = if content_rect.width() < 280.0 { 12.0 } else { 24.0 };
+        let offset_y = if content_rect.height() < 200.0 { 24.0 } else { 48.0 };
+
         egui::Area::new(egui::Id::unique("osd_overlay_pill_area"))
-            .anchor(egui::Align2::LEFT_TOP, [24.0, 48.0])
-            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, [offset_x, offset_y])
+            .order(egui::Order::Middle)
+            .constrain_to(content_rect)
             .interactable(false)
             .show(ctx, |ui| {
                 let bg_color = egui::Color32::from_rgba_premultiplied(
@@ -189,11 +222,15 @@ impl OsdOverlay {
                     .corner_radius(egui::CornerRadius::same(6))
                     .inner_margin(egui::Margin::symmetric(14, 8))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(text)
-                                .font(egui::FontId::proportional(15.0))
-                                .strong()
-                                .color(text_color),
+                        ui.set_max_width(max_text_w);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .font(egui::FontId::proportional(15.0))
+                                    .strong()
+                                    .color(text_color),
+                            )
+                            .wrap(),
                         );
                     });
             });
@@ -420,5 +457,43 @@ mod tests {
         osd.clear();
         assert_eq!(osd.opacity(t0), 0.0);
         assert!(osd.active_notification(t0).is_none());
+    }
+
+    #[test]
+    fn test_osd_headless_show_and_viewport_across_widths_and_dpi() {
+        let widths = [
+            200.0, 320.0, 480.0, 560.0, 640.0, 700.0, 800.0, 930.0, 1024.0, 1280.0, 1920.0,
+        ];
+        let dpis = [1.0_f32, 1.5, 2.0];
+
+        let mut osd = OsdOverlay::new();
+        let now = Instant::now();
+        osd.show_notification(
+            "Audio: Track 2/5 - Japanese 5.1 Surround (Dolby Digital Plus / E-AC3, +50 ms delay)",
+            now,
+        );
+
+        for &ppp in &dpis {
+            for &w in &widths {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 360.0));
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+
+                let mut output = ctx.run_ui(raw_input, |ui| {
+                    let viewport_rect = egui::Rect::from_min_size(
+                        egui::pos2(0.0, 32.0),
+                        egui::vec2((w - 20.0).max(40.0), 240.0),
+                    );
+                    osd.show_in_viewport(ui, viewport_rect, now);
+                    osd.show(ui.ctx(), now);
+                });
+                output.textures_delta.clear();
+            }
+        }
     }
 }

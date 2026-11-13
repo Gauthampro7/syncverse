@@ -269,6 +269,10 @@ pub struct SidebarState {
     pub pending_local_records: Vec<ChatRecord>,
     /// Flag requesting the parent application to clear local chat history (/clear command).
     pub pending_clear_chat: bool,
+    /// Pending seek timestamp (milliseconds) requested via chat `[MM:SS]` link or `/seek` command.
+    pub pending_seek_ms: Option<u64>,
+    /// When true, suppresses rendering the collapsed floating toggle handle (e.g., behind modals or hidden fullscreen controls).
+    pub suppress_floating_handle: bool,
 }
 
 impl Default for SidebarState {
@@ -296,6 +300,8 @@ impl Default for SidebarState {
             chat_index: InvertedIndexFts::new(),
             pending_local_records: Vec::new(),
             pending_clear_chat: false,
+            pending_seek_ms: None,
+            suppress_floating_handle: false,
         }
     }
 }
@@ -320,15 +326,22 @@ impl SidebarState {
         command_tx: &Sender<PlayerCommand>,
     ) {
         if !self.is_expanded {
-            let ctx = ui.ctx().clone();
-            self.render_collapsed_handle(&ctx);
+            if !self.suppress_floating_handle {
+                let ctx = ui.ctx().clone();
+                self.render_collapsed_handle(&ctx);
+            }
             return;
         }
 
+        let content_w = ui.ctx().content_rect().width().max(1.0);
+        let max_w = (content_w * 0.42).clamp(220.0, 420.0);
+        let min_w = 220.0_f32.min(max_w);
+        let default_w = self.panel_width.clamp(min_w, max_w);
+
         egui::Panel::right("watch_party_sidebar")
             .resizable(true)
-            .default_size(self.panel_width)
-            .size_range(240.0..=450.0)
+            .default_size(default_w)
+            .size_range(min_w..=max_w)
             .show(ui, |ui| {
                 self.show_content(ui, snapshot, chat_records, command_tx);
             });
@@ -342,6 +355,27 @@ impl SidebarState {
         chat_records: &[ChatRecord],
         command_tx: &Sender<PlayerCommand>,
     ) {
+        // --- 0. DOCK CHAT INPUT & QUICK REACTION FOOTER FIRST AT BOTTOM ---
+        let ctx = ui.ctx().clone();
+        let footer_frame = egui::Frame::new()
+            .fill(ui.style().visuals.panel_fill)
+            .inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 6,
+                bottom: 2,
+            });
+        egui::Panel::bottom("watch_party_sidebar_footer")
+            .show_separator_line(true)
+            .frame(footer_frame)
+            .show(ui, |ui| {
+                self.render_input_bar(ui, &ctx, snapshot, command_tx);
+            });
+
+        // Prevent upper/chat widgets from ever painting over the docked footer on extreme heights.
+        let body_bounds = ui.available_rect_before_wrap();
+        ui.shrink_clip_rect(body_bounds);
+
         ui.add_space(4.0);
 
         // --- 1. HEADER & COLLAPSE BUTTON ---
@@ -361,7 +395,7 @@ impl SidebarState {
 
         if !is_in_room {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(egui::RichText::new("🌐 Host Room").strong().color(Color32::from_rgb(74, 222, 128)))
                     .on_hover_text("Host a synchronized watch party room on this computer")
                     .clicked()
@@ -455,19 +489,21 @@ impl SidebarState {
             });
         });
 
-        // Collapsible Search Bar at top of chat area
+        // Collapsible Search Bar at top of chat area (DPI-safe right-to-left layout)
         if self.show_search {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("🔍").small());
-                ui.add(
-                    TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search messages (FTS, hashtags, CJK)...")
-                        .desired_width(ui.available_width() - 48.0),
-                );
-                if !self.search_query.is_empty() && ui.small_button("Clear").clicked() {
-                    self.search_query.clear();
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.search_query.is_empty() && ui.small_button("Clear").clicked() {
+                        self.search_query.clear();
+                    }
+                    ui.add(
+                        TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search messages (FTS, hashtags, CJK)...")
+                            .desired_width(ui.available_width()),
+                    );
+                });
             });
             ui.add_space(2.0);
         }
@@ -487,15 +523,18 @@ impl SidebarState {
             );
         }
 
-        let available_height = (ui.available_height() - 40.0).max(60.0);
+        let mut clicked_seek_ms: Option<u64> = None;
+        let remaining_height = ui.available_height().max(0.0);
         ScrollArea::vertical()
-            .max_height(available_height)
+            .id_salt("watch_party_chat_scroll")
+            .max_height(remaining_height)
+            .min_scrolled_height(0.0)
             .auto_shrink([false, false])
             .stick_to_bottom(self.autoscroll && (!self.show_search || query_trimmed.is_empty()))
             .show(ui, |ui| {
                 if display_records.is_empty() {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(20.0);
+                        ui.add_space(12.0);
                         if self.show_search && !query_trimmed.is_empty() {
                             ui.label(
                                 egui::RichText::new("No matching messages found.")
@@ -509,24 +548,28 @@ impl SidebarState {
                     });
                 } else {
                     for record in display_records {
-                        self.render_chat_message(ui, record, command_tx);
+                        if let Some(target_ms) = self.render_chat_message(ui, record, command_tx) {
+                            clicked_seek_ms = Some(target_ms);
+                        }
                         ui.add_space(4.0);
                     }
                 }
             });
 
-        ui.add_space(4.0);
-
-        // --- 6. CHAT INPUT & SLASH COMMAND PROMPT ---
-        let ctx = ui.ctx().clone();
-        self.render_input_bar(ui, &ctx, snapshot, command_tx);
+        if let Some(target_ms) = clicked_seek_ms {
+            self.pending_seek_ms = Some(target_ms);
+        }
     }
 
     /// Renders a sleek floating collapsed toggle button docked on the right window edge.
     pub fn render_collapsed_handle(&mut self, ctx: &Context) {
+        if self.suppress_floating_handle {
+            return;
+        }
+
         egui::Area::new(egui::Id::unique("sidebar_collapsed_floating_handle"))
             .anchor(Align2::RIGHT_CENTER, [-4.0, 0.0])
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .show(ctx, |ui| {
                 let button_size = Vec2::new(30.0, 84.0);
                 let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
@@ -568,7 +611,7 @@ impl SidebarState {
             SyncBadgeColor::Red => ("● DESYNC", Color32::from_rgb(239, 68, 68)),
         };
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(badge_text).strong().color(badge_color));
             ui.label(format!("| RTT: {:.1}ms", rtt_ms));
             ui.label(format!("| e(t): {:+.1}ms", phase_err_ms));
@@ -586,7 +629,7 @@ impl SidebarState {
 
         ui.collapsing(format!("Members ({})", self.members.len()), |ui| {
             // 1. Interactive readiness toggle and Host bypass controls
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .checkbox(&mut self.local_ready, "Ready to Watch")
                     .on_hover_text("Signal to room peers that you are ready to watch")
@@ -609,137 +652,124 @@ impl SidebarState {
 
             // Find local member to compare against
             let local_member = self.members.iter().find(|m| m.is_local).cloned();
+            let members_max_h = (ui.available_height() * 0.30).clamp(0.0, 140.0);
 
-            for member in &self.members {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        if member.is_host {
-                            ui.label(egui::RichText::new("★").color(Color32::from_rgb(250, 204, 21)));
-                        } else {
-                            ui.label("👤");
-                        }
-
-                        if member.is_local {
-                            ui.label(
-                                egui::RichText::new(format!("{} (You)", member.username))
-                                    .strong()
-                                    .color(Color32::from_rgb(96, 165, 250)),
-                            );
-                        } else {
-                            ui.label(&member.username);
-                        }
-
-                        // Readiness badge: [✓ Ready] (green) vs [⏳ Not Ready] (amber)
-                        if member.is_ready {
-                            ui.label(
-                                egui::RichText::new("[✓ Ready]")
-                                    .color(Color32::from_rgb(34, 197, 94))
-                                    .small(),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("[⏳ Not Ready]")
-                                    .color(Color32::from_rgb(245, 158, 11))
-                                    .small(),
-                            );
-                        }
-
-                        if member.rtt_ms > 0.0 {
+            ScrollArea::vertical()
+                .id_salt("watch_party_members_scroll")
+                .max_height(members_max_h)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for member in &self.members {
+                        ui.group(|ui| {
+                            // Row 1: RTT & Readiness badge right-aligned, icon + truncated username left-aligned
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{:.0}ms", member.rtt_ms))
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
-                            });
-                        }
-                    });
-
-                    // Media status & diagnostic badge row
-                    ui.horizontal(|ui| {
-                        if let Some(ref fname) = member.file_name {
-                            let dur_str = member
-                                .duration_ms
-                                .map(format_duration_hms)
-                                .unwrap_or_else(|| "--:--:--".to_string());
-                            ui.label(
-                                egui::RichText::new(format!("📄 {} ({})", fname, dur_str))
-                                    .small()
-                                    .color(Color32::from_rgb(203, 213, 225)),
-                            );
-
-                            // Compare peer media against local media
-                            if !member.is_local {
-                                if let Some(ref local) = local_member {
-                                    let match_st = evaluate_file_match_with_hash(
-                                        local.file_name.as_deref(),
-                                        local.duration_ms,
-                                        local.media_hash,
-                                        Some(fname.as_str()),
-                                        member.duration_ms,
-                                        member.media_hash,
+                                if member.rtt_ms > 0.0 {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.0}ms", member.rtt_ms))
+                                            .small()
+                                            .color(Color32::GRAY),
                                     );
-                                    match match_st {
-                                        FileMatchStatus::ExactMatch => {
-                                            ui.label(
-                                                egui::RichText::new("[Exact Match ✔]")
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgb(34, 197, 94)),
+                                }
+
+                                if member.is_ready {
+                                    ui.label(
+                                        egui::RichText::new("[✓ Ready]")
+                                            .color(Color32::from_rgb(34, 197, 94))
+                                            .small(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("[⏳ Not Ready]")
+                                            .color(Color32::from_rgb(245, 158, 11))
+                                            .small(),
+                                    );
+                                }
+
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    if member.is_host {
+                                        ui.label(egui::RichText::new("★").color(Color32::from_rgb(250, 204, 21)));
+                                    } else {
+                                        ui.label("👤");
+                                    }
+
+                                    let name_rich = if member.is_local {
+                                        egui::RichText::new(format!("{} (You)", member.username))
+                                            .strong()
+                                            .color(Color32::from_rgb(96, 165, 250))
+                                    } else {
+                                        egui::RichText::new(&member.username)
+                                    };
+                                    ui.add(egui::Label::new(name_rich).truncate())
+                                        .on_hover_text(&member.username);
+                                });
+                            });
+
+                            // Row 2: Media status & diagnostic badge (match badge R-to-L, truncated filename L-to-R)
+                            if let Some(ref fname) = member.file_name {
+                                let dur_str = member
+                                    .duration_ms
+                                    .map(format_duration_hms)
+                                    .unwrap_or_else(|| "--:--:--".to_string());
+                                let file_display = format!("📄 {} ({})", fname, dur_str);
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if !member.is_local {
+                                        if let Some(ref local) = local_member {
+                                            let match_st = evaluate_file_match_with_hash(
+                                                local.file_name.as_deref(),
+                                                local.duration_ms,
+                                                local.media_hash,
+                                                Some(fname.as_str()),
+                                                member.duration_ms,
+                                                member.media_hash,
                                             );
-                                        }
-                                        FileMatchStatus::Variation => {
-                                            ui.label(
-                                                egui::RichText::new("[⚠️ Variation]")
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgb(245, 158, 11)),
-                                            );
-                                        }
-                                        FileMatchStatus::DesyncAlert => {
-                                            ui.label(
-                                                egui::RichText::new("[❌ Desync Alert]")
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgb(239, 68, 68)),
-                                            );
-                                        }
-                                        FileMatchStatus::Match => {
-                                            ui.label(
-                                                egui::RichText::new("[Match ✔]")
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgb(34, 197, 94)),
-                                            );
-                                        }
-                                        FileMatchStatus::Mismatch => {
-                                            ui.label(
-                                                egui::RichText::new("[⚠️ Mismatch]")
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgb(245, 158, 11)),
-                                            );
-                                        }
-                                        FileMatchStatus::NoFileLoaded => {
-                                            ui.label(
-                                                egui::RichText::new("[⏳ No file loaded]")
-                                                    .small()
-                                                    .color(Color32::from_rgb(148, 163, 184)),
-                                            );
+                                            let (badge_color, strong) = match match_st {
+                                                FileMatchStatus::ExactMatch | FileMatchStatus::Match => {
+                                                    (Color32::from_rgb(34, 197, 94), true)
+                                                }
+                                                FileMatchStatus::Variation | FileMatchStatus::Mismatch => {
+                                                    (Color32::from_rgb(245, 158, 11), true)
+                                                }
+                                                FileMatchStatus::DesyncAlert => {
+                                                    (Color32::from_rgb(239, 68, 68), true)
+                                                }
+                                                FileMatchStatus::NoFileLoaded => {
+                                                    (Color32::from_rgb(148, 163, 184), false)
+                                                }
+                                            };
+                                            let mut badge_rich = egui::RichText::new(match_st.label())
+                                                .small()
+                                                .color(badge_color);
+                                            if strong {
+                                                badge_rich = badge_rich.strong();
+                                            }
+                                            ui.label(badge_rich);
                                         }
                                     }
-                                }
+
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&file_display)
+                                                    .small()
+                                                    .color(Color32::from_rgb(203, 213, 225)),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&file_display);
+                                    });
+                                });
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("[⏳ No file loaded]")
+                                        .small()
+                                        .color(Color32::from_rgb(148, 163, 184)),
+                                );
                             }
-                        } else {
-                            ui.label(
-                                egui::RichText::new("[⏳ No file loaded]")
-                                    .small()
-                                    .color(Color32::from_rgb(148, 163, 184)),
-                            );
-                        }
-                    });
+                        });
+                    }
                 });
-            }
         });
     }
 
@@ -748,26 +778,38 @@ impl SidebarState {
         ui.group(|ui| {
             ui.label(egui::RichText::new("📊 Active Poll").strong().color(Color32::from_rgb(56, 189, 248)));
             ui.label(&poll.question);
-            for (idx, opt) in poll.options.iter().enumerate() {
-                let votes = poll.votes.get(idx).copied().unwrap_or(0);
-                if ui.button(format!("{} ({} votes)", opt, votes)).clicked() {
-                    if let Some(p) = &mut self.active_poll {
-                        if let Some(v) = p.votes.get_mut(idx) {
-                            *v += 1;
+            let poll_max_h = (ui.available_height() * 0.25).clamp(0.0, 120.0);
+            ScrollArea::vertical()
+                .id_salt("watch_party_poll_scroll")
+                .max_height(poll_max_h)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (idx, opt) in poll.options.iter().enumerate() {
+                        let votes = poll.votes.get(idx).copied().unwrap_or(0);
+                        if ui.button(format!("{} ({} votes)", opt, votes)).clicked() {
+                            if let Some(p) = &mut self.active_poll {
+                                if let Some(v) = p.votes.get_mut(idx) {
+                                    *v += 1;
+                                }
+                            }
                         }
                     }
-                }
-            }
+                });
         });
     }
 
     /// Renders an individual chat message record with dual timestamps.
+    ///
+    /// Returns `Some(target_ms)` if the user clicked an interactive `[MM:SS]` timestamp link.
     fn render_chat_message(
         &self,
         ui: &mut Ui,
         record: &ChatRecord,
         command_tx: &Sender<PlayerCommand>,
-    ) {
+    ) -> Option<u64> {
+        let mut requested_seek_ms = None;
+
         ui.horizontal_wrapped(|ui| {
             // 1. Wall-clock timestamp t_wall: HH:MM:SS
             let wall_sec = (record.wall_timestamp_utc_ms / 1000) % 86400;
@@ -800,6 +842,7 @@ impl SidebarState {
 
                 if btn.on_hover_text("Click to seek to this timestamp").clicked() {
                     let _ = command_tx.send(PlayerCommand::Seek(record.media_timestamp_ms));
+                    requested_seek_ms = Some(record.media_timestamp_ms);
                 }
             } else {
                 ui.label(
@@ -840,6 +883,8 @@ impl SidebarState {
                 }
             }
         });
+
+        requested_seek_ms
     }
 
     /// Renders the bottom chat and slash-command input bar.
@@ -850,26 +895,35 @@ impl SidebarState {
         snapshot: &PlayerUiSnapshot,
         command_tx: &Sender<PlayerCommand>,
     ) {
-        // Quick reaction bar
-        ui.horizontal(|ui| {
-            for &(emoji, name) in crate::gui::reactions::REACTION_PRESETS {
-                if ui.small_button(emoji).on_hover_text(format!("React: {} (Hotkey 1-6)", name)).clicked() {
-                    let _ = command_tx.send(PlayerCommand::SendReaction(emoji.to_string()));
+        // Quick reaction bar (wrapped with compact spacing so it never overflows narrow sidebars)
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.horizontal_wrapped(|ui| {
+                for &(emoji, name) in crate::gui::reactions::REACTION_PRESETS {
+                    if ui
+                        .small_button(emoji)
+                        .on_hover_text(format!("React: {} (Hotkey 1-6)", name))
+                        .clicked()
+                    {
+                        let _ = command_tx.send(PlayerCommand::SendReaction(emoji.to_string()));
+                    }
                 }
-            }
+            });
         });
         ui.add_space(2.0);
 
-        ui.horizontal(|ui| {
-            let input_response = ui.add_sized(
-                [ui.available_width() - 55.0, 28.0],
+        // DPI-safe right-to-left layout: allocate Send button first, then TextEdit fills remaining width.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let send_clicked = ui.button("Send").clicked();
+            let input_response = ui.add(
                 TextEdit::singleline(&mut self.input_text)
                     .hint_text("Type chat or /command...")
-                    .font(egui::TextStyle::Body),
+                    .font(egui::TextStyle::Body)
+                    .desired_width(ui.available_width()),
             );
 
-            let enter_pressed = input_response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            let send_clicked = ui.button("Send").clicked();
+            let enter_pressed =
+                input_response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
 
             if (enter_pressed || send_clicked) && !self.input_text.trim().is_empty() {
                 let msg = self.input_text.trim().to_string();
@@ -926,6 +980,7 @@ impl SidebarState {
             match self.dispatcher.dispatch(&text, Some(current_pts_ms)) {
                 Ok(action) => match action {
                     DispatchAction::Seek { target_pts_ms } => {
+                        self.pending_seek_ms = Some(target_pts_ms);
                         let _ = command_tx.send(PlayerCommand::Seek(target_pts_ms));
                     }
                     DispatchAction::Bookmark(_) | DispatchAction::Clip(_) => {
@@ -1213,5 +1268,217 @@ mod tests {
 
         let results_none = state.chat_index.search("nonexistent");
         assert_eq!(results_none.len(), 0);
+    }
+
+    fn make_stress_sidebar_and_records() -> (SidebarState, Vec<ChatRecord>) {
+        let mut state = SidebarState::new();
+        state.is_expanded = true;
+        state.show_search = true;
+        state.search_query = "scene".to_string();
+        state.active_poll = Some(ActivePoll {
+            poll_id: 1,
+            question: "Which scene should we rewatch next?".to_string(),
+            options: vec![
+                "Opening Sequence".to_string(),
+                "Climax Duel".to_string(),
+                "Post-Credits Teaser".to_string(),
+            ],
+            votes: vec![3, 7, 2],
+            created_at_ms: 1_700_000_000_000,
+        });
+
+        let long_filename_180 = format!(
+            "{}_4k_2160p_uhd_bluray_remux_hevc_dts_hd_ma_7_1_hdr10plus.mkv",
+            "extremely_long_movie_release_title_segment".repeat(3)
+        );
+        assert!(long_filename_180.len() >= 180);
+
+        state.members = vec![
+            RoomMember::with_media_and_hash(
+                "VeryLongLocalHostUsername_AlphaBetaGamma".to_string(),
+                true,
+                true,
+                0.0,
+                Some(long_filename_180.clone()),
+                Some(8_130_000),
+                Some(42_000_000_000),
+                true,
+                Some([7u8; 32]),
+            ),
+            RoomMember::with_media_and_hash(
+                "VeryLongPeerUsername_DeltaEpsilonZeta".to_string(),
+                false,
+                false,
+                48.0,
+                Some(long_filename_180),
+                Some(8_130_000),
+                Some(42_000_000_000),
+                true,
+                Some([7u8; 32]),
+            ),
+            RoomMember::with_media_and_hash(
+                "PeerThree_WithDifferentCut".to_string(),
+                false,
+                false,
+                142.0,
+                Some("another_extremely_long_directors_cut_edition_2026_1080p_web_dl_ddp5_1.mp4".to_string()),
+                Some(8_400_000),
+                Some(12_000_000_000),
+                false,
+                Some([9u8; 32]),
+            ),
+        ];
+
+        let mut records = Vec::with_capacity(50);
+        for i in 0..50u64 {
+            records.push(ChatRecord {
+                record_type: 1,
+                flags: 0,
+                wall_timestamp_utc_ms: 1_700_000_000_000 + i * 1500,
+                media_timestamp_ms: i * 12_000,
+                sender_id: [(i % 250) as u8; 16],
+                sender_name: if i % 2 == 0 {
+                    state.local_username.clone()
+                } else {
+                    "PeerTwo".to_string()
+                },
+                payload: format!(
+                    "Message #{i}: Great scene transition at timestamp with lots of commentary!"
+                )
+                .into_bytes(),
+            });
+        }
+
+        (state, records)
+    }
+
+    #[test]
+    fn test_sidebar_responsive_layout_no_overflow_headless() {
+        let sizes = [
+            egui::vec2(640.0, 360.0),
+            egui::vec2(480.0, 320.0),
+            egui::vec2(1280.0, 720.0),
+        ];
+        let dpis = [1.0_f32, 2.0_f32];
+
+        for size in sizes {
+            for dpi in dpis {
+                let (mut state, records) = make_stress_sidebar_and_records();
+                let snapshot = PlayerUiSnapshot::default();
+                let (tx, _rx) = std::sync::mpsc::channel();
+
+                let ctx = Context::default();
+
+                let window_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let mut remaining_rect = egui::Rect::NOTHING;
+
+                // Run two frames so Panel/ScrollArea memory stabilizes
+                for _ in 0..2 {
+                    let mut raw_input = egui::RawInput {
+                        screen_rect: Some(window_rect),
+                        ..Default::default()
+                    };
+                    if let Some(vp) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
+                        vp.native_pixels_per_point = Some(dpi);
+                    }
+                    let mut output = ctx.run_ui(raw_input, |ui| {
+                        state.show(ui, &snapshot, &records, &tx);
+                        remaining_rect = ui.available_rect_before_wrap();
+                        egui::CentralPanel::default().show(ui, |_ui| {});
+                    });
+                    output.textures_delta.clear();
+
+                    let sidebar_panel_rect = egui::Rect::from_min_max(
+                        egui::pos2(remaining_rect.right(), window_rect.top()),
+                        window_rect.max,
+                    );
+
+                    // Ensure central viewport is never crushed on narrow windows
+                    assert!(
+                        remaining_rect.width() >= 200.0,
+                        "central viewport crushed ({}px) at {:?} dpi={}",
+                        remaining_rect.width(),
+                        size,
+                        dpi
+                    );
+
+                    // Ensure sidebar width respects responsive clamping [220, 420] and <= 42% (when > 220/0.42)
+                    let expected_max_w = (size.x * 0.42).clamp(220.0, 420.0);
+                    assert!(
+                        sidebar_panel_rect.width() <= expected_max_w + 1.0,
+                        "sidebar width {} exceeded expected max {} at {:?}",
+                        sidebar_panel_rect.width(),
+                        expected_max_w,
+                        size
+                    );
+
+                    // Ensure every painted clip_rect stays strictly within the window rect
+                    for clipped in &output.shapes {
+                        assert!(
+                            clipped.clip_rect.left() >= window_rect.left() - 1.0
+                                && clipped.clip_rect.right() <= window_rect.right() + 1.0
+                                && clipped.clip_rect.top() >= window_rect.top() - 1.0
+                                && clipped.clip_rect.bottom() <= window_rect.bottom() + 1.0,
+                            "shape clip_rect {:?} escaped window_rect {:?} at dpi={}",
+                            clipped.clip_rect,
+                            window_rect,
+                            dpi
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sidebar_collapsed_handle_suppression_and_pending_seek() {
+        let mut state = SidebarState::new();
+        assert!(!state.is_expanded);
+        assert!(!state.suppress_floating_handle);
+        assert_eq!(state.pending_seek_ms, None);
+
+        let snapshot = PlayerUiSnapshot::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = Context::default();
+        let window_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // 1. Collapsed handle renders when not suppressed
+        let mut out_visible = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(window_rect),
+                ..Default::default()
+            },
+            |ui| {
+                state.show(ui, &snapshot, &[], &tx);
+            },
+        );
+        out_visible.textures_delta.clear();
+        assert!(
+            !out_visible.shapes.is_empty(),
+            "collapsed handle should render when suppress_floating_handle is false"
+        );
+
+        // 2. Collapsed handle is suppressed when suppress_floating_handle is true
+        state.suppress_floating_handle = true;
+        let mut out_suppressed = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(window_rect),
+                ..Default::default()
+            },
+            |ui| {
+                state.show(ui, &snapshot, &[], &tx);
+            },
+        );
+        out_suppressed.textures_delta.clear();
+        assert!(
+            out_suppressed.shapes.is_empty(),
+            "collapsed handle must emit zero shapes when suppress_floating_handle is true"
+        );
+
+        // 3. Submitting /seek sets pending_seek_ms AND emits PlayerCommand::Seek
+        state.handle_message_submit("/seek 01:30".to_string(), &snapshot, &tx);
+        assert_eq!(state.pending_seek_ms, Some(90_000));
+        let cmd = rx.try_recv().expect("expected PlayerCommand::Seek");
+        assert!(matches!(cmd, PlayerCommand::Seek(90_000)));
     }
 }

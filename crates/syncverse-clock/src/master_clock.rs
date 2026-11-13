@@ -1,6 +1,6 @@
 //! Master monotonic clock, continuous PTS re-anchoring via SeqLock, and presentation scheduling.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,8 @@ pub struct MasterClock {
     seq: AtomicUsize,
     writer_lock: Mutex<()>,
     state: std::cell::UnsafeCell<ClockStateSnapshot>,
+    seek_generation: AtomicU64,
+    audio_latency_ns: AtomicU64,
 }
 
 // SAFETY: Synchronization is guaranteed by the SeqLock protocol: readers only observe
@@ -67,7 +69,56 @@ impl MasterClock {
                 speed: initial_speed,
                 state: initial_state,
             }),
+            seek_generation: AtomicU64::new(0),
+            audio_latency_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Returns the monotonically increasing seek/epoch generation counter.
+    ///
+    /// Video and audio consumers compare frame generations against this epoch to
+    /// discard stale pre-seek frames immediately without lock contention.
+    #[inline]
+    pub fn seek_generation(&self) -> u64 {
+        self.seek_generation.load(Ordering::Acquire)
+    }
+
+    /// Atomically increments the seek generation epoch and returns the new value.
+    #[inline]
+    pub fn bump_seek_generation(&self) -> u64 {
+        self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Updates the reported hardware audio output latency in milliseconds.
+    ///
+    /// Video presentation pacing subtracts this latency so visual frames align
+    /// with when audio samples actually reach the physical output device.
+    #[inline]
+    pub fn set_audio_latency_ms(&self, latency_ms: u64) {
+        self.audio_latency_ns
+            .store(latency_ms.saturating_mul(1_000_000), Ordering::Release);
+    }
+
+    /// Returns the currently configured hardware audio output latency in milliseconds.
+    #[inline]
+    pub fn audio_latency_ms(&self) -> u64 {
+        self.audio_latency_ns.load(Ordering::Acquire) / 1_000_000
+    }
+
+    /// Returns the current media presentation timestamp in whole milliseconds at `now`.
+    #[inline]
+    pub fn current_pts_ms(&self, now: Instant) -> u64 {
+        self.current_pts(now).max(0.0).round() as u64
+    }
+
+    /// Returns the latency-compensated video presentation target timestamp in milliseconds at `now`.
+    ///
+    /// Subtracts the active hardware audio output buffer latency from `current_pts_ms(now)`
+    /// so video frames wait for queued audio to drain to the speaker.
+    #[inline]
+    pub fn effective_video_pts_ms(&self, now: Instant) -> u64 {
+        self.current_pts_ms(now)
+            .saturating_sub(self.audio_latency_ms())
     }
 
     /// Returns the current media presentation timestamp in milliseconds at wall instant `now`.
@@ -194,7 +245,7 @@ impl MasterClock {
         self.seq.store(s.wrapping_add(2), Ordering::Release);
     }
 
-    /// Hard seeks presentation to a target timestamp.
+    /// Hard seeks presentation to a target timestamp and increments the seek generation epoch.
     pub fn seek_to(&self, target_pts_ms: f64, now: Instant) {
         let _guard = self.writer_lock.lock().unwrap();
         let s = self.seq.load(Ordering::Relaxed);
@@ -207,10 +258,14 @@ impl MasterClock {
             snap.anchor_wall = now;
         }
 
+        self.seek_generation.fetch_add(1, Ordering::AcqRel);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
     }
 
     /// Evaluates the presentation scheduling action for a frame with timestamp `frame_pts_ms`.
+    ///
+    /// Accounts for the configured hardware audio output latency (`audio_latency_ms`) so
+    /// visual frame presentation tracks when audio actually emerges from the output device.
     ///
     /// Decision Window:
     /// - Early (Delta > +10ms): Wait(Duration)
@@ -222,7 +277,8 @@ impl MasterClock {
         frame_pts_ms: u64,
         now: Instant,
     ) -> PresentationAction {
-        let master_pts = self.current_pts(now);
+        let audio_latency_ms = (self.audio_latency_ns.load(Ordering::Acquire) as f64) / 1_000_000.0;
+        let master_pts = self.current_pts(now) - audio_latency_ms;
         let delta_ms = (frame_pts_ms as f64) - master_pts;
 
         if delta_ms > 10.0 {
@@ -307,5 +363,43 @@ mod tests {
 
         clock.reanchor(now, 1.04);
         assert!((clock.speed() - 1.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_generation_and_audio_latency_compensation() {
+        let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Paused);
+        let now = Instant::now();
+
+        assert_eq!(clock.seek_generation(), 0);
+        assert_eq!(clock.audio_latency_ms(), 0);
+        assert_eq!(clock.current_pts_ms(now), 1000);
+        assert_eq!(clock.effective_video_pts_ms(now), 1000);
+
+        // Explicit bump
+        assert_eq!(clock.bump_seek_generation(), 1);
+        assert_eq!(clock.seek_generation(), 1);
+
+        // seek_to also increments seek_generation
+        clock.seek_to(5000.0, now);
+        assert_eq!(clock.seek_generation(), 2);
+        assert_eq!(clock.current_pts_ms(now), 5000);
+
+        // Set 45ms hardware audio latency -> effective video PTS lags master by 45ms
+        clock.set_audio_latency_ms(45);
+        assert_eq!(clock.audio_latency_ms(), 45);
+        assert_eq!(clock.effective_video_pts_ms(now), 4955);
+
+        // Frame at 5000ms is 45ms ahead of latency-compensated video clock (4955ms) -> Wait(35ms)
+        match clock.evaluate_presentation_timing(5000, now) {
+            PresentationAction::Wait(d) => {
+                let wait_ms = d.as_secs_f64() * 1000.0;
+                assert!((wait_ms - 35.0).abs() < 1e-2);
+            }
+            other => panic!("Expected Wait(35ms), got {:?}", other),
+        }
+
+        // Saturating sub when current_pts < audio_latency_ms
+        clock.seek_to(20.0, now);
+        assert_eq!(clock.effective_video_pts_ms(now), 0);
     }
 }

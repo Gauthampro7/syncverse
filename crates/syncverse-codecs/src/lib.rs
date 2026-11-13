@@ -8,6 +8,7 @@ pub mod color;
 pub mod error;
 pub mod frame;
 pub mod h264;
+pub mod subtitle_decoder;
 pub mod universal_video;
 
 pub use audio::{
@@ -28,5 +29,6 @@ pub use h264::{
     extract_nal_units, parse_annex_b, parse_avcc, unescape_rbsp, AnnexBScanner, H264Decoder,
     NalHeader, NalUnitType, Pps, SliceHeader, SliceType, Sps,
 };
+pub use subtitle_decoder::{DecodedSubtitleEvent, UniversalSubtitleDecoder};
 pub use universal_video::UniversalVideoDecoder;
 
