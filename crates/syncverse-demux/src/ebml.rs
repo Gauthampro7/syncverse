@@ -448,6 +448,8 @@ impl EbmlDemuxer {
                 let mut height = None;
                 let mut sample_rate = None;
                 let mut channels = None;
+                let mut is_default = false;
+                let mut is_forced = false;
 
                 let mut sub_off = 0;
                 while sub_off < track_entry_bytes.len() {
@@ -474,6 +476,8 @@ impl EbmlDemuxer {
                                 _ => TrackType::Video,
                             };
                         }
+                        0x88 => is_default = parse_ebml_uint(val) != 0,
+                        0x55AA => is_forced = parse_ebml_uint(val) != 0,
                         0x86 => codec_id = parse_ebml_string(val),
                         0x22B59C | 0x22B59D => language = Some(parse_ebml_string(val)),
                         0x536E => title = Some(parse_ebml_string(val)),
@@ -535,6 +539,8 @@ impl EbmlDemuxer {
                     sample_rate,
                     channels,
                     codec_private,
+                    is_default,
+                    is_forced,
                 });
             }
         }
@@ -845,6 +851,8 @@ impl Demuxer for EbmlDemuxer {
                 sample_rate: None,
                 channels: None,
                 codec_private: None,
+                is_default: false,
+                is_forced: false,
             });
         }
 
@@ -927,11 +935,12 @@ impl Demuxer for EbmlDemuxer {
 
                     let cluster_ticks = i64::try_from(self.current_cluster_timecode)
                         .map_err(|_| DemuxError::IntegerOverflow)?;
-                    let (_, pts_ms) = compute_simpleblock_pts(
+                    let (pts_ns, pts_ms) = compute_simpleblock_pts(
                         cluster_ticks,
                         rel_timecode,
                         self.timestamp_scale_ns,
                     )?;
+                    let pts_us = pts_ns.div_euclid(1_000).max(0);
                     let pts_ms = pts_ms.max(0) as u64;
 
                     let frames = unpack_lacing(lacing, payload)?;
@@ -939,6 +948,7 @@ impl Demuxer for EbmlDemuxer {
                         self.packet_queue.push_back(DemuxPacket {
                             track_id,
                             pts_ms,
+                            pts_us,
                             dts_ms: None,
                             duration_ms: None,
                             is_keyframe: if i == 0 { is_keyframe } else { false },
@@ -999,11 +1009,12 @@ impl Demuxer for EbmlDemuxer {
 
                                 let cluster_ticks = i64::try_from(self.current_cluster_timecode)
                                     .map_err(|_| DemuxError::IntegerOverflow)?;
-                                let (_, pts_ms) = compute_simpleblock_pts(
+                                let (pts_ns, pts_ms) = compute_simpleblock_pts(
                                     cluster_ticks,
                                     rel_timecode,
                                     self.timestamp_scale_ns,
                                 )?;
+                                let pts_us = pts_ns.div_euclid(1_000).max(0);
                                 let pts_ms = pts_ms.max(0) as u64;
 
                                 let frames = unpack_lacing(lacing, payload)?;
@@ -1011,6 +1022,7 @@ impl Demuxer for EbmlDemuxer {
                                     self.packet_queue.push_back(DemuxPacket {
                                         track_id,
                                         pts_ms,
+                                        pts_us,
                                         dts_ms: None,
                                         duration_ms: None,
                                         is_keyframe: if i == 0 { is_keyframe } else { false },

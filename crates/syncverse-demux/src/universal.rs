@@ -31,6 +31,8 @@ pub struct UniversalDemuxer {
     peeked_packet: Option<DemuxPacket>,
     /// Container presentation start time offset in microseconds (AV_TIME_BASE units).
     start_time_us: i64,
+    /// Preferred stream index for keyframe-targeted seeking (first active video, or audio fallback).
+    preferred_seek_stream_index: Option<usize>,
 }
 
 impl Default for UniversalDemuxer {
@@ -52,6 +54,7 @@ impl UniversalDemuxer {
             frame_rates: Vec::new(),
             peeked_packet: None,
             start_time_us: 0,
+            preferred_seek_stream_index: None,
         }
     }
 
@@ -69,11 +72,12 @@ impl UniversalDemuxer {
     /// Internal helper initializing track state and time bases from an open `Input` context.
     fn init_from_context(
         &mut self,
-        ictx: ffmpeg::format::context::Input,
+        mut ictx: ffmpeg::format::context::Input,
     ) -> Result<ContainerInfo, DemuxError> {
         let mut tracks = Vec::new();
         let mut time_bases = Vec::new();
         let mut frame_rates = Vec::new();
+        let mut discard_indices = Vec::new();
 
         for s in ictx.streams() {
             let s_idx = s.index();
@@ -93,47 +97,66 @@ impl UniversalDemuxer {
             };
             frame_rates.push(fps);
 
+            let disp = s.disposition();
+            let is_attached_pic = disp.contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC);
+            if is_attached_pic {
+                discard_indices.push(s_idx);
+                continue;
+            }
+
+            let is_default = disp.contains(ffmpeg::format::stream::Disposition::DEFAULT);
+            let is_forced = disp.contains(ffmpeg::format::stream::Disposition::FORCED);
+
             let params = s.parameters();
             let track_type = match params.medium() {
                 ffmpeg::media::Type::Video => TrackType::Video,
                 ffmpeg::media::Type::Audio => TrackType::Audio,
                 ffmpeg::media::Type::Subtitle => TrackType::Subtitle,
-                _ => continue,
+                _ => {
+                    discard_indices.push(s_idx);
+                    continue;
+                }
             };
 
             let codec_id = params.id().name().to_string();
-            let mut width = None;
-            let mut height = None;
-            let mut sample_rate = None;
-            let mut channels = None;
 
-            if let Ok(ctx) = ffmpeg::codec::context::Context::from_parameters(params.clone()) {
-                if track_type == TrackType::Video {
-                    if let Ok(video) = ctx.decoder().video() {
-                        width = Some(video.width());
-                        height = Some(video.height());
-                    }
-                } else if track_type == TrackType::Audio {
-                    if let Ok(audio) = ctx.decoder().audio() {
-                        sample_rate = Some(audio.rate() as f64);
-                        channels = Some(audio.channels() as u32);
-                    }
-                }
-            }
-
-            // SAFETY: `params.as_ptr()` points to a valid AVCodecParameters owned by FFmpeg stream context.
-            // If extradata is non-null and extradata_size > 0, the pointer addresses a valid byte slice of length extradata_size.
-            let codec_private = unsafe {
+            // SAFETY: `params.as_ptr()` points to a valid `AVCodecParameters` owned by the FFmpeg
+            // stream context for the duration of `s`. Reading scalar fields (`width`, `height`,
+            // `sample_rate`, `ch_layout.nb_channels`, `extradata`, `extradata_size`) is valid,
+            // and `extradata` is only sliced when non-null and `extradata_size > 0`.
+            let (width, height, sample_rate, channels, codec_private) = unsafe {
                 let raw = params.as_ptr();
-                if !(*raw).extradata.is_null() && (*raw).extradata_size > 0 {
-                    let slice = std::slice::from_raw_parts((*raw).extradata, (*raw).extradata_size as usize);
+                let w = if track_type == TrackType::Video && (*raw).width > 0 {
+                    Some((*raw).width as u32)
+                } else {
+                    None
+                };
+                let h = if track_type == TrackType::Video && (*raw).height > 0 {
+                    Some((*raw).height as u32)
+                } else {
+                    None
+                };
+                let sr = if track_type == TrackType::Audio && (*raw).sample_rate > 0 {
+                    Some((*raw).sample_rate as f64)
+                } else {
+                    None
+                };
+                let ch = if track_type == TrackType::Audio && (*raw).ch_layout.nb_channels > 0 {
+                    Some((*raw).ch_layout.nb_channels as u32)
+                } else {
+                    None
+                };
+                let extra = if !(*raw).extradata.is_null() && (*raw).extradata_size > 0 {
+                    let slice = std::slice::from_raw_parts(
+                        (*raw).extradata,
+                        (*raw).extradata_size as usize,
+                    );
                     Some(slice.to_vec())
                 } else {
                     None
-                }
+                };
+                (w, h, sr, ch, extra)
             };
-
-
 
             let mut language = None;
             let mut title = None;
@@ -162,7 +185,27 @@ impl UniversalDemuxer {
                 sample_rate,
                 channels,
                 codec_private,
+                is_default,
+                is_forced,
             });
+        }
+
+        if !discard_indices.is_empty() {
+            // SAFETY: `ictx.as_mut_ptr()` returns a valid, non-null `AVFormatContext` pointer.
+            // Every index in `discard_indices` came from `ictx.streams()`, so it is strictly less
+            // than `(*raw_ctx).nb_streams as usize` and points to a valid `AVStream`.
+            unsafe {
+                let raw_ctx = ictx.as_mut_ptr();
+                let nb_streams = (*raw_ctx).nb_streams as usize;
+                for idx in discard_indices {
+                    if idx < nb_streams {
+                        let stream_ptr = *(*raw_ctx).streams.add(idx);
+                        if !stream_ptr.is_null() {
+                            (*stream_ptr).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
+                        }
+                    }
+                }
+            }
         }
 
 
@@ -226,6 +269,12 @@ impl UniversalDemuxer {
             });
         }
 
+        let preferred_seek_stream_index = tracks
+            .iter()
+            .find(|t| t.track_type == TrackType::Video)
+            .or_else(|| tracks.iter().find(|t| t.track_type == TrackType::Audio))
+            .map(|t| t.track_id as usize);
+
         let info = ContainerInfo {
             duration_ms,
             timescale: 1_000_000,
@@ -239,6 +288,7 @@ impl UniversalDemuxer {
         self.ictx = Some(ictx);
         self.peeked_packet = None;
         self.start_time_us = start_time_us;
+        self.preferred_seek_stream_index = preferred_seek_stream_index;
 
         Ok(info)
     }
@@ -248,7 +298,115 @@ impl UniversalDemuxer {
         self.start_time_us
     }
 
-    /// Normalizes raw packet timestamps against container start time to yield 0-based millisecond timestamps.
+    /// Configures which streams remain active during demuxing and discards all others at the
+    /// container demuxer level (`AVDISCARD_ALL`).
+    ///
+    /// - Attached-picture, data, attachment, and unknown streams are always discarded.
+    /// - Video streams are kept only if their stream index equals `video_id`.
+    /// - Audio streams are kept only if their stream index equals `audio_id`.
+    /// - Subtitle streams are kept only if `keep_subtitles` is `true`.
+    ///
+    /// Any buffered post-seek packet belonging to a newly discarded stream is dropped, and
+    /// `preferred_seek_stream_index` is updated to `video_id.or(audio_id)`.
+    pub fn set_active_streams(
+        &mut self,
+        video_id: Option<u64>,
+        audio_id: Option<u64>,
+        keep_subtitles: bool,
+    ) {
+        let Some(ictx) = self.ictx.as_mut() else {
+            return;
+        };
+
+        let mut discarded_tracks = Vec::new();
+
+        // SAFETY: `ictx.as_mut_ptr()` returns a valid, non-null `AVFormatContext` owned by `self.ictx`.
+        // `nb_streams` bounds the `streams` pointer array, and each non-null entry points to a valid
+        // `AVStream` owned by `ictx`.
+        unsafe {
+            let raw_ctx = ictx.as_mut_ptr();
+            let nb_streams = (*raw_ctx).nb_streams as usize;
+            for i in 0..nb_streams {
+                let stream_ptr = *(*raw_ctx).streams.add(i);
+                if stream_ptr.is_null() {
+                    continue;
+                }
+                let stream_id = (*stream_ptr).index as u64;
+                let is_attached_pic =
+                    ((*stream_ptr).disposition & ffmpeg::ffi::AV_DISPOSITION_ATTACHED_PIC) != 0;
+                let codecpar = (*stream_ptr).codecpar;
+                let media_type = if !codecpar.is_null() {
+                    ffmpeg::media::Type::from((*codecpar).codec_type)
+                } else {
+                    ffmpeg::media::Type::Unknown
+                };
+
+                let discard = if is_attached_pic {
+                    ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+                } else {
+                    match media_type {
+                        ffmpeg::media::Type::Video => {
+                            if Some(stream_id) == video_id {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_DEFAULT
+                            } else {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+                            }
+                        }
+                        ffmpeg::media::Type::Audio => {
+                            if Some(stream_id) == audio_id {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_DEFAULT
+                            } else {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+                            }
+                        }
+                        ffmpeg::media::Type::Subtitle => {
+                            if keep_subtitles {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_DEFAULT
+                            } else {
+                                ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+                            }
+                        }
+                        _ => ffmpeg::ffi::AVDiscard::AVDISCARD_ALL,
+                    }
+                };
+
+                (*stream_ptr).discard = discard;
+                if discard == ffmpeg::ffi::AVDiscard::AVDISCARD_ALL {
+                    discarded_tracks.push(stream_id);
+                }
+            }
+        }
+
+        if let Some(ref pkt) = self.peeked_packet {
+            if discarded_tracks.contains(&pkt.track_id) {
+                self.peeked_packet = None;
+            }
+        }
+
+        self.preferred_seek_stream_index = video_id.or(audio_id).map(|id| id as usize);
+    }
+
+    /// Returns `true` if the given stream index currently has `AVDISCARD_ALL` set.
+    fn is_stream_discarded(&self, stream_idx: usize) -> bool {
+        let Some(ictx) = self.ictx.as_ref() else {
+            return false;
+        };
+        // SAFETY: `ictx.as_ptr()` returns a valid, non-null `AVFormatContext` owned by `self.ictx`.
+        // We bounds-check `stream_idx < (*raw).nb_streams as usize` before dereferencing `streams[stream_idx]`.
+        unsafe {
+            let raw = ictx.as_ptr();
+            if stream_idx >= (*raw).nb_streams as usize {
+                return false;
+            }
+            let stream_ptr = *(*raw).streams.add(stream_idx);
+            if stream_ptr.is_null() {
+                return false;
+            }
+            (*stream_ptr).discard == ffmpeg::ffi::AVDiscard::AVDISCARD_ALL
+        }
+    }
+
+    /// Normalizes raw packet timestamps against container start time to yield 0-based timestamps.
     fn normalize_packet(&self, packet: &ffmpeg::Packet) -> DemuxPacket {
         let s_idx = packet.stream();
         let tb = if s_idx < self.time_bases.len() {
@@ -265,9 +423,10 @@ impl UniversalDemuxer {
         };
 
         let raw_pts = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
-        let pts_us = (raw_pts as i128 * num * 1_000_000) / den;
-        let norm_pts_us = (pts_us - self.start_time_us as i128).max(0);
-        let pts_ms = (norm_pts_us / 1000) as u64;
+        let raw_pts_us = (raw_pts as i128 * num * 1_000_000) / den;
+        let norm_pts_us = (raw_pts_us - self.start_time_us as i128).max(0);
+        let pts_us = norm_pts_us.min(i64::MAX as i128) as i64;
+        let pts_ms = (norm_pts_us as u64) / 1000;
 
         let dts_ms = packet.dts().map(|dts| {
             let dts_us = (dts as i128 * num * 1_000_000) / den;
@@ -288,6 +447,7 @@ impl UniversalDemuxer {
         DemuxPacket {
             track_id: s_idx as u64,
             pts_ms,
+            pts_us,
             dts_ms,
             duration_ms,
             is_keyframe,
@@ -306,6 +466,33 @@ impl UniversalDemuxer {
             .as_ref()
             .map(|i| i.chapters.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Returns the FFmpeg codec parameters and rational time base for a given track ID, if available.
+    pub fn stream_params(
+        &self,
+        track_id: u64,
+    ) -> Option<(ffmpeg::codec::Parameters, ffmpeg::Rational)> {
+        self.ictx.as_ref().and_then(|ctx| {
+            ctx.streams()
+                .find(|s| s.index() as u64 == track_id)
+                .map(|s| (s.parameters(), s.time_base()))
+        })
+    }
+
+    /// Returns the FFmpeg codec parameters and rational time base for a subtitle track ID, if available.
+    pub fn subtitle_stream_params(
+        &self,
+        track_id: u64,
+    ) -> Option<(ffmpeg::codec::Parameters, ffmpeg::Rational)> {
+        self.ictx.as_ref().and_then(|ctx| {
+            ctx.streams()
+                .find(|s| {
+                    s.index() as u64 == track_id
+                        && s.parameters().medium() == ffmpeg::media::Type::Subtitle
+                })
+                .map(|s| (s.parameters(), s.time_base()))
+        })
     }
 
     /// Returns the FFmpeg codec parameters for a given stream index, if available.
@@ -408,19 +595,23 @@ impl Demuxer for UniversalDemuxer {
             return Ok(Some(packet));
         }
 
-        let ictx = match self.ictx.as_mut() {
-            Some(ctx) => ctx,
-            None => {
-                return Err(DemuxError::InvalidHeader(
-                    "UniversalDemuxer not initialized".into(),
-                ));
-            }
-        };
+        if self.ictx.is_none() {
+            return Err(DemuxError::InvalidHeader(
+                "UniversalDemuxer not initialized".into(),
+            ));
+        }
 
         let mut packet = ffmpeg::Packet::empty();
         loop {
-            match packet.read(ictx) {
+            let read_res = {
+                let ictx = self.ictx.as_mut().expect("ictx checked above");
+                packet.read(ictx)
+            };
+            match read_res {
                 Ok(()) => {
+                    if self.is_stream_discarded(packet.stream()) {
+                        continue;
+                    }
                     return Ok(Some(self.normalize_packet(&packet)));
                 }
                 Err(ffmpeg::Error::Eof) => return Ok(None),
@@ -438,40 +629,138 @@ impl Demuxer for UniversalDemuxer {
     fn seek_to(&mut self, target_pts_ms: u64) -> Result<u64, DemuxError> {
         self.peeked_packet = None;
 
-        let ictx = match self.ictx.as_mut() {
-            Some(ctx) => ctx,
-            None => {
-                return Err(DemuxError::InvalidHeader(
-                    "UniversalDemuxer not initialized".into(),
-                ));
+        let target_us = self
+            .start_time_us
+            .saturating_add((target_pts_ms as i64).saturating_mul(1000));
+
+        let preferred_stream = self
+            .preferred_seek_stream_index
+            .and_then(|idx| self.time_bases.get(idx).copied().map(|tb| (idx, tb)))
+            .filter(|(_, tb)| tb.numerator() > 0 && tb.denominator() > 0);
+
+        {
+            let ictx = match self.ictx.as_mut() {
+                Some(ctx) => ctx,
+                None => {
+                    return Err(DemuxError::InvalidHeader(
+                        "UniversalDemuxer not initialized".into(),
+                    ));
+                }
+            };
+            ictx.clear_interrupt();
+
+            let av_time_base_q = ffmpeg::ffi::AVRational {
+                num: 1,
+                den: ffmpeg::ffi::AV_TIME_BASE,
+            };
+
+            let (stream_index, stream_ts) = if let Some((idx, tb)) = preferred_stream {
+                // SAFETY: `av_rescale_q` is a pure integer rational scaling function with no pointer arguments.
+                let ts = unsafe { ffmpeg::ffi::av_rescale_q(target_us, av_time_base_q, tb.into()) };
+                (idx as std::ffi::c_int, ts)
+            } else {
+                (-1 as std::ffi::c_int, target_us)
+            };
+
+            // SAFETY: `ictx.as_mut_ptr()` returns a valid, non-null `AVFormatContext` pointer owned by `self.ictx`.
+            // `stream_index` is either `-1` (`AV_TIME_BASE`) or a validated stream index from `self.time_bases`.
+            let seek_ret = unsafe {
+                let raw_ctx = ictx.as_mut_ptr();
+                let mut ret = ffmpeg::ffi::avformat_seek_file(
+                    raw_ctx,
+                    stream_index,
+                    i64::MIN,
+                    stream_ts,
+                    stream_ts,
+                    ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as std::ffi::c_int,
+                );
+                if ret < 0 {
+                    // Fallback: target may precede first keyframe (e.g. priming delay or target == 0).
+                    ret = ffmpeg::ffi::avformat_seek_file(
+                        raw_ctx,
+                        stream_index,
+                        stream_ts,
+                        stream_ts,
+                        i64::MAX,
+                        0,
+                    );
+                }
+                if ret < 0 && stream_index != -1 {
+                    ret = ffmpeg::ffi::avformat_seek_file(
+                        raw_ctx,
+                        -1,
+                        i64::MIN,
+                        target_us,
+                        target_us,
+                        ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as std::ffi::c_int,
+                    );
+                    if ret < 0 {
+                        ret = ffmpeg::ffi::avformat_seek_file(
+                            raw_ctx,
+                            -1,
+                            target_us,
+                            target_us,
+                            i64::MAX,
+                            0,
+                        );
+                    }
+                }
+                if ret < 0 {
+                    ret = ffmpeg::ffi::avformat_seek_file(
+                        raw_ctx,
+                        -1,
+                        self.start_time_us,
+                        self.start_time_us,
+                        i64::MAX,
+                        0,
+                    );
+                }
+                if ret < 0 {
+                    ret = ffmpeg::ffi::avformat_seek_file(raw_ctx, -1, 0, 0, i64::MAX, 0);
+                }
+                if ret < 0 {
+                    ret = ffmpeg::ffi::avformat_seek_file(
+                        raw_ctx,
+                        -1,
+                        i64::MIN,
+                        target_us,
+                        i64::MAX,
+                        0,
+                    );
+                }
+                ret
+            };
+
+            if seek_ret < 0 {
+                return Err(DemuxError::Io(format!(
+                    "FFmpeg seek failure: {}",
+                    ffmpeg::Error::from(seek_ret)
+                )));
             }
-        };
-
-        // Convert target_pts_ms to microseconds (AV_TIME_BASE = 1_000_000) and offset by start_time_us
-        let stream_target_us = (target_pts_ms as i64 * 1000) + self.start_time_us;
-
-        // 1. Attempt seeking backwards to nearest keyframe at or before target
-        if ictx.seek(stream_target_us, ..stream_target_us).is_err() {
-            // Fallback: if seeking backwards fails (e.g. target is before first keyframe,
-            // such as FLV priming delay or target_pts_ms == 0), seek forward to earliest available keyframe.
-            ictx.seek(stream_target_us, stream_target_us..)
-                .or_else(|_| ictx.seek(self.start_time_us, self.start_time_us..))
-                .or_else(|_| ictx.seek(0, 0..))
-                .or_else(|_| ictx.seek(stream_target_us, ..))
-                .map_err(|e| DemuxError::Io(format!("FFmpeg seek failure: {e}")))?;
         }
 
-        // Read the first packet after seek to establish the exact landed PTS and buffer it
+        // Read the first active packet after seek to establish the exact landed PTS and buffer it
+        // in `self.peeked_packet` so the post-seek keyframe is never dropped.
         let mut packet = ffmpeg::Packet::empty();
-        match packet.read(ictx) {
-            Ok(()) => {
-                let demux_packet = self.normalize_packet(&packet);
-                let landed_pts = demux_packet.pts_ms;
-                self.peeked_packet = Some(demux_packet);
-                Ok(landed_pts)
+        loop {
+            let read_res = {
+                let ictx = self.ictx.as_mut().expect("ictx checked above");
+                packet.read(ictx)
+            };
+            match read_res {
+                Ok(()) => {
+                    if self.is_stream_discarded(packet.stream()) {
+                        continue;
+                    }
+                    let demux_packet = self.normalize_packet(&packet);
+                    let landed_pts = demux_packet.pts_ms;
+                    self.peeked_packet = Some(demux_packet);
+                    return Ok(landed_pts);
+                }
+                Err(ffmpeg::Error::InvalidData) => continue,
+                Err(ffmpeg::Error::Eof) => return Ok(target_pts_ms),
+                Err(e) => return Err(DemuxError::Io(format!("FFmpeg read post-seek error: {e}"))),
             }
-            Err(ffmpeg::Error::Eof) => Ok(target_pts_ms),
-            Err(e) => Err(DemuxError::Io(format!("FFmpeg read post-seek error: {e}"))),
         }
     }
 }

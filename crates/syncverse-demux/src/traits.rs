@@ -8,7 +8,7 @@ pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
 /// Track media type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackType {
     /// Video track.
     Video,
@@ -16,6 +16,9 @@ pub enum TrackType {
     Audio,
     /// Subtitle or timed text track.
     Subtitle,
+    /// Unknown or unsupported track type.
+    #[default]
+    Unknown,
 }
 
 /// Information describing an individual track within a container.
@@ -41,6 +44,29 @@ pub struct TrackInfo {
     pub channels: Option<u32>,
     /// Optional binary extradata (AVCDecoderConfigurationRecord, OpusHead, etc.).
     pub codec_private: Option<Vec<u8>>,
+    /// Whether the container marks this track as a default track (`AV_DISPOSITION_DEFAULT`).
+    pub is_default: bool,
+    /// Whether the container marks this track as a forced track (`AV_DISPOSITION_FORCED`).
+    pub is_forced: bool,
+}
+
+impl Default for TrackInfo {
+    fn default() -> Self {
+        Self {
+            track_id: 0,
+            track_type: TrackType::Unknown,
+            codec_id: String::new(),
+            language: None,
+            title: None,
+            width: None,
+            height: None,
+            sample_rate: None,
+            channels: None,
+            codec_private: None,
+            is_default: false,
+            is_forced: false,
+        }
+    }
 }
 
 /// Media chapter metadata identifying structural boundaries in container.
@@ -76,6 +102,8 @@ pub struct DemuxPacket {
     pub track_id: u64,
     /// Presentation timestamp in milliseconds.
     pub pts_ms: u64,
+    /// Zero-based presentation timestamp in microseconds.
+    pub pts_us: i64,
     /// Decode timestamp in milliseconds, if distinct from PTS.
     pub dts_ms: Option<u64>,
     /// Packet presentation duration in milliseconds, if known.

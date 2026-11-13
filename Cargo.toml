@@ -21,5 +21,10 @@ description = "Ultra-efficient standalone desktop media player and long-distance
 
 [workspace.dependencies]
 thiserror = "2.0"
-ffmpeg-next = "9.0.0"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 

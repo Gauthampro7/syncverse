@@ -832,6 +832,8 @@ impl IsoBmffDemuxer {
             sample_rate,
             channels,
             codec_private,
+            is_default: false,
+            is_forced: false,
         };
 
         let track_state = Mp4TrackState {
@@ -924,6 +926,8 @@ impl Demuxer for IsoBmffDemuxer {
                 sample_rate: None,
                 channels: None,
                 codec_private: None,
+                is_default: false,
+                is_forced: false,
             });
         }
 
@@ -999,12 +1003,14 @@ impl Demuxer for IsoBmffDemuxer {
         };
 
         let pts_ms = track.sample_pts_ms.get(sample_idx).copied().unwrap_or(0);
+        let pts_us = (pts_ms as i64).saturating_mul(1000);
         let dts_ms = track.sample_dts_ms.get(sample_idx).copied();
         let dts_opt = if dts_ms == Some(pts_ms) { None } else { dts_ms };
 
         let packet = DemuxPacket {
             track_id: track.track_id,
             pts_ms,
+            pts_us,
             dts_ms: dts_opt,
             duration_ms: None,
             is_keyframe,
