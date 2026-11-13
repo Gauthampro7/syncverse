@@ -45,6 +45,8 @@ pub enum PacketType {
     PeerStatus = 0x09,
     /// 0x0A: Floating Emoji Reaction (`client_id: u32`, `media_pts_ms: u64`, `emoji: String`, `username: String`)
     Reaction = 0x0A,
+    /// 0x0D: Bidirectional Peer Playback Control / Sync Snapshot Request (17 bytes big-endian)
+    PeerControl = 0x0D,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -61,8 +63,65 @@ impl TryFrom<u8> for PacketType {
             0x08 => Ok(Self::ChatMessage),
             0x09 => Ok(Self::PeerStatus),
             0x0A => Ok(Self::Reaction),
+            0x0D => Ok(Self::PeerControl),
             other => Err(SyncError::UnknownPacketType(other)),
         }
+    }
+}
+
+/// Control action issued by a watch-party peer (`0x0D` `PeerControl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PeerControlAction {
+    /// Pause playback across the watch-party room.
+    Pause = 1,
+    /// Resume or start playback across the watch-party room.
+    Play = 2,
+    /// Seek playback to `media_pts_ms`.
+    Seek = 3,
+    /// Update playback speed to `rate_q16`.
+    SetSpeed = 4,
+    /// Client join handshake requesting immediate `RoomStateBroadcast` and `PeerStatus`es.
+    RequestSyncSnapshot = 5,
+}
+
+impl TryFrom<u8> for PeerControlAction {
+    type Error = SyncError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            1 => Ok(Self::Pause),
+            2 => Ok(Self::Play),
+            3 => Ok(Self::Seek),
+            4 => Ok(Self::SetSpeed),
+            5 => Ok(Self::RequestSyncSnapshot),
+            other => Err(SyncError::MalformedPayload(format!(
+                "Unknown PeerControlAction: {}",
+                other
+            ))),
+        }
+    }
+}
+
+/// Payload for `0x0D` Bidirectional Peer Playback Control (17 bytes, big-endian).
+///
+/// Wire layout: `[peer_id:4][action:1][media_pts_ms:8][rate_q16:4]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerControlPayload {
+    /// Identifier of the peer issuing the control command.
+    pub peer_id: u32,
+    /// Control action requested.
+    pub action: PeerControlAction,
+    /// Target media presentation timestamp in milliseconds.
+    pub media_pts_ms: u64,
+    /// Target playback rate in Q16 fixed-point format (`1.0 = 65536`).
+    pub rate_q16: u32,
+}
+
+impl PeerControlPayload {
+    /// Converts the Q16 fixed-point playback rate into an `f64` multiplier.
+    pub fn rate_f64(&self) -> f64 {
+        (self.rate_q16 as f64) / 65536.0
     }
 }
 
@@ -287,6 +346,8 @@ pub enum PacketPayload {
     PeerStatus(PeerStatusPayload),
     /// Floating Emoji Reaction
     Reaction(ReactionPayload),
+    /// Bidirectional Peer Control
+    PeerControl(PeerControlPayload),
 }
 
 impl PacketPayload {
@@ -378,6 +439,14 @@ impl PacketPayload {
                 buf.extend_from_slice(&username_bytes[..username_len as usize]);
                 buf
             }
+            Self::PeerControl(p) => {
+                let mut buf = Vec::with_capacity(17);
+                buf.extend_from_slice(&p.peer_id.to_be_bytes());
+                buf.push(p.action as u8);
+                buf.extend_from_slice(&p.media_pts_ms.to_be_bytes());
+                buf.extend_from_slice(&p.rate_q16.to_be_bytes());
+                buf
+            }
         }
     }
 
@@ -393,6 +462,7 @@ impl PacketPayload {
             Self::ChatMessage(_) => PacketType::ChatMessage,
             Self::PeerStatus(_) => PacketType::PeerStatus,
             Self::Reaction(_) => PacketType::Reaction,
+            Self::PeerControl(_) => PacketType::PeerControl,
         }
     }
 }
@@ -605,6 +675,27 @@ impl WirePacket {
         }
     }
 
+    /// Constructs a Bidirectional Peer Control packet (`0x0D`).
+    pub fn peer_control(
+        _seq: u32,
+        peer_id: u32,
+        action: PeerControlAction,
+        media_pts_ms: u64,
+        rate: f64,
+    ) -> Self {
+        let rate_q16 = (rate.clamp(0.1, 8.0) * 65536.0).round() as u32;
+        Self {
+            packet_type: PacketType::PeerControl,
+            flags: FLAG_NONE,
+            payload: PacketPayload::PeerControl(PeerControlPayload {
+                peer_id,
+                action,
+                media_pts_ms,
+                rate_q16,
+            }),
+        }
+    }
+
     /// Serializes this packet into a binary byte vector with header framing and CRC32.
     pub fn to_bytes(&self) -> Vec<u8> {
         let payload_bytes = self.payload.serialize();
@@ -652,9 +743,24 @@ impl WirePacket {
         Ok(buf)
     }
 
+    /// Alias for [`WirePacket::to_bytes_encrypted`].
+    #[inline]
+    pub fn to_encrypted_bytes(&self, crypto: &RoomCryptoSession) -> Result<Vec<u8>, SyncError> {
+        self.to_bytes_encrypted(crypto)
+    }
+
     /// Deserializes a binary byte buffer into a validated `WirePacket`.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, SyncError> {
         Self::from_bytes_with_crypto(buf, None)
+    }
+
+    /// Alias for [`WirePacket::from_bytes_with_crypto`].
+    #[inline]
+    pub fn from_encrypted_bytes(
+        buf: &[u8],
+        crypto: Option<&RoomCryptoSession>,
+    ) -> Result<Self, SyncError> {
+        Self::from_bytes_with_crypto(buf, crypto)
     }
 
     /// Deserializes a binary byte buffer into a validated `WirePacket`, decrypting if encrypted.
@@ -721,6 +827,11 @@ impl WirePacket {
                 payload,
             })
         } else {
+            if crypto.is_some() {
+                return Err(SyncError::Crypto(
+                    "Unencrypted packet rejected on encrypted room session".to_string(),
+                ));
+            }
             let payload = PacketPayload::deserialize(packet_type, payload_slice)?;
             Ok(WirePacket {
                 packet_type,
@@ -990,6 +1101,24 @@ impl PacketPayload {
                     username,
                 })
             }
+            PacketType::PeerControl => {
+                if payload_slice.len() != 17 {
+                    return Err(SyncError::MalformedPayload(format!(
+                        "PeerControl expected 17 bytes, got {}",
+                        payload_slice.len()
+                    )));
+                }
+                let peer_id = u32::from_be_bytes(payload_slice[0..4].try_into().unwrap());
+                let action = PeerControlAction::try_from(payload_slice[4])?;
+                let media_pts_ms = u64::from_be_bytes(payload_slice[5..13].try_into().unwrap());
+                let rate_q16 = u32::from_be_bytes(payload_slice[13..17].try_into().unwrap());
+                PacketPayload::PeerControl(PeerControlPayload {
+                    peer_id,
+                    action,
+                    media_pts_ms,
+                    rate_q16,
+                })
+            }
         };
 
         Ok(payload)
@@ -1254,5 +1383,72 @@ mod tests {
         assert_eq!(decrypted_pkt.packet_type, PacketType::SeekCommand);
         assert_eq!(decrypted_pkt.flags, FLAG_NONE);
         assert_eq!(decrypted_pkt.payload, original_pkt.payload);
+
+        // Plaintext packet must be rejected when crypto is configured
+        let plaintext_bytes = original_pkt.to_bytes();
+        let err_plaintext = WirePacket::from_encrypted_bytes(&plaintext_bytes, Some(&crypto));
+        assert!(matches!(err_plaintext, Err(SyncError::Crypto(_))));
+    }
+
+    #[test]
+    fn test_peer_control_roundtrip_and_big_endian_layout() {
+        let actions = [
+            PeerControlAction::Pause,
+            PeerControlAction::Play,
+            PeerControlAction::Seek,
+            PeerControlAction::SetSpeed,
+            PeerControlAction::RequestSyncSnapshot,
+        ];
+        for action in actions {
+            let pkt = WirePacket::peer_control(9, 0x01020304, action, 0x0011223344556677, 1.5);
+            let bytes = pkt.to_bytes();
+            assert_eq!(bytes.len(), HEADER_LEN + 17);
+            assert_eq!(bytes[4], PacketType::PeerControl as u8);
+
+            // Verify 17-byte big-endian payload layout: [peer_id:4][action:1][media_pts_ms:8][rate_q16:4]
+            let payload = &bytes[HEADER_LEN..];
+            assert_eq!(&payload[0..4], &0x01020304u32.to_be_bytes());
+            assert_eq!(payload[4], action as u8);
+            assert_eq!(&payload[5..13], &0x0011223344556677u64.to_be_bytes());
+            assert_eq!(&payload[13..17], &(98304u32).to_be_bytes());
+
+            let parsed = WirePacket::from_bytes(&bytes).expect("parse PeerControl");
+            assert_eq!(parsed, pkt);
+            if let PacketPayload::PeerControl(ctrl) = parsed.payload {
+                assert!((ctrl.rate_f64() - 1.5).abs() < 1e-4);
+            } else {
+                panic!("expected PeerControl payload");
+            }
+        }
+
+        // Clamping test
+        let clamped_low = WirePacket::peer_control(1, 1, PeerControlAction::SetSpeed, 0, 0.01);
+        if let PacketPayload::PeerControl(ctrl) = clamped_low.payload {
+            assert!((ctrl.rate_f64() - 0.1).abs() < 1e-3);
+        }
+        let clamped_high = WirePacket::peer_control(2, 1, PeerControlAction::SetSpeed, 0, 99.0);
+        if let PacketPayload::PeerControl(ctrl) = clamped_high.payload {
+            assert!((ctrl.rate_f64() - 8.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_peer_control_encrypted_and_invalid_inputs() {
+        let crypto = RoomCryptoSession::from_password("sync-room", "pw-xyz").unwrap();
+        let pkt = WirePacket::peer_control(1, 7, PeerControlAction::Seek, 42_000, 1.25);
+        let enc = pkt.to_encrypted_bytes(&crypto).unwrap();
+        let dec = WirePacket::from_encrypted_bytes(&enc, Some(&crypto)).unwrap();
+        assert_eq!(dec, pkt);
+
+        // Invalid action byte
+        let mut bad_action = pkt.to_bytes();
+        bad_action[HEADER_LEN + 4] = 99;
+        let payload_slice = &bad_action[HEADER_LEN..];
+        let crc = Crc32::digest(payload_slice);
+        bad_action[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            WirePacket::from_bytes(&bad_action),
+            Err(SyncError::MalformedPayload(_))
+        ));
     }
 }
