@@ -513,34 +513,61 @@ impl PlaybackControlsBar {
                 let hover_pts = (rel_x as f64 * duration_ms as f64).round() as u64;
                 state.hover_pts_ms = Some(hover_pts);
 
-                response.show_tooltip_ui(|ui| {
-                    ui.style_mut().visuals.window_fill = style::TOOLTIP_BG;
-                    ui.style_mut().visuals.window_stroke =
-                        Stroke::new(1.0, style::TOOLTIP_BORDER);
+                let active_chapter = state
+                    .chapters
+                    .iter()
+                    .find(|c| hover_pts >= c.start_ms && hover_pts <= c.end_ms);
+                let tooltip_text = if let Some(ch) = active_chapter {
+                    format!(
+                        "{} — 📌 {}",
+                        ControlsBarState::format_timestamp(hover_pts),
+                        ch.title
+                    )
+                } else {
+                    ControlsBarState::format_timestamp(hover_pts)
+                };
 
-                    let active_chapter = state
-                        .chapters
-                        .iter()
-                        .find(|c| hover_pts >= c.start_ms && hover_pts <= c.end_ms);
-                    let tooltip_text = if let Some(ch) = active_chapter {
-                        format!(
-                            "{} — 📌 {}",
-                            ControlsBarState::format_timestamp(hover_pts),
-                            ch.title
-                        )
-                    } else {
-                        ControlsBarState::format_timestamp(hover_pts)
-                    };
+                let tooltip_font = FontId::monospace(12.0);
+                let max_tooltip_text_w = (rect.width() - 24.0).max(80.0);
+                let galley = ui.painter().layout(
+                    tooltip_text.clone(),
+                    tooltip_font.clone(),
+                    style::TEXT_PRIMARY,
+                    max_tooltip_text_w,
+                );
+                let pad = egui::vec2(8.0, 5.0);
+                let tooltip_size = galley.size() + pad * 2.0;
 
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(tooltip_text)
-                                .monospace()
-                                .color(style::TEXT_PRIMARY)
-                                .size(12.0),
-                        ),
-                    );
-                });
+                // Clamp tooltip horizontally within [rect.left(), rect.right()] so 00:00:00 and EOF never clip.
+                let min_x = rect.left();
+                let max_x = (rect.right() - tooltip_size.x).max(min_x);
+                let clamped_x = (mouse_pos.x - tooltip_size.x * 0.5).clamp(min_x, max_x);
+                let content_rect = ui.ctx().content_rect();
+                let clamped_y = (rect.top() - tooltip_size.y - 6.0).max(content_rect.top() + 4.0);
+
+                egui::Area::new(ui.make_persistent_id("seekbar_hover_tooltip"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(egui::pos2(clamped_x, clamped_y))
+                    .constrain_to(content_rect)
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(style::TOOLTIP_BG)
+                            .stroke(Stroke::new(1.0, style::TOOLTIP_BORDER))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.set_max_width(max_tooltip_text_w);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(tooltip_text)
+                                            .font(tooltip_font)
+                                            .color(style::TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    });
             }
         } else {
             state.hover_pts_ms = None;
@@ -582,366 +609,830 @@ impl PlaybackControlsBar {
         actions
     }
 
-    /// Renders the horizontal controls row: buttons, timecode HUD, volume, speed selector.
+    /// Formats compact current-only timecode (`MM:SS`, or `HH:MM:SS` if >= 1 hour) for ultra-narrow bars.
+    fn format_compact_timecode(ms: u64) -> String {
+        let total_sec = ms / 1000;
+        if total_sec >= 3600 {
+            ControlsBarState::format_timestamp(ms)
+        } else {
+            let m = total_sec / 60;
+            let s = total_sec % 60;
+            format!("{:02}:{:02}", m, s)
+        }
+    }
+
+    /// Renders a uniform dark icon button with fixed minimum size for predictable budgeting.
+    fn icon_button(ui: &mut Ui, label: RichText, active: bool, hover_text: &str) -> egui::Response {
+        let btn = egui::Button::new(label)
+            .min_size(Vec2::new(28.0, 28.0))
+            .fill(if active {
+                style::BUTTON_BG
+            } else {
+                Color32::TRANSPARENT
+            })
+            .corner_radius(6.0);
+        ui.add(btn).on_hover_text(hover_text)
+    }
+
+    /// Renders the horizontal controls row: strictly partitioned left transport group and
+    /// width-budgeted right settings group with progressive folding into a `⋯` popover menu.
     fn render_controls_row(
         ui: &mut Ui,
         snapshot: &PlayerUiSnapshot,
         state: &mut ControlsBarState,
         current_ms: u64,
     ) -> Vec<ControlsBarAction> {
+        let (actions, _bounds) =
+            Self::render_controls_row_with_bounds(ui, snapshot, state, current_ms);
+        actions
+    }
+
+    /// Renders the controls row and returns layout bounds for deterministic non-overlap verification.
+    fn render_controls_row_with_bounds(
+        ui: &mut Ui,
+        snapshot: &PlayerUiSnapshot,
+        state: &mut ControlsBarState,
+        current_ms: u64,
+    ) -> (Vec<ControlsBarAction>, ControlsRowBounds) {
         let mut actions = Vec::new();
-        let bar_width = ui.available_width();
+        let bar_width = ui.available_width().max(0.0);
         let is_compact = ControlsBarState::is_compact_layout(bar_width);
-        let is_ultra_compact = ControlsBarState::is_ultra_compact_layout(bar_width);
+        let spacing = if bar_width < 480.0 {
+            4.0
+        } else if bar_width < 820.0 {
+            6.0
+        } else {
+            8.0
+        };
 
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+        let row_height = 34.0;
+        let (_row_id, row_rect) = ui.allocate_space(Vec2::new(bar_width, row_height));
 
-            // Play / Pause Button (Bit 0: 1 = Playing, 0 = Paused/Stopped)
-            let is_playing = (snapshot.playback_state & 1) != 0;
-            let play_label = if is_playing { "⏸" } else { "▶" };
-            let play_btn = egui::Button::new(
-                RichText::new(play_label)
-                    .size(16.0)
+        // 1. Left transport group inside row_rect (clipped to row_rect so it never overflows right)
+        let mut left_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(Layout::left_to_right(egui::Align::Center)),
+        );
+        left_ui.spacing_mut().item_spacing = egui::vec2(spacing, 0.0);
+        left_ui.set_clip_rect(row_rect.intersect(ui.clip_rect()));
+
+        // Play / Pause Button (Bit 0: 1 = Playing, 0 = Paused/Stopped)
+        let is_playing = (snapshot.playback_state & 1) != 0;
+        let play_label = if is_playing { "⏸" } else { "▶" };
+        let play_btn = egui::Button::new(
+            RichText::new(play_label)
+                .size(16.0)
+                .color(style::TEXT_PRIMARY),
+        )
+        .min_size(Vec2::new(36.0, 32.0))
+        .fill(if is_playing {
+            style::BUTTON_BG
+        } else {
+            style::PLAY_ACCENT_BG
+        })
+        .corner_radius(6.0);
+
+        if left_ui
+            .add(play_btn)
+            .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
+            .clicked()
+        {
+            actions.push(ControlsBarAction::TogglePause);
+        }
+
+        // Stop Button
+        let stop_btn = egui::Button::new(
+            RichText::new("⏹")
+                .size(14.0)
+                .color(style::TEXT_PRIMARY),
+        )
+        .min_size(Vec2::new(32.0, 32.0))
+        .fill(style::BUTTON_BG)
+        .corner_radius(6.0);
+
+        if left_ui
+            .add(stop_btn)
+            .on_hover_text("Stop Playback (returns to 00:00:00)")
+            .clicked()
+        {
+            actions.push(ControlsBarAction::Stop);
+        }
+
+        // Previous / Next Track buttons at >= 420px
+        if bar_width >= 420.0 {
+            let prev_trk_btn = egui::Button::new(
+                RichText::new("⏮")
+                    .size(13.0)
                     .color(style::TEXT_PRIMARY),
             )
-            .min_size(Vec2::new(36.0, 32.0))
-            .fill(if is_playing {
-                style::BUTTON_BG
-            } else {
-                style::PLAY_ACCENT_BG
-            })
-            .corner_radius(6.0);
-
-            if ui
-                .add(play_btn)
-                .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
-                .clicked()
-            {
-                actions.push(ControlsBarAction::TogglePause);
-            }
-
-            // Stop Button
-            let stop_btn = egui::Button::new(
-                RichText::new("⏹")
-                    .size(14.0)
-                    .color(style::TEXT_PRIMARY),
-            )
-            .min_size(Vec2::new(32.0, 32.0))
+            .min_size(Vec2::new(26.0, 32.0))
             .fill(style::BUTTON_BG)
             .corner_radius(6.0);
 
-            if ui
-                .add(stop_btn)
-                .on_hover_text("Stop Playback (returns to 00:00:00)")
+            if left_ui
+                .add(prev_trk_btn)
+                .on_hover_text("Previous File / Track (P)")
                 .clicked()
             {
-                actions.push(ControlsBarAction::Stop);
+                actions.push(ControlsBarAction::PreviousTrack);
             }
 
-            // Track / Chapter & A-B Looping Buttons (collapsed on narrow viewports < 560px)
-            if !is_ultra_compact {
-                // Previous Track Button (P)
-                let prev_trk_btn = egui::Button::new(
-                    RichText::new("⏮")
-                        .size(13.0)
-                        .color(style::TEXT_PRIMARY),
-                )
-                .min_size(Vec2::new(26.0, 32.0))
-                .fill(style::BUTTON_BG)
-                .corner_radius(6.0);
+            let next_trk_btn = egui::Button::new(
+                RichText::new("⏭")
+                    .size(13.0)
+                    .color(style::TEXT_PRIMARY),
+            )
+            .min_size(Vec2::new(26.0, 32.0))
+            .fill(style::BUTTON_BG)
+            .corner_radius(6.0);
 
-                if ui
-                    .add(prev_trk_btn)
-                    .on_hover_text("Previous File / Track (P)")
-                    .clicked()
-                {
-                    actions.push(ControlsBarAction::PreviousTrack);
-                }
-
-                // Next Track Button (N)
-                let next_trk_btn = egui::Button::new(
-                    RichText::new("⏭")
-                        .size(13.0)
-                        .color(style::TEXT_PRIMARY),
-                )
-                .min_size(Vec2::new(26.0, 32.0))
-                .fill(style::BUTTON_BG)
-                .corner_radius(6.0);
-
-                if ui
-                    .add(next_trk_btn)
-                    .on_hover_text("Next File / Track (N)")
-                    .clicked()
-                {
-                    actions.push(ControlsBarAction::NextTrack);
-                }
-
-                // A-B Repeat Looping Button
-                let (ab_label, ab_color) = match state.ab_repeat {
-                    AbRepeatState::Disabled => ("🔁 A-B", style::TEXT_SECONDARY),
-                    AbRepeatState::PointASet(_) => ("A➔...", Color32::from_rgb(74, 222, 128)),
-                    AbRepeatState::Active { .. } => ("A⇄B", Color32::from_rgb(168, 85, 247)),
-                };
-                let ab_btn = egui::Button::new(
-                    RichText::new(ab_label)
-                        .size(11.0)
-                        .strong()
-                        .color(ab_color),
-                )
-                .min_size(Vec2::new(36.0, 32.0))
-                .fill(style::BUTTON_BG)
-                .corner_radius(6.0);
-
-                let resp = ui
-                    .add(ab_btn)
-                    .on_hover_text(format!("{} (Left-click: cycle, Right-click: clear)", state.ab_repeat.status_text()));
-                if resp.clicked() {
-                    actions.push(ControlsBarAction::CycleAbRepeat);
-                } else if resp.secondary_clicked() {
-                    actions.push(ControlsBarAction::ClearAbRepeat);
-                }
+            if left_ui
+                .add(next_trk_btn)
+                .on_hover_text("Next File / Track (N)")
+                .clicked()
+            {
+                actions.push(ControlsBarAction::NextTrack);
             }
+        }
 
-            // Timecode HUD: Monospace HH:MM:SS / HH:MM:SS (or single HH:MM:SS on narrowest viewports)
-            let duration_ms = snapshot.media_duration_pts / 1_000_000;
-            let timecode_str = if bar_width < 450.0 {
-                ControlsBarState::format_timestamp(current_ms)
-            } else {
-                format_timecode_hud(current_ms, duration_ms)
-            };
-
-            ui.add(
-                egui::Label::new(
-                    RichText::new(timecode_str)
-                        .monospace()
-                        .size(13.0)
-                        .color(style::TEXT_PRIMARY),
+        // Compact A-B Repeat pill on left at >= 700px (!is_compact)
+        let ab_inline_on_left = !is_compact;
+        if ab_inline_on_left {
+            let (ab_label, ab_color) = match state.ab_repeat {
+                AbRepeatState::Disabled => (
+                    if bar_width >= 820.0 { "🔁 A-B" } else { "🔁" },
+                    style::TEXT_SECONDARY,
                 ),
+                AbRepeatState::PointASet(_) => ("A➔...", Color32::from_rgb(74, 222, 128)),
+                AbRepeatState::Active { .. } => ("A⇄B", Color32::from_rgb(168, 85, 247)),
+            };
+            let ab_min_w = if bar_width >= 820.0 { 44.0 } else { 30.0 };
+            let ab_btn = egui::Button::new(
+                RichText::new(ab_label)
+                    .size(11.0)
+                    .strong()
+                    .color(ab_color),
+            )
+            .min_size(Vec2::new(ab_min_w, 32.0))
+            .fill(style::BUTTON_BG)
+            .corner_radius(6.0);
+
+            let resp = left_ui
+                .add(ab_btn)
+                .on_hover_text(format!(
+                    "{} (Left-click: cycle, Right-click: clear)",
+                    state.ab_repeat.status_text()
+                ));
+            if resp.clicked() {
+                actions.push(ControlsBarAction::CycleAbRepeat);
+            } else if resp.secondary_clicked() {
+                actions.push(ControlsBarAction::ClearAbRepeat);
+            }
+        }
+
+        // Timecode HUD: compact MM:SS at < 420px, full HH:MM:SS / HH:MM:SS at >= 420px
+        let duration_ms = snapshot.media_duration_pts / 1_000_000;
+        let timecode_str = if bar_width < 420.0 {
+            Self::format_compact_timecode(current_ms)
+        } else {
+            format_timecode_hud(current_ms, duration_ms)
+        };
+
+        left_ui.add(
+            egui::Label::new(
+                RichText::new(timecode_str)
+                    .monospace()
+                    .size(if bar_width < 420.0 { 12.0 } else { 13.0 })
+                    .color(style::TEXT_PRIMARY),
+            ),
+        );
+
+        // 2. Measure exact left boundary and allocate strictly bounded right sub-UI
+        let left_end_x = left_ui.min_rect().right().min(row_rect.right());
+        let gap = 8.0;
+        let right_start_x = (left_end_x + gap).min(row_rect.right());
+        let remaining_w = (row_rect.right() - right_start_x).max(0.0);
+
+        let right_rect = egui::Rect::from_min_max(
+            egui::pos2(right_start_x, row_rect.top()),
+            egui::pos2(row_rect.right(), row_rect.bottom()),
+        );
+
+        let mut right_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(right_rect)
+                .layout(Layout::right_to_left(egui::Align::Center)),
+        );
+        right_ui.spacing_mut().item_spacing = egui::vec2(spacing, 0.0);
+        right_ui.set_clip_rect(right_rect.intersect(ui.clip_rect()));
+
+        // 3. Width-budgeted progressive folding for right-side controls
+        let plan = RightControlsPlan::compute(bar_width, remaining_w, spacing, is_compact);
+
+        if plan.show_fullscreen {
+            let fs_label = if state.is_fullscreen { "🗗" } else { "⛶" };
+            if Self::icon_button(
+                &mut right_ui,
+                RichText::new(fs_label).size(14.0).color(style::TEXT_PRIMARY),
+                false,
+                "Toggle Fullscreen (F / F11 / Double-Click)",
+            )
+            .clicked()
+            {
+                actions.push(ControlsBarAction::ToggleFullscreen);
+            }
+        }
+
+        if plan.show_more_menu {
+            let menu_resp = right_ui.menu_button(
+                RichText::new("⋯")
+                    .size(15.0)
+                    .strong()
+                    .color(style::TEXT_PRIMARY),
+                |ui| {
+                    ui.set_min_width(215.0);
+                    Self::render_overflow_menu(ui, state, &plan, &mut actions);
+                },
             );
+            menu_resp.response.on_hover_text("More Controls");
+        }
 
-            // Right-aligned settings group
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                // Fullscreen Toggle Button (F11 / F)
-                let fs_label = if state.is_fullscreen { "🗗" } else { "⛶" };
-                if ui
-                    .button(RichText::new(fs_label).size(14.0))
-                    .on_hover_text("Toggle Fullscreen (F / F11 / Double-Click)")
-                    .clicked()
-                {
-                    actions.push(ControlsBarAction::ToggleFullscreen);
+        if plan.show_info_screenshot
+            && Self::icon_button(
+                &mut right_ui,
+                RichText::new("📸").size(14.0).color(style::TEXT_PRIMARY),
+                false,
+                "Take Lossless Screenshot (F8 / Ctrl+S)",
+            )
+            .clicked()
+        {
+            actions.push(ControlsBarAction::TakeScreenshot);
+        }
+
+        if plan.show_sidebar
+            && Self::icon_button(
+                &mut right_ui,
+                RichText::new("💬").size(14.0).color(style::TEXT_PRIMARY),
+                false,
+                "Toggle Watch-Party Chat & Member Panel",
+            )
+            .clicked()
+        {
+            actions.push(ControlsBarAction::ToggleSidebar);
+        }
+
+        if plan.show_playlist
+            && Self::icon_button(
+                &mut right_ui,
+                RichText::new("🎶").size(14.0).color(style::TEXT_PRIMARY),
+                false,
+                "Playlist Queue (Ctrl+L)",
+            )
+            .clicked()
+        {
+            actions.push(ControlsBarAction::TogglePlaylist);
+        }
+
+        if plan.show_info_screenshot
+            && Self::icon_button(
+                &mut right_ui,
+                RichText::new("ℹ️").size(14.0).color(style::TEXT_PRIMARY),
+                false,
+                "Media Information & Codec Statistics (Ctrl+I)",
+            )
+            .clicked()
+        {
+            actions.push(ControlsBarAction::ToggleMediaInfo);
+        }
+
+        if plan.show_cc_video {
+            right_ui.separator();
+
+            let video_active = state.video_dialog.is_open;
+            if Self::icon_button(
+                &mut right_ui,
+                RichText::new("🎬").size(13.0).color(if video_active {
+                    style::SEEKBAR_PLAYED
+                } else {
+                    style::TEXT_PRIMARY
+                }),
+                video_active,
+                "Video Settings (Aspect Ratio, Playback Speed, Stream Info)",
+            )
+            .clicked()
+            {
+                state.video_dialog.is_open = !state.video_dialog.is_open;
+                if state.video_dialog.is_open {
+                    state.video_dialog.speed = state.speed;
+                    state.video_dialog.aspect_ratio = state.aspect_ratio;
                 }
+                actions.push(ControlsBarAction::OpenVideoSettings);
+            }
 
-                // Lossless Screenshot Button (📸) (hidden on narrow viewports < 560px)
-                if !is_ultra_compact
-                    && ui
-                        .button(RichText::new("📸").size(14.0))
-                        .on_hover_text("Take Lossless Screenshot (F8 / Ctrl+S)")
-                        .clicked()
-                {
-                    actions.push(ControlsBarAction::TakeScreenshot);
-                }
-
-                // Watch-Party Sidebar Toggle
-                if ui
-                    .button(RichText::new("💬").size(14.0))
-                    .on_hover_text("Toggle Watch-Party Chat & Member Panel")
-                    .clicked()
-                {
-                    actions.push(ControlsBarAction::ToggleSidebar);
-                }
-
-                // Playlist Queue Button (🎶)
-                if ui
-                    .button(RichText::new("🎶").size(14.0))
-                    .on_hover_text("Playlist Queue (Ctrl+L)")
-                    .clicked()
-                {
-                    actions.push(ControlsBarAction::TogglePlaylist);
-                }
-
-                // Media Info & Diagnostics Button (ℹ️)
-                if !is_ultra_compact
-                    && ui
-                        .button(RichText::new("ℹ️").size(14.0))
-                        .on_hover_text("Media Information & Codec Statistics (Ctrl+I)")
-                        .clicked()
-                {
-                    actions.push(ControlsBarAction::ToggleMediaInfo);
-                }
-
-                ui.separator();
-
-                // Video Configuration Quick-Access Button (hidden on narrow viewports < 560px)
-                if !is_ultra_compact {
-                    let video_active = state.video_dialog.is_open;
-                    let video_btn = egui::Button::new(
-                        RichText::new("🎬")
-                            .size(13.0)
-                            .color(if video_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
-                    )
-                    .min_size(Vec2::new(28.0, 28.0))
-                    .fill(if video_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
-
-                    if ui
-                        .add(video_btn)
-                        .on_hover_text("Video Settings (Aspect Ratio, Playback Speed, Stream Info)")
-                        .clicked()
-                    {
-                        state.video_dialog.is_open = !state.video_dialog.is_open;
-                        if state.video_dialog.is_open {
-                            state.video_dialog.speed = state.speed;
-                            state.video_dialog.aspect_ratio = state.aspect_ratio;
-                        }
-                        actions.push(ControlsBarAction::OpenVideoSettings);
-                    }
-
-                    // Subtitle Configuration Quick-Access Button
-                    let sub_active = state.subtitle_dialog.is_open;
-                    let sub_btn = egui::Button::new(
-                        RichText::new("CC")
-                            .strong()
-                            .size(12.0)
-                            .color(if sub_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
-                    )
-                    .min_size(Vec2::new(28.0, 28.0))
-                    .fill(if sub_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
-
-                    if ui
-                        .add(sub_btn)
-                        .on_hover_text("Subtitle Settings (Tracks, External Subtitles, Sync Offset)")
-                        .clicked()
-                    {
-                        state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
-                        actions.push(ControlsBarAction::OpenSubtitleSettings);
-                    }
-                }
-
-                // Audio Configuration Quick-Access Button
-                let audio_active = state.audio_dialog.is_open;
-                let audio_btn = egui::Button::new(
-                    RichText::new("🎚")
-                        .size(13.0)
-                        .color(if audio_active { style::SEEKBAR_PLAYED } else { style::TEXT_PRIMARY }),
-                )
-                .min_size(Vec2::new(28.0, 28.0))
-                .fill(if audio_active { style::BUTTON_BG } else { Color32::TRANSPARENT });
-
-                if ui
-                    .add(audio_btn)
-                    .on_hover_text("Audio Settings (Track Selection, Volume, Sync Delay)")
-                    .clicked()
-                {
-                    state.audio_dialog.is_open = !state.audio_dialog.is_open;
-                    if state.audio_dialog.is_open {
-                        state.audio_dialog.volume = state.volume.volume;
-                        state.audio_dialog.is_muted = state.volume.is_muted;
-                    }
-                    actions.push(ControlsBarAction::OpenAudioSettings);
-                }
-
-                if !is_compact {
-                    ui.separator();
-
-                    // Aspect Ratio Selector (Original, 16:9, 4:3, 21:9, 1:1, Fill/Stretch)
-                    let aspect_label = format!("📐 {}", state.aspect_ratio.display_name());
-                    egui::ComboBox::from_id_salt("aspect_ratio_selector")
-                        .selected_text(
-                            RichText::new(aspect_label)
-                                .size(12.0)
-                                .color(style::TEXT_PRIMARY),
-                        )
-                        .width(88.0)
-                        .show_ui(ui, |ui| {
-                            for &ar in &AspectRatioOverride::ALL {
-                                let is_selected = state.aspect_ratio == ar;
-                                if ui.selectable_label(is_selected, ar.display_name()).clicked() {
-                                    state.aspect_ratio = ar;
-                                    actions.push(ControlsBarAction::SetAspectRatio(ar));
-                                }
-                            }
-                        });
-
-                    ui.separator();
-
-                    // Playback Speed Selector (0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 1.75x, 2.0x)
-                    let speed_label = format!("{:.2}x", state.speed);
-                    egui::ComboBox::from_id_salt("playback_speed_selector")
-                        .selected_text(
-                            RichText::new(speed_label)
-                                .monospace()
-                                .size(12.0)
-                                .color(style::TEXT_PRIMARY),
-                        )
-                        .width(68.0)
-                        .show_ui(ui, |ui| {
-                            for &spd in &SUPPORTED_SPEEDS {
-                                let label = format!("{:.2}x", spd);
-                                let is_selected = (state.speed - spd).abs() < 0.01;
-                                if ui.selectable_label(is_selected, label).clicked() {
-                                    state.speed = spd;
-                                    actions.push(ControlsBarAction::SetSpeed(spd));
-                                }
-                            }
-                        });
-                }
-
-                ui.separator();
-                if !is_ultra_compact {
-                    // Volume percentage text (amber highlight when boosted > 100%)
-                    let vol_color = if state.volume.volume > 1.0 {
-                        Color32::from_rgb(251, 146, 60)
+            let sub_active = state.subtitle_dialog.is_open;
+            if Self::icon_button(
+                &mut right_ui,
+                RichText::new("CC")
+                    .strong()
+                    .size(12.0)
+                    .color(if sub_active {
+                        style::SEEKBAR_PLAYED
                     } else {
-                        style::TEXT_SECONDARY
-                    };
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(state.volume.formatted_percentage())
-                                .monospace()
-                                .size(12.0)
-                                .color(vol_color),
-                        ),
-                    );
+                        style::TEXT_PRIMARY
+                    }),
+                sub_active,
+                "Subtitle Settings (Tracks, External Subtitles, Sync Offset)",
+            )
+            .clicked()
+            {
+                state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
+                actions.push(ControlsBarAction::OpenSubtitleSettings);
+            }
+        }
+
+        if plan.show_audio {
+            let audio_active = state.audio_dialog.is_open;
+            if Self::icon_button(
+                &mut right_ui,
+                RichText::new("🎚").size(13.0).color(if audio_active {
+                    style::SEEKBAR_PLAYED
+                } else {
+                    style::TEXT_PRIMARY
+                }),
+                audio_active,
+                "Audio Settings (Track Selection, Volume, Sync Delay)",
+            )
+            .clicked()
+            {
+                state.audio_dialog.is_open = !state.audio_dialog.is_open;
+                if state.audio_dialog.is_open {
+                    state.audio_dialog.volume = state.volume.volume;
+                    state.audio_dialog.is_muted = state.volume.is_muted;
+                }
+                actions.push(ControlsBarAction::OpenAudioSettings);
+            }
+        }
+
+        if plan.show_aspect {
+            right_ui.separator();
+
+            let aspect_label = format!("📐 {}", state.aspect_ratio.display_name());
+            egui::ComboBox::from_id_salt("aspect_ratio_selector")
+                .selected_text(
+                    RichText::new(aspect_label)
+                        .size(12.0)
+                        .color(style::TEXT_PRIMARY),
+                )
+                .width(88.0)
+                .show_ui(&mut right_ui, |ui| {
+                    for &ar in &AspectRatioOverride::ALL {
+                        let is_selected = state.aspect_ratio == ar;
+                        if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                            state.aspect_ratio = ar;
+                            actions.push(ControlsBarAction::SetAspectRatio(ar));
+                        }
+                    }
+                });
+        }
+
+        if plan.show_speed {
+            right_ui.separator();
+
+            let speed_label = format!("{:.2}x", state.speed);
+            egui::ComboBox::from_id_salt("playback_speed_selector")
+                .selected_text(
+                    RichText::new(speed_label)
+                        .monospace()
+                        .size(12.0)
+                        .color(style::TEXT_PRIMARY),
+                )
+                .width(68.0)
+                .show_ui(&mut right_ui, |ui| {
+                    for &spd in &SUPPORTED_SPEEDS {
+                        let label = format!("{:.2}x", spd);
+                        let is_selected = (state.speed - spd).abs() < 0.01;
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            state.speed = spd;
+                            actions.push(ControlsBarAction::SetSpeed(spd));
+                        }
+                    }
+                });
+        }
+
+        if plan.show_volume_slider {
+            if plan.show_volume_separator {
+                right_ui.separator();
+            }
+
+            if plan.show_volume_pct {
+                let vol_color = if state.volume.volume > 1.0 {
+                    Color32::from_rgb(251, 146, 60)
+                } else {
+                    style::TEXT_SECONDARY
+                };
+                right_ui.add(
+                    egui::Label::new(
+                        RichText::new(state.volume.formatted_percentage())
+                            .monospace()
+                            .size(12.0)
+                            .color(vol_color),
+                    ),
+                );
+            }
+
+            let mut vol = state.volume.volume;
+            let slider = egui::Slider::new(&mut vol, 0.0..=VolumeControlState::MAX_VOLUME)
+                .show_value(false)
+                .trailing_fill(true);
+            let slider_resp = right_ui.add_sized(Vec2::new(plan.slider_width, 16.0), slider);
+            if slider_resp.changed() {
+                state.volume.set_volume(vol);
+                actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+            } else if slider_resp.hovered() {
+                let scroll_y = right_ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_y >= 2.0 {
+                    let new_vol = (state.volume.volume + 0.05).min(VolumeControlState::MAX_VOLUME);
+                    state.volume.set_volume(new_vol);
+                    actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+                } else if scroll_y <= -2.0 {
+                    let new_vol = (state.volume.volume - 0.05).max(0.0);
+                    state.volume.set_volume(new_vol);
+                    actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
+                }
+            }
+        }
+
+        if plan.show_mute
+            && Self::icon_button(
+                &mut right_ui,
+                RichText::new(state.volume.glyph()).font(FontId::proportional(14.0)),
+                false,
+                "Toggle Mute (M)",
+            )
+            .clicked()
+        {
+            state.volume.toggle_mute();
+            actions.push(ControlsBarAction::ToggleMute);
+        }
+
+        let right_min = right_ui.min_rect();
+        let bounds = ControlsRowBounds {
+            row_rect,
+            left_end_x,
+            right_rect,
+            right_widgets_min_x: if right_min.width() > 0.0 {
+                right_min.left()
+            } else {
+                right_rect.right()
+            },
+            right_widgets_max_x: if right_min.width() > 0.0 {
+                right_min.right()
+            } else {
+                right_rect.right()
+            },
+        };
+
+        (actions, bounds)
+    }
+
+    /// Renders the compact `⋯` ("More Controls") popover menu containing all folded controls.
+    fn render_overflow_menu(
+        ui: &mut Ui,
+        state: &mut ControlsBarState,
+        plan: &RightControlsPlan,
+        actions: &mut Vec<ControlsBarAction>,
+    ) {
+        if !plan.show_fullscreen && ui.button("⛶ Toggle Fullscreen (F)").clicked() {
+            actions.push(ControlsBarAction::ToggleFullscreen);
+            ui.close();
+        }
+
+        if !plan.show_sidebar && ui.button("💬 Toggle Watch-Party Panel").clicked() {
+            actions.push(ControlsBarAction::ToggleSidebar);
+            ui.close();
+        }
+
+        if !plan.show_volume_slider {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new(state.volume.glyph()).size(13.0))
+                    .on_hover_text("Toggle Mute (M)")
+                    .clicked()
+                {
+                    state.volume.toggle_mute();
+                    actions.push(ControlsBarAction::ToggleMute);
                 }
 
-                // Volume Slider (0.0 to 2.0 with soft-knee saturation, compact width on narrow viewports)
                 let mut vol = state.volume.volume;
                 let slider = egui::Slider::new(&mut vol, 0.0..=VolumeControlState::MAX_VOLUME)
                     .show_value(false)
                     .trailing_fill(true);
-                let slider_width = if is_ultra_compact { 50.0 } else { 80.0 };
-                let slider_resp = ui.add_sized(Vec2::new(slider_width, 16.0), slider);
-                if slider_resp.changed() {
+                if ui.add_sized(Vec2::new(115.0, 16.0), slider).changed() {
                     state.volume.set_volume(vol);
                     actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
-                } else if slider_resp.hovered() {
-                    let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll_y >= 2.0 {
-                        let new_vol = (state.volume.volume + 0.05).min(VolumeControlState::MAX_VOLUME);
-                        state.volume.set_volume(new_vol);
-                        actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
-                    } else if scroll_y <= -2.0 {
-                        let new_vol = (state.volume.volume - 0.05).max(0.0);
-                        state.volume.set_volume(new_vol);
-                        actions.push(ControlsBarAction::SetVolume(state.volume.effective_volume()));
-                    }
                 }
 
-                // Mute Toggle Button ('M')
-                let mute_btn = egui::Button::new(
-                    RichText::new(state.volume.glyph()).font(FontId::proportional(14.0)),
-                )
-                .min_size(Vec2::new(28.0, 28.0))
-                .fill(Color32::TRANSPARENT);
-
-                if ui.add(mute_btn).clicked() {
-                    state.volume.toggle_mute();
-                    actions.push(ControlsBarAction::ToggleMute);
-                }
+                ui.label(
+                    RichText::new(state.volume.formatted_percentage())
+                        .monospace()
+                        .size(11.0),
+                );
             });
+            ui.separator();
+        }
+
+        ui.menu_button("⏩ Playback Speed", |ui| {
+            for &spd in &SUPPORTED_SPEEDS {
+                let label = format!("{:.2}x", spd);
+                let is_selected = (state.speed - spd).abs() < 0.01;
+                if ui.selectable_label(is_selected, label).clicked() {
+                    state.speed = spd;
+                    actions.push(ControlsBarAction::SetSpeed(spd));
+                    ui.close();
+                }
+            }
         });
 
-        actions
+        ui.menu_button("📐 Aspect Ratio", |ui| {
+            for &ar in &AspectRatioOverride::ALL {
+                let is_selected = state.aspect_ratio == ar;
+                if ui.selectable_label(is_selected, ar.display_name()).clicked() {
+                    state.aspect_ratio = ar;
+                    actions.push(ControlsBarAction::SetAspectRatio(ar));
+                    ui.close();
+                }
+            }
+        });
+
+        ui.menu_button("🔁 A-B Repeat", |ui| {
+            ui.label(
+                RichText::new(state.ab_repeat.status_text())
+                    .size(11.0)
+                    .color(style::TEXT_SECONDARY),
+            );
+            ui.separator();
+            if ui.button("Cycle A-B Point (L)").clicked() {
+                actions.push(ControlsBarAction::CycleAbRepeat);
+                ui.close();
+            }
+            if ui.button("Clear A-B Loop").clicked() {
+                actions.push(ControlsBarAction::ClearAbRepeat);
+                ui.close();
+            }
+        });
+
+        ui.separator();
+
+        if ui.button("🎚 Audio Settings...").clicked() {
+            state.audio_dialog.is_open = !state.audio_dialog.is_open;
+            if state.audio_dialog.is_open {
+                state.audio_dialog.volume = state.volume.volume;
+                state.audio_dialog.is_muted = state.volume.is_muted;
+            }
+            actions.push(ControlsBarAction::OpenAudioSettings);
+            ui.close();
+        }
+
+        if ui.button("💬 Subtitle Settings...").clicked() {
+            state.subtitle_dialog.is_open = !state.subtitle_dialog.is_open;
+            actions.push(ControlsBarAction::OpenSubtitleSettings);
+            ui.close();
+        }
+
+        if ui.button("🎬 Video Settings...").clicked() {
+            state.video_dialog.is_open = !state.video_dialog.is_open;
+            if state.video_dialog.is_open {
+                state.video_dialog.speed = state.speed;
+                state.video_dialog.aspect_ratio = state.aspect_ratio;
+            }
+            actions.push(ControlsBarAction::OpenVideoSettings);
+            ui.close();
+        }
+
+        ui.separator();
+
+        if ui.button("🎶 Playlist Queue").clicked() {
+            actions.push(ControlsBarAction::TogglePlaylist);
+            ui.close();
+        }
+        if ui.button("ℹ️ Media Info & Stats").clicked() {
+            actions.push(ControlsBarAction::ToggleMediaInfo);
+            ui.close();
+        }
+        if ui.button("📸 Take Screenshot").clicked() {
+            actions.push(ControlsBarAction::TakeScreenshot);
+            ui.close();
+        }
+
+        ui.separator();
+
+        if ui.button("⏮ Previous Track").clicked() {
+            actions.push(ControlsBarAction::PreviousTrack);
+            ui.close();
+        }
+        if ui.button("⏭ Next Track").clicked() {
+            actions.push(ControlsBarAction::NextTrack);
+            ui.close();
+        }
+        if ui.button("⏪ Previous Chapter").clicked() {
+            actions.push(ControlsBarAction::PreviousChapter);
+            ui.close();
+        }
+        if ui.button("⏩ Next Chapter").clicked() {
+            actions.push(ControlsBarAction::NextChapter);
+            ui.close();
+        }
+    }
+}
+
+/// Measured horizontal bounds of the left and right regions of a rendered controls row.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct ControlsRowBounds {
+    row_rect: egui::Rect,
+    left_end_x: f32,
+    right_rect: egui::Rect,
+    right_widgets_min_x: f32,
+    right_widgets_max_x: f32,
+}
+
+/// Width-budgeted visibility plan for right-side playback controls.
+#[derive(Debug, Clone, Copy)]
+struct RightControlsPlan {
+    show_fullscreen: bool,
+    show_more_menu: bool,
+    show_sidebar: bool,
+    show_mute: bool,
+    show_volume_slider: bool,
+    show_volume_pct: bool,
+    show_volume_separator: bool,
+    slider_width: f32,
+    show_speed: bool,
+    show_aspect: bool,
+    show_audio: bool,
+    show_cc_video: bool,
+    show_playlist: bool,
+    show_info_screenshot: bool,
+}
+
+impl RightControlsPlan {
+    /// Computes which right-side controls fit cleanly inside `remaining_w` without crossing `left_end_x`.
+    fn compute(bar_width: f32, remaining_w: f32, spacing: f32, is_compact: bool) -> Self {
+        let btn_w = 30.0_f32;
+        let sep_cost = 10.0 + spacing;
+        let slider_width = if bar_width < 820.0 { 56.0 } else { 80.0 };
+        let slider_cost = slider_width + 12.0 + spacing;
+        let vol_pct_cost = 40.0 + spacing;
+        let speed_cost = 72.0 + spacing + sep_cost;
+        let aspect_cost = 92.0 + spacing + sep_cost;
+        let cc_video_cost = (btn_w + spacing) * 2.0 + sep_cost;
+        let info_screenshot_cost = (btn_w + spacing) * 2.0;
+
+        // Total width if every single control is shown inline without the `⋯` overflow menu.
+        let full_inline_cost = btn_w
+            + (btn_w + spacing) * 7.0
+            + sep_cost * 3.0
+            + (72.0 + spacing)
+            + (92.0 + spacing)
+            + vol_pct_cost
+            + slider_cost;
+
+        if !is_compact && bar_width >= 980.0 && remaining_w >= full_inline_cost {
+            return Self {
+                show_fullscreen: true,
+                show_more_menu: false,
+                show_sidebar: true,
+                show_mute: true,
+                show_volume_slider: true,
+                show_volume_pct: true,
+                show_volume_separator: true,
+                slider_width,
+                show_speed: true,
+                show_aspect: true,
+                show_audio: true,
+                show_cc_video: true,
+                show_playlist: true,
+                show_info_screenshot: true,
+            };
+        }
+
+        // At least one control is folded; reserve `⋯` button first if any room exists.
+        if remaining_w < 26.0 {
+            return Self {
+                show_fullscreen: false,
+                show_more_menu: false,
+                show_sidebar: false,
+                show_mute: false,
+                show_volume_slider: false,
+                show_volume_pct: false,
+                show_volume_separator: false,
+                slider_width,
+                show_speed: false,
+                show_aspect: false,
+                show_audio: false,
+                show_cc_video: false,
+                show_playlist: false,
+                show_info_screenshot: false,
+            };
+        }
+
+        let mut budget = remaining_w - 30.0;
+        let btn_step = btn_w + spacing;
+
+        let show_fullscreen = if budget >= btn_step {
+            budget -= btn_step;
+            true
+        } else {
+            false
+        };
+
+        let show_sidebar = if budget >= btn_step {
+            budget -= btn_step;
+            true
+        } else {
+            false
+        };
+
+        let show_mute = if budget >= btn_step {
+            budget -= btn_step;
+            true
+        } else {
+            false
+        };
+
+        let show_volume_slider = if remaining_w >= 170.0 && budget >= slider_cost {
+            budget -= slider_cost;
+            true
+        } else {
+            false
+        };
+
+        let show_volume_pct =
+            if show_volume_slider && bar_width >= 560.0 && budget >= vol_pct_cost {
+                budget -= vol_pct_cost;
+                true
+            } else {
+                false
+            };
+
+        // Reserve optional separator before volume slider if any secondary left-of-volume group fits.
+        let show_speed = if !is_compact && budget >= speed_cost + sep_cost {
+            budget -= speed_cost;
+            true
+        } else {
+            false
+        };
+
+        let show_aspect = if !is_compact && budget >= aspect_cost + sep_cost {
+            budget -= aspect_cost;
+            true
+        } else {
+            false
+        };
+
+        let show_audio = if budget >= btn_step + sep_cost {
+            budget -= btn_step;
+            true
+        } else {
+            false
+        };
+
+        let show_cc_video = if bar_width >= 560.0 && budget >= cc_video_cost + sep_cost {
+            budget -= cc_video_cost;
+            true
+        } else {
+            false
+        };
+
+        let show_playlist = if budget >= btn_step + sep_cost {
+            budget -= btn_step;
+            true
+        } else {
+            false
+        };
+
+        let show_info_screenshot = !is_compact && budget >= info_screenshot_cost + sep_cost;
+
+        let any_left_of_vol = show_speed || show_aspect || show_audio || show_cc_video;
+        let show_volume_separator = show_volume_slider && any_left_of_vol;
+
+        Self {
+            show_fullscreen,
+            show_more_menu: true,
+            show_sidebar,
+            show_mute,
+            show_volume_slider,
+            show_volume_pct,
+            show_volume_separator,
+            slider_width,
+            show_speed,
+            show_aspect,
+            show_audio,
+            show_cc_video,
+            show_playlist,
+            show_info_screenshot,
+        }
     }
 }
 
@@ -1114,6 +1605,101 @@ mod tests {
     fn test_controls_clear_ab_repeat_action() {
         let action = ControlsBarAction::ClearAbRepeat;
         assert!(matches!(action, ControlsBarAction::ClearAbRepeat));
+    }
+
+    #[test]
+    fn test_controls_bar_non_overlapping_across_widths_and_dpi() {
+        let widths = [
+            200.0, 320.0, 480.0, 560.0, 640.0, 700.0, 800.0, 930.0, 1024.0, 1280.0, 1920.0,
+        ];
+        let dpis = [1.0_f32, 1.5, 2.0];
+
+        let snapshot = PlayerUiSnapshot {
+            media_position_pts: 125_000_000_000,   // 00:02:05
+            media_duration_pts: 3_600_000_000_000, // 01:00:00
+            playback_state: 1,
+            ..Default::default()
+        };
+        let now = Instant::now();
+
+        for &ppp in &dpis {
+            for &w in &widths {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+                let mut state = ControlsBarState::default();
+
+                // 1. Full PlaybackControlsBar::show must never panic at any width/DPI
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, 400.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw_input.clone(), |ui| {
+                    ui.set_width(w);
+                    ui.set_height(120.0);
+                    let _actions = PlaybackControlsBar::show(ui, &snapshot, &mut state, now);
+                });
+                output.textures_delta.clear();
+
+                // 2. Direct bounds check on render_controls_row_with_bounds
+                let mut captured_bounds: Option<ControlsRowBounds> = None;
+                let mut output2 = ctx.run_ui(raw_input, |ui| {
+                    ui.set_width(w);
+                    ui.set_height(60.0);
+                    let (_actions, bounds) = PlaybackControlsBar::render_controls_row_with_bounds(
+                        ui, &snapshot, &mut state, 125_000,
+                    );
+                    captured_bounds = Some(bounds);
+                });
+                output2.textures_delta.clear();
+
+                let bounds = captured_bounds.expect("bounds must be captured");
+                assert!(
+                    bounds.right_rect.left() >= bounds.left_end_x - 0.01,
+                    "width={w} ppp={ppp}: right_rect.left() ({}) crossed left_end_x ({})",
+                    bounds.right_rect.left(),
+                    bounds.left_end_x
+                );
+                assert!(
+                    bounds.right_widgets_min_x >= bounds.left_end_x - 0.01,
+                    "width={w} ppp={ppp}: right_widgets_min_x ({}) overlapped left_end_x ({})",
+                    bounds.right_widgets_min_x,
+                    bounds.left_end_x
+                );
+                assert!(
+                    bounds.right_widgets_max_x <= bounds.row_rect.right() + 0.5,
+                    "width={w} ppp={ppp}: right_widgets_max_x ({}) overflowed row_rect.right() ({})",
+                    bounds.right_widgets_max_x,
+                    bounds.row_rect.right()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_right_controls_plan_progressive_folding_rules() {
+        // Ultra-narrow remaining_w < 170 hides volume slider into overflow menu
+        let plan_narrow = RightControlsPlan::compute(480.0, 140.0, 6.0, true);
+        assert!(plan_narrow.show_more_menu);
+        assert!(!plan_narrow.show_volume_slider);
+        assert!(plan_narrow.show_fullscreen);
+
+        // Width < 820 shrinks slider to 56px
+        let plan_mid = RightControlsPlan::compute(760.0, 360.0, 6.0, false);
+        assert!(plan_mid.show_more_menu);
+        assert!(plan_mid.show_volume_slider);
+        assert_eq!(plan_mid.slider_width, 56.0);
+
+        // Wide >= 980 with ample remaining_w shows all controls inline without overflow menu
+        let plan_wide = RightControlsPlan::compute(1280.0, 880.0, 8.0, false);
+        assert!(!plan_wide.show_more_menu);
+        assert!(plan_wide.show_speed);
+        assert!(plan_wide.show_aspect);
+        assert!(plan_wide.show_cc_video);
+        assert!(plan_wide.show_info_screenshot);
+        assert_eq!(plan_wide.slider_width, 80.0);
     }
 }
 
