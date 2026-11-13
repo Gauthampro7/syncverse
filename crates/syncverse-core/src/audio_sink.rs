@@ -85,6 +85,11 @@ pub trait AudioSink: Send {
     fn available_frames(&self) -> usize {
         usize::MAX
     }
+
+    /// Returns true if the sink natively applies volume/mute inside its real-time callback.
+    fn handles_gain_internally(&self) -> bool {
+        false
+    }
 }
 
 /// Shared lock-free ring buffer and atomic control state between [`CpalAudioSink`] and its
@@ -858,6 +863,10 @@ impl AudioSink for CpalAudioSink {
     fn available_frames(&self) -> usize {
         self.engine.available_frames()
     }
+
+    fn handles_gain_internally(&self) -> bool {
+        true
+    }
 }
 
 /// Pure-Rust audio sink streaming raw IEEE 754 32-bit float PCM samples to a system subprocess pipe.
@@ -1244,6 +1253,10 @@ impl AudioSink for AutoAudioSink {
             Self::Pipe(p) => p.available_frames(),
             Self::Null(n) => n.available_frames(),
         }
+    }
+
+    fn handles_gain_internally(&self) -> bool {
+        matches!(self, Self::Cpal(_))
     }
 }
 

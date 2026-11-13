@@ -10,6 +10,8 @@ pub mod coordinator;
 pub mod error;
 pub mod interactive;
 pub mod playback_runtime;
+mod subtitle_runtime;
+mod sync_runtime;
 
 pub use aggregator::{SubsystemMetrics, TelemetryAggregator};
 pub use audio_sink::{AudioSink, AutoAudioSink, MockAudioSink, NullAudioSink, PipeAudioSink};

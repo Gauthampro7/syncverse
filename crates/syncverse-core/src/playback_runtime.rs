@@ -19,13 +19,16 @@ use syncverse_chat::{
     RoomAnnouncement, SlashCommandParser, SyncDiagnostics,
 };
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
+use syncverse_codecs::audio::LinearResampler;
+use syncverse_codecs::frame::RgbaFramePool;
 use syncverse_codecs::{
     apply_gain, UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA,
 };
+use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack as CommonSubtitleTrack};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::{
-    ClientNode, HostServer, MediaFingerprint, PeerStatusPayload, RoomCryptoSession,
-    UpnpMappingGuard, UpnpStatus,
+    spawn_upnp_mapping, ClientNode, HostServer, MediaFingerprint, PeerControlAction,
+    PeerStatusPayload, RoomCryptoSession,
 };
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
@@ -34,8 +37,17 @@ use syncverse_ui::{
     SNAPSHOT_FLAG_MUTED,
 };
 
-use crate::audio_sink::{AudioSink, AutoAudioSink};
+use crate::audio_sink::{create_default_audio_sink, AudioSink};
 use crate::error::CoreError;
+use crate::subtitle_runtime::{
+    build_embedded_subtitle_decoders, choose_initial_subtitle_track,
+    composite_active_bitmap_subtitle, find_exact_stem_sidecar_languages,
+    process_embedded_subtitle_packet, to_ui_subtitle_tracks, EmbeddedSubtitleDecoderEntry,
+};
+use crate::sync_runtime::{
+    broadcast_chat_announcement, broadcast_local_peer_status, get_sender_name,
+    poll_host_upnp_status, send_client_peer_control, WatchPartyRole,
+};
 
 /// Commands delivered to the asynchronous audio streaming thread.
 #[derive(Debug, Clone)]
@@ -63,8 +75,119 @@ pub enum AudioWorkerCommand {
     SetCompressor(Option<syncverse_codecs::audio::AudioDynamicsCompressor>),
     /// Update stereo balance panning [-1.0, 1.0].
     SetStereoPan(f32),
+    /// Update output volume gain `[0.0, 2.0]`.
+    SetVolume(f32),
+    /// Update mute state non-destructively.
+    SetMuted(bool),
+    /// Update playback speed multiplier `[0.2, 4.0]` for real-time resampling.
+    SetSpeed(f64),
+    /// Update audio presentation delay offset in milliseconds `[-5000, 5000]`.
+    SetAudioDelay(i64),
+    /// Cleanly terminates the audio worker thread.
+    Shutdown,
 }
 
+/// Dispatches a single [`AudioWorkerCommand`] inside [`run_audio_sink_worker`].
+///
+/// Returns `false` when [`AudioWorkerCommand::Shutdown`] is received.
+#[allow(clippy::too_many_arguments)]
+fn handle_audio_worker_command(
+    cmd: AudioWorkerCommand,
+    sink: &mut Box<dyn AudioSink>,
+    local_generation: &mut u64,
+    pending_queue: &mut VecDeque<(u64, Vec<f32>, u64)>,
+    needs_fade_in: &mut bool,
+    equalizer: &mut syncverse_codecs::audio::AudioEqualizer10Band,
+    compressor: &mut Option<syncverse_codecs::audio::AudioDynamicsCompressor>,
+    stereo_pan: &mut f32,
+    volume: &mut f32,
+    muted: &mut bool,
+    speed: &mut f64,
+    audio_delay_ms: &mut i64,
+    resampler: &LinearResampler,
+    clock: &MasterClock,
+) -> bool {
+    match cmd {
+        AudioWorkerCommand::Shutdown => return false,
+        AudioWorkerCommand::Reset => {
+            *local_generation = local_generation.wrapping_add(1);
+            equalizer.reset();
+            if let Some(ref mut c) = compressor {
+                c.reset();
+            }
+            resampler.reset();
+            // Smooth micro-fade-out of remaining front audio to eliminate DC offset clicks/pops
+            if let Some((_, ref samples, _)) = pending_queue.front() {
+                let fade_len = samples.len().min(256);
+                if fade_len > 0 {
+                    let mut fade_buf = samples[..fade_len].to_vec();
+                    for (i, s) in fade_buf.iter_mut().enumerate() {
+                        *s *= 1.0 - (i as f32 / fade_len as f32);
+                    }
+                    let _ = sink.write_samples(&fade_buf);
+                }
+            }
+            let _ = sink.flush();
+            pending_queue.clear();
+            *needs_fade_in = true;
+        }
+        AudioWorkerCommand::Pause => {
+            let _ = sink.pause();
+        }
+        AudioWorkerCommand::Resume => {
+            let _ = sink.resume();
+        }
+        AudioWorkerCommand::SetEqualizer(cfg) => {
+            equalizer.set_config(cfg);
+        }
+        AudioWorkerCommand::SetCompressor(comp) => {
+            *compressor = comp;
+        }
+        AudioWorkerCommand::SetStereoPan(pan) => {
+            *stereo_pan = pan;
+        }
+        AudioWorkerCommand::SetVolume(vol) => {
+            *volume = vol.clamp(0.0, 2.0);
+            let effective = if *muted { 0.0 } else { *volume };
+            sink.set_volume(effective);
+        }
+        AudioWorkerCommand::SetMuted(m) => {
+            *muted = m;
+            sink.set_muted(*muted);
+            let effective = if *muted { 0.0 } else { *volume };
+            sink.set_volume(effective);
+        }
+        AudioWorkerCommand::SetSpeed(spd) => {
+            let clamped = spd.clamp(0.2, 4.0);
+            let was_bypass = (*speed - 1.0).abs() < 1e-4;
+            let now_active = (clamped - 1.0).abs() >= 1e-4;
+            if was_bypass && now_active {
+                resampler.reset();
+            }
+            *speed = clamped;
+            let _ = resampler.set_speed_ratio(clamped);
+        }
+        AudioWorkerCommand::SetAudioDelay(delay) => {
+            *audio_delay_ms = delay.clamp(-5000, 5000);
+        }
+        AudioWorkerCommand::TimestampedSamples {
+            pts_ms,
+            samples,
+            generation,
+        } => {
+            if generation >= *local_generation && !samples.is_empty() {
+                pending_queue.push_back((pts_ms, samples, generation));
+            }
+        }
+        AudioWorkerCommand::Samples(samples) => {
+            if !samples.is_empty() {
+                let now_pts = clock.current_pts(Instant::now()).max(0.0) as u64;
+                pending_queue.push_back((now_pts, samples, *local_generation));
+            }
+        }
+    }
+    true
+}
 
 /// Runs the dedicated audio sink output loop on an isolated OS thread with MasterClock pacing and closed-loop sync.
 fn run_audio_sink_worker(
@@ -72,87 +195,47 @@ fn run_audio_sink_worker(
     clock: Arc<MasterClock>,
     running: Arc<AtomicBool>,
 ) {
-    let mut sink = AutoAudioSink::new();
+    let mut sink = create_default_audio_sink(false);
     let mut local_generation: u64 = 0;
     let mut pending_queue: VecDeque<(u64, Vec<f32>, u64)> = VecDeque::with_capacity(128);
     let mut needs_fade_in = false;
     let mut equalizer = syncverse_codecs::audio::AudioEqualizer10Band::default();
     let mut compressor: Option<syncverse_codecs::audio::AudioDynamicsCompressor> = None;
     let mut stereo_pan: f32 = 0.0;
-
-    let handle_reset = |local_gen: &mut u64,
-                        queue: &mut VecDeque<(u64, Vec<f32>, u64)>,
-                        sink: &mut AutoAudioSink,
-                        fade_in: &mut bool,
-                        eq: &mut syncverse_codecs::audio::AudioEqualizer10Band,
-                        comp: &mut Option<syncverse_codecs::audio::AudioDynamicsCompressor>| {
-        *local_gen = local_gen.wrapping_add(1);
-        eq.reset();
-        if let Some(ref mut c) = comp {
-            c.reset();
-        }
-        // Smooth micro-fade-out of remaining front audio to eliminate DC offset clicks/pops
-        if let Some((_, ref samples, _)) = queue.front() {
-            let fade_len = samples.len().min(256);
-            if fade_len > 0 {
-                let mut fade_buf = samples[..fade_len].to_vec();
-                for (i, s) in fade_buf.iter_mut().enumerate() {
-                    *s *= 1.0 - (i as f32 / fade_len as f32);
-                }
-                let _ = sink.write_samples(&fade_buf);
-                let _ = sink.flush();
-            }
-        }
-        queue.clear();
-        *fade_in = true;
-    };
+    let mut volume: f32 = 1.0;
+    let mut muted: bool = false;
+    let mut speed: f64 = 1.0;
+    let mut audio_delay_ms: i64 = 0;
+    let resampler = LinearResampler::new(48_000, 48_000, 2)
+        .expect("48kHz stereo LinearResampler initialization must succeed");
+    let mut resampled_buf: Vec<f32> = Vec::with_capacity(4096);
 
     while running.load(Ordering::Relaxed) {
-        // 1. Drain incoming commands non-blockingly to catch Resets and queue fresh samples
+        // 1. Drain incoming commands non-blockingly to catch Resets, control changes, and fresh samples
         while let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                AudioWorkerCommand::Reset => {
-                    handle_reset(
-                        &mut local_generation,
-                        &mut pending_queue,
-                        &mut sink,
-                        &mut needs_fade_in,
-                        &mut equalizer,
-                        &mut compressor,
-                    );
-                }
-                AudioWorkerCommand::Pause => {
-                    let _ = sink.pause();
-                }
-                AudioWorkerCommand::Resume => {
-                    let _ = sink.resume();
-                }
-                AudioWorkerCommand::SetEqualizer(cfg) => {
-                    equalizer.set_config(cfg);
-                }
-                AudioWorkerCommand::SetCompressor(comp) => {
-                    compressor = comp;
-                }
-                AudioWorkerCommand::SetStereoPan(pan) => {
-                    stereo_pan = pan;
-                }
-                AudioWorkerCommand::TimestampedSamples {
-                    pts_ms,
-                    samples,
-                    generation,
-                } => {
-                    if generation >= local_generation && !samples.is_empty() {
-                        pending_queue.push_back((pts_ms, samples, generation));
-                    }
-                }
-                AudioWorkerCommand::Samples(samples) => {
-                    if !samples.is_empty() {
-                        let now_pts = clock.current_pts(Instant::now()).max(0.0) as u64;
-                        pending_queue.push_back((now_pts, samples, local_generation));
-                    }
-                }
+            if !handle_audio_worker_command(
+                cmd,
+                &mut sink,
+                &mut local_generation,
+                &mut pending_queue,
+                &mut needs_fade_in,
+                &mut equalizer,
+                &mut compressor,
+                &mut stereo_pan,
+                &mut volume,
+                &mut muted,
+                &mut speed,
+                &mut audio_delay_ms,
+                &resampler,
+                &clock,
+            ) {
+                return;
             }
         }
+
+        // Report remaining DAC hardware buffer latency excluding queued ring samples
+        let dac_latency_ms = sink.latency_ms().saturating_sub(sink.queued_ms());
+        clock.set_audio_latency_ms(dac_latency_ms);
 
         // 2. If clock is not playing, sleep briefly and loop
         if !clock.is_playing() {
@@ -163,47 +246,23 @@ fn run_audio_sink_worker(
         // 3. If pending queue is empty, wait briefly for new commands
         if pending_queue.is_empty() {
             if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(5)) {
-                match cmd {
-                    AudioWorkerCommand::Reset => {
-                        handle_reset(
-                            &mut local_generation,
-                            &mut pending_queue,
-                            &mut sink,
-                            &mut needs_fade_in,
-                            &mut equalizer,
-                            &mut compressor,
-                        );
-                    }
-                    AudioWorkerCommand::Pause => {
-                        let _ = sink.pause();
-                    }
-                    AudioWorkerCommand::Resume => {
-                        let _ = sink.resume();
-                    }
-                    AudioWorkerCommand::SetEqualizer(cfg) => {
-                        equalizer.set_config(cfg);
-                    }
-                    AudioWorkerCommand::SetCompressor(comp) => {
-                        compressor = comp;
-                    }
-                    AudioWorkerCommand::SetStereoPan(pan) => {
-                        stereo_pan = pan;
-                    }
-                    AudioWorkerCommand::TimestampedSamples {
-                        pts_ms,
-                        samples,
-                        generation,
-                    } => {
-                        if generation >= local_generation && !samples.is_empty() {
-                            pending_queue.push_back((pts_ms, samples, generation));
-                        }
-                    }
-                    AudioWorkerCommand::Samples(samples) => {
-                        if !samples.is_empty() {
-                            let now_pts = clock.current_pts(Instant::now()).max(0.0) as u64;
-                            pending_queue.push_back((now_pts, samples, local_generation));
-                        }
-                    }
+                if !handle_audio_worker_command(
+                    cmd,
+                    &mut sink,
+                    &mut local_generation,
+                    &mut pending_queue,
+                    &mut needs_fade_in,
+                    &mut equalizer,
+                    &mut compressor,
+                    &mut stereo_pan,
+                    &mut volume,
+                    &mut muted,
+                    &mut speed,
+                    &mut audio_delay_ms,
+                    &resampler,
+                    &clock,
+                ) {
+                    return;
                 }
             }
             continue;
@@ -222,20 +281,24 @@ fn run_audio_sink_worker(
 
         let now = Instant::now();
         let master_pts = clock.current_pts(now);
-        let delta = (pts_ms as f64) - master_pts;
+        let effective_pts_ms = (pts_ms as i64 + audio_delay_ms).max(0) as f64;
+        let delta = effective_pts_ms - master_pts;
 
         if delta < -500.0 {
             // Severely late frame (> 500ms behind master clock): drop to resynchronize
             pending_queue.pop_front();
             continue;
-        } else if delta > 80.0 {
-            // Frame is early (> 80ms ahead of master clock): soundcard buffer is well supplied.
-            // Wait briefly to maintain ~50-80ms lead buffer.
-            let sleep_ms = (delta - 50.0).clamp(1.0, 10.0) as u64;
+        } else if delta > 80.0 || sink.queued_ms() >= 80 {
+            // Soundcard ring already holds >= 80ms or frame is ahead of target lead window
+            let sleep_ms = if delta > 80.0 {
+                (delta - 50.0).clamp(1.0, 10.0) as u64
+            } else {
+                3
+            };
             thread::sleep(Duration::from_millis(sleep_ms));
             continue;
         } else {
-            // Frame is within presentation window (-500ms <= delta <= 80ms): write to soundcard!
+            // Frame is within presentation window (-500ms <= delta <= 80ms) and sink queued < 80ms
             let (_, mut samples, _) = pending_queue.pop_front().unwrap();
             if needs_fade_in && !samples.is_empty() {
                 let fade_len = samples.len().min(256);
@@ -245,7 +308,7 @@ fn run_audio_sink_worker(
                 needs_fade_in = false;
             }
 
-            // Apply stereo panning, dynamic compression, and 10-band equalizer before soundcard delivery
+            // Apply stereo panning, dynamic compression, and 10-band equalizer before resampling
             if stereo_pan.abs() > 0.01 {
                 syncverse_codecs::audio::AudioStereoPan::pan_interleaved(&mut samples, stereo_pan);
             }
@@ -256,29 +319,34 @@ fn run_audio_sink_worker(
                 equalizer.process_interleaved(&mut samples);
             }
 
+            // Continuous micro-speed / playback rate resampling (bypassed at 1.0x)
+            if (speed - 1.0).abs() >= 1e-4
+                && resampler.resample_into(&samples, &mut resampled_buf).is_ok()
+            {
+                std::mem::swap(&mut samples, &mut resampled_buf);
+            }
+
+            if samples.is_empty() {
+                continue;
+            }
+
+            // Apply software gain only if the backend does not scale gain internally in its callback
+            if !sink.handles_gain_internally() {
+                let effective_vol = if muted { 0.0 } else { volume };
+                if (effective_vol - 1.0).abs() > 1e-4 {
+                    apply_gain(&mut samples, effective_vol);
+                }
+            }
+
             if sink.write_samples(&samples).is_err() {
-                sink = AutoAudioSink::new();
+                sink = create_default_audio_sink(false);
+                let effective_vol = if muted { 0.0 } else { volume };
+                sink.set_volume(effective_vol);
+                sink.set_muted(muted);
                 let _ = sink.write_samples(&samples);
             }
         }
     }
-}
-
-/// Cleans raw subtitle packet text demuxed from container bitstreams (SRT, VTT, or Matroska ASS/SSA).
-fn clean_demuxed_subtitle_packet(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches('\0');
-    if let Some(stripped) = trimmed.strip_prefix("Dialogue:") {
-        let parts: Vec<&str> = stripped.splitn(10, ',').collect();
-        if parts.len() == 10 {
-            return syncverse_demux::subtitles::clean_ass_text(parts[9]);
-        }
-    } else if trimmed.chars().take(30).filter(|&c| c == ',').count() >= 8 {
-        let parts: Vec<&str> = trimmed.splitn(9, ',').collect();
-        if parts.len() == 9 {
-            return syncverse_demux::subtitles::clean_ass_text(parts[8]);
-        }
-    }
-    syncverse_demux::subtitles::clean_srt_text(trimmed)
 }
 
 /// Formats track info into a human-readable display string.
@@ -310,27 +378,35 @@ fn format_track_info(track: &TrackInfo) -> String {
     parts.join(" - ")
 }
 
-/// Active media playback session managing demuxer and decoders.
+/// Active media playback session managing dual demuxers, decoders, pooled RGBA frames, and subtitles.
 struct PlaybackSession {
     demuxer: UniversalDemuxer,
+    audio_demuxer: Option<UniversalDemuxer>,
     video_decoder: Option<UniversalVideoDecoder>,
     audio_decoder: Option<UniversalAudioDecoder>,
     video_track_id: Option<u64>,
     audio_track_id: Option<u64>,
     available_audio_tracks: Vec<TrackInfo>,
-    available_subtitle_tracks: Vec<syncverse_common::subtitles::SubtitleTrack>,
+    available_subtitle_tracks: Vec<CommonSubtitleTrack>,
     selected_subtitle_track_index: Option<usize>,
     subtitle_track_id: Option<u64>,
+    subtitle_decoders: HashMap<u64, EmbeddedSubtitleDecoderEntry>,
     duration_ms: u64,
     eof_reached: bool,
+    audio_eof_reached: bool,
     pending_video_packets: VecDeque<DemuxPacket>,
+    unsent_video_packet: Option<DemuxPacket>,
+    video_eof_sent: bool,
     last_demuxed_video_dts: Option<u64>,
+    last_demuxed_audio_pts_ms: Option<u64>,
+    rgba_pool: RgbaFramePool,
+    video_fps: Option<f64>,
     video_metadata: syncverse_ui::gui::dialogs::VideoStreamMetadata,
     chapters: Vec<syncverse_demux::MediaChapter>,
 }
 
 impl PlaybackSession {
-    /// Attempts to open a media file and initialize decoders for its primary video and audio streams.
+    /// Attempts to open a media file and initialize demuxers, decoders, subtitle parsers, and pools.
     fn open(path: &PathBuf) -> Result<Self, CoreError> {
         if !path.exists() {
             return Err(CoreError::Io(std::io::Error::new(
@@ -338,7 +414,7 @@ impl PlaybackSession {
                 format!("File does not exist: {:?}", path),
             )));
         }
-        let demuxer = UniversalDemuxer::open_file(path)?;
+        let mut demuxer = UniversalDemuxer::open_file(path)?;
 
         let info = demuxer
             .container_info()
@@ -362,7 +438,10 @@ impl PlaybackSession {
             .collect();
 
         let mut available_subtitle_tracks = Vec::new();
+        let mut subtitle_embedded_flags = Vec::new();
+        let mut stream_to_track_index = HashMap::new();
         for t in embedded_subtitle_tracks {
+            let track_idx = available_subtitle_tracks.len();
             let title = t.title.clone().unwrap_or_else(|| {
                 if let Some(ref lang) = t.language {
                     format!("Embedded Subtitle [{}]", lang.to_uppercase())
@@ -370,18 +449,17 @@ impl PlaybackSession {
                     format!("Embedded Subtitle (Track {})", t.track_id)
                 }
             });
-            available_subtitle_tracks.push(syncverse_common::subtitles::SubtitleTrack::new(
+            stream_to_track_index.insert(t.track_id, track_idx);
+            subtitle_embedded_flags.push((t.is_forced, t.is_default));
+            available_subtitle_tracks.push(CommonSubtitleTrack::new(
                 t.track_id as usize,
-                syncverse_common::subtitles::SubtitleSource::Embedded,
+                SubtitleSource::Embedded,
                 t.codec_id.clone(),
                 t.language.clone(),
                 title,
                 Vec::new(),
             ));
         }
-
-        let external_tracks = syncverse_demux::subtitles::scan_external_subtitles(path);
-        available_subtitle_tracks.extend(external_tracks);
 
         let vt = info
             .tracks
@@ -392,6 +470,50 @@ impl PlaybackSession {
 
         let video_track_id = vt.as_ref().map(|t| t.track_id);
         let audio_track_id = at.as_ref().map(|t| t.track_id);
+
+        let video_frame_rate = vt
+            .as_ref()
+            .and_then(|v| demuxer.stream_frame_rate(v.track_id as usize));
+
+        let external_tracks =
+            syncverse_demux::subtitles::scan_external_subtitles_with_fps(path, video_frame_rate);
+        let has_exact_stem_external_subtitle = !find_exact_stem_sidecar_languages(path).is_empty();
+        available_subtitle_tracks.extend(external_tracks);
+
+        let subtitle_decoders = build_embedded_subtitle_decoders(
+            &demuxer,
+            &info.tracks,
+            &stream_to_track_index,
+        );
+
+        let selected_subtitle_track_index = choose_initial_subtitle_track(
+            &available_subtitle_tracks,
+            &subtitle_embedded_flags,
+            has_exact_stem_external_subtitle,
+            Some("en"),
+        );
+        let subtitle_track_id = selected_subtitle_track_index.and_then(|idx| {
+            let t = &available_subtitle_tracks[idx];
+            if t.source == SubtitleSource::Embedded {
+                Some(t.id as u64)
+            } else {
+                None
+            }
+        });
+
+        // Open independent audio demuxer when both video and audio streams exist for <1ms track switch
+        let mut audio_demuxer = if video_track_id.is_some() && audio_track_id.is_some() {
+            UniversalDemuxer::open_file(path).ok()
+        } else {
+            None
+        };
+
+        if let Some(ref mut ad) = audio_demuxer {
+            ad.set_active_streams(None, audio_track_id, false);
+            demuxer.set_active_streams(video_track_id, None, true);
+        } else {
+            demuxer.set_active_streams(video_track_id, audio_track_id, true);
+        }
 
         let video_decoder = if let Some(ref track) = vt {
             if let Some(params) = demuxer.stream_parameters(track.track_id as usize) {
@@ -409,9 +531,10 @@ impl PlaybackSession {
             None
         };
 
+        let audio_demuxer_ref = audio_demuxer.as_ref().unwrap_or(&demuxer);
         let audio_decoder = if let Some(ref track) = at {
-            let tb = demuxer.stream_time_base(track.track_id as usize);
-            if let Some(params) = demuxer.stream_parameters(track.track_id as usize) {
+            let tb = audio_demuxer_ref.stream_time_base(track.track_id as usize);
+            if let Some(params) = audio_demuxer_ref.stream_parameters(track.track_id as usize) {
                 UniversalAudioDecoder::from_parameters(params, tb).ok()
             } else {
                 UniversalAudioDecoder::from_codec_name(
@@ -425,9 +548,6 @@ impl PlaybackSession {
             None
         };
 
-        let video_frame_rate = vt
-            .as_ref()
-            .and_then(|v| demuxer.stream_frame_rate(v.track_id as usize));
         let video_metadata = syncverse_ui::gui::dialogs::VideoStreamMetadata {
             width: vt.as_ref().and_then(|v| v.width),
             height: vt.as_ref().and_then(|v| v.height),
@@ -441,18 +561,26 @@ impl PlaybackSession {
 
         Ok(Self {
             demuxer,
+            audio_demuxer,
             video_decoder,
             audio_decoder,
             video_track_id,
             audio_track_id,
             available_audio_tracks,
             available_subtitle_tracks,
-            selected_subtitle_track_index: None,
-            subtitle_track_id: None,
+            selected_subtitle_track_index,
+            subtitle_track_id,
+            subtitle_decoders,
             duration_ms,
             eof_reached: false,
+            audio_eof_reached: false,
             pending_video_packets: VecDeque::with_capacity(64),
+            unsent_video_packet: None,
+            video_eof_sent: false,
             last_demuxed_video_dts: None,
+            last_demuxed_audio_pts_ms: None,
+            rgba_pool: RgbaFramePool::new(48),
+            video_fps: video_frame_rate,
             video_metadata,
             chapters,
         })
@@ -465,7 +593,7 @@ impl PlaybackSession {
             Some(idx) if idx < self.available_subtitle_tracks.len() => {
                 self.selected_subtitle_track_index = Some(idx);
                 let track = &self.available_subtitle_tracks[idx];
-                self.subtitle_track_id = if track.source == syncverse_common::subtitles::SubtitleSource::Embedded {
+                self.subtitle_track_id = if track.source == SubtitleSource::Embedded {
                     Some(track.id as u64)
                 } else {
                     None
@@ -496,8 +624,8 @@ impl PlaybackSession {
 
     /// Switches the active audio track to the specified `track_id`.
     ///
-    /// Constructs a new `UniversalAudioDecoder` for the selected stream.
-    /// Returns the human-readable description of the selected track on success.
+    /// Constructs a new `UniversalAudioDecoder` for the selected stream and updates
+    /// stream discard masks on the audio demuxer (if dedicated) or primary demuxer.
     fn select_audio_track(&mut self, track_id: u64) -> Result<String, CoreError> {
         let track = self
             .available_audio_tracks
@@ -506,19 +634,32 @@ impl PlaybackSession {
             .cloned()
             .ok_or_else(|| CoreError::Runtime(format!("Audio track ID {} not found", track_id)))?;
 
-        let tb = self.demuxer.stream_time_base(track.track_id as usize);
-        let new_decoder = if let Some(params) = self.demuxer.stream_parameters(track.track_id as usize) {
-            UniversalAudioDecoder::from_parameters(params, tb)?
-        } else {
-            UniversalAudioDecoder::from_codec_name(
-                &track.codec_id,
-                tb,
-                track.codec_private.as_deref(),
-            )?
+        let tb = {
+            let source_demuxer = self.audio_demuxer.as_ref().unwrap_or(&self.demuxer);
+            source_demuxer.stream_time_base(track.track_id as usize)
+        };
+        let new_decoder = {
+            let source_demuxer = self.audio_demuxer.as_ref().unwrap_or(&self.demuxer);
+            if let Some(params) = source_demuxer.stream_parameters(track.track_id as usize) {
+                UniversalAudioDecoder::from_parameters(params, tb)?
+            } else {
+                UniversalAudioDecoder::from_codec_name(
+                    &track.codec_id,
+                    tb,
+                    track.codec_private.as_deref(),
+                )?
+            }
         };
 
         self.audio_decoder = Some(new_decoder);
         self.audio_track_id = Some(track_id);
+
+        if let Some(ref mut ad) = self.audio_demuxer {
+            ad.set_active_streams(None, Some(track_id), false);
+        } else {
+            self.demuxer
+                .set_active_streams(self.video_track_id, Some(track_id), true);
+        }
 
         let desc = format_track_info(&track);
         Ok(desc)
@@ -550,42 +691,90 @@ impl PlaybackSession {
         }
     }
 
+    /// Emits decoded PCM frames with boundary trimming at `target_ms` and unity software gain.
+    fn trim_and_send_audio_frames(
+        pcm_frames: Vec<syncverse_codecs::AudioFramePCM>,
+        target_ms: u64,
+        audio_delay_ms: i64,
+        audio_tx: &Sender<AudioWorkerCommand>,
+        audio_generation: u64,
+    ) -> bool {
+        let mut sent_any = false;
+        for mut pcm in pcm_frames {
+            let effective_pts = (pcm.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+            if effective_pts < target_ms {
+                let diff_ms = target_ms - effective_pts;
+                let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
+                let float_count = num_frames * pcm.channels as usize;
+                if float_count < pcm.samples.len() {
+                    pcm.samples.drain(0..float_count);
+                    pcm.pts_ms = pcm.pts_ms.saturating_add(diff_ms);
+                } else {
+                    continue;
+                }
+            }
+            if !pcm.samples.is_empty() {
+                let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
+                    pts_ms: pcm.pts_ms,
+                    samples: pcm.samples,
+                    generation: audio_generation,
+                });
+                sent_any = true;
+            }
+        }
+        sent_any
+    }
+
     /// Performs synchronous random-access seek and keyframe preroll forward to `target_ms`.
     ///
-    /// Freezes playback timeline during preroll, decodes video reference pictures without RGBA
-    /// conversions until reaching `target_ms`, discards pre-target audio, and trims the boundary
-    /// audio frame to align sample-exact with the target millisecond.
+    /// Never pops from `video_ring` (worker owns the producer side only). Decodes up to 600
+    /// reference video packets into the `RgbaFramePool`, handles near-EOF draining safely, decodes
+    /// interleaved embedded subtitles, and prerolls up to 64 audio packets with unity gain.
     ///
-    /// Returns the exact presentation timestamp where playback will resume.
+    /// Returns `(actual_landed_pts, first_video_frame)` so the caller updates `MasterClock`
+    /// once and stamps `first_video_frame` with the final post-seek `seek_generation()`.
+    #[allow(clippy::too_many_arguments)]
     fn seek_preroll(
         &mut self,
         target_ms: u64,
-        video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>,
         audio_tx: &Sender<AudioWorkerCommand>,
         audio_generation: u64,
-        effective_vol: f32,
         audio_delay_ms: i64,
-    ) -> u64 {
+        subtitle_delay_ms: i64,
+        ui_event_tx: Option<&Sender<UiEvent>>,
+    ) -> (u64, Option<VideoFrameRGBA>) {
         self.pending_video_packets.clear();
+        self.unsent_video_packet = None;
+        self.video_eof_sent = false;
         let _ = self.demuxer.seek_to(target_ms);
+        if let Some(ref mut ad) = self.audio_demuxer {
+            let _ = ad.seek_to(target_ms);
+        }
         self.last_demuxed_video_dts = Some(target_ms);
+        self.last_demuxed_audio_pts_ms = Some(target_ms);
+
         if let Some(ref mut vdec) = self.video_decoder {
             vdec.flush();
         }
         if let Some(ref mut adec) = self.audio_decoder {
             adec.flush_buffers();
         }
-        while video_ring.try_pop().is_some() {}
+        for entry in self.subtitle_decoders.values_mut() {
+            entry.decoder.flush();
+        }
         self.eof_reached = false;
+        self.audio_eof_reached = false;
 
         let mut first_video_frame: Option<VideoFrameRGBA> = None;
+        let mut last_drained_frame: Option<VideoFrameRGBA> = None;
         let mut first_audio_sent = false;
-        let actual_landed_pts = target_ms;
 
-        let max_preroll_packets = 5000;
-        let mut packets_read = 0;
+        const MAX_VIDEO_PREROLL_PACKETS: usize = 600;
+        const MAX_TOTAL_READ_PACKETS: usize = 5000;
+        let mut video_packets_sent = 0usize;
+        let mut packets_read = 0usize;
 
-        while packets_read < max_preroll_packets {
+        while packets_read < MAX_TOTAL_READ_PACKETS {
             match self.demuxer.read_packet() {
                 Ok(Some(packet)) => {
                     packets_read += 1;
@@ -594,53 +783,94 @@ impl PlaybackSession {
                         let pkt_dts = packet.dts_ms.unwrap_or(packet.pts_ms);
                         self.last_demuxed_video_dts = Some(pkt_dts);
                         if first_video_frame.is_none() {
+                            if video_packets_sent >= MAX_VIDEO_PREROLL_PACKETS {
+                                self.pending_video_packets.push_back(packet);
+                                break;
+                            }
                             if let Some(ref mut vdec) = self.video_decoder {
-                                let _ = vdec.send_packet(
-                                    &packet.data,
-                                    packet.pts_ms,
-                                    packet.dts_ms,
-                                    packet.is_keyframe,
-                                );
-                                if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba(Some(target_ms)) {
-                                    first_video_frame = Some(rgba);
+                                let mut sent = false;
+                                for _ in 0..16 {
+                                    match vdec.try_send_packet_with_dts(
+                                        &packet.data,
+                                        packet.pts_ms,
+                                        packet.dts_ms,
+                                        packet.is_keyframe,
+                                    ) {
+                                        Ok(true) => {
+                                            sent = true;
+                                            break;
+                                        }
+                                        Ok(false) => {
+                                            if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba_pooled(
+                                                target_ms,
+                                                &self.rgba_pool,
+                                                0,
+                                            ) {
+                                                first_video_frame = Some(rgba);
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                if sent {
+                                    video_packets_sent += 1;
+                                    if let Ok(Some(rgba)) = vdec.receive_preroll_or_rgba_pooled(
+                                        target_ms,
+                                        &self.rgba_pool,
+                                        0,
+                                    ) {
+                                        first_video_frame = Some(rgba);
+                                    }
+                                } else if first_video_frame.is_none() {
+                                    self.unsent_video_packet = Some(packet);
+                                    break;
+                                } else {
+                                    self.pending_video_packets.push_back(packet);
                                 }
                             }
                         } else {
                             self.pending_video_packets.push_back(packet);
                         }
-                    } else if Some(packet.track_id) == self.audio_track_id {
+                    } else if self.audio_demuxer.is_none()
+                        && Some(packet.track_id) == self.audio_track_id
+                    {
                         let dur = packet.duration_ms.unwrap_or(25);
                         let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                         if delayed_pts + dur >= target_ms {
+                            self.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
                             if let Some(ref mut adec) = self.audio_decoder {
-                                if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
-                                    for mut pcm in pcm_frames {
-                                        if pcm.pts_ms < target_ms {
-                                            let diff_ms = target_ms - pcm.pts_ms;
-                                            let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
-                                            let float_count = num_frames * pcm.channels as usize;
-                                            if float_count < pcm.samples.len() {
-                                                pcm.samples.drain(0..float_count);
-                                                pcm.pts_ms = target_ms;
-                                            } else {
-                                                continue;
-                                            }
-                                        }
-                                        apply_gain(&mut pcm.samples, effective_vol);
-                                        let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
-                                            pts_ms: pcm.pts_ms,
-                                            samples: pcm.samples,
-                                            generation: audio_generation,
-                                        });
+                                if let Ok(pcm_frames) =
+                                    adec.decode_packet_us(&packet.data, packet.pts_us)
+                                {
+                                    if Self::trim_and_send_audio_frames(
+                                        pcm_frames,
+                                        target_ms,
+                                        audio_delay_ms,
+                                        audio_tx,
+                                        audio_generation,
+                                    ) {
                                         first_audio_sent = true;
                                     }
                                 }
                             }
                         }
+                    } else if let Some(entry) = self.subtitle_decoders.get_mut(&packet.track_id) {
+                        process_embedded_subtitle_packet(
+                            entry,
+                            &packet.data,
+                            packet.pts_ms,
+                            packet.duration_ms.unwrap_or(3000),
+                            &mut self.available_subtitle_tracks,
+                            self.selected_subtitle_track_index,
+                            ui_event_tx,
+                        );
                     }
 
                     let v_done = self.video_track_id.is_none() || first_video_frame.is_some();
-                    let a_done = self.audio_track_id.is_none() || first_audio_sent;
+                    let a_done = self.audio_demuxer.is_some()
+                        || self.audio_track_id.is_none()
+                        || first_audio_sent;
                     if v_done && a_done {
                         break;
                     }
@@ -653,33 +883,187 @@ impl PlaybackSession {
             }
         }
 
-        if let Some(frame) = first_video_frame {
-            let _ = video_ring.try_push(frame);
+        // Near-EOF or extreme-GOP drain fallback so a valid frame is surfaced instead of blanking
+        if first_video_frame.is_none() {
+            if let Some(ref mut vdec) = self.video_decoder {
+                if self.eof_reached && !self.video_eof_sent {
+                    let _ = vdec.send_eof();
+                    self.video_eof_sent = true;
+                }
+                while let Ok(Some(rgba)) = vdec.receive_frame_rgba_pooled(&self.rgba_pool, 0) {
+                    last_drained_frame = Some(rgba);
+                }
+                if last_drained_frame.is_some() {
+                    first_video_frame = last_drained_frame;
+                } else if self.eof_reached && target_ms > 0 {
+                    // Demuxer landed right past the final packet; step back slightly and recover last frame
+                    let fallback_ms = target_ms.saturating_sub(500);
+                    let _ = self.demuxer.seek_to(fallback_ms);
+                    vdec.flush();
+                    self.eof_reached = false;
+                    self.video_eof_sent = false;
+                    let mut fallback_pkts = 0usize;
+                    while fallback_pkts < 64 {
+                        match self.demuxer.read_packet() {
+                            Ok(Some(packet)) => {
+                                if Some(packet.track_id) == self.video_track_id {
+                                    fallback_pkts += 1;
+                                    let _ = vdec.try_send_packet_with_dts(
+                                        &packet.data,
+                                        packet.pts_ms,
+                                        packet.dts_ms,
+                                        packet.is_keyframe,
+                                    );
+                                    while let Ok(Some(rgba)) =
+                                        vdec.receive_frame_rgba_pooled(&self.rgba_pool, 0)
+                                    {
+                                        last_drained_frame = Some(rgba);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                self.eof_reached = true;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if self.eof_reached && !self.video_eof_sent {
+                        let _ = vdec.send_eof();
+                        self.video_eof_sent = true;
+                        while let Ok(Some(rgba)) =
+                            vdec.receive_frame_rgba_pooled(&self.rgba_pool, 0)
+                        {
+                            last_drained_frame = Some(rgba);
+                        }
+                    }
+                    first_video_frame = last_drained_frame;
+                }
+            }
         }
 
-        actual_landed_pts
-    }
+        let actual_landed_pts = if let Some(ref f) = first_video_frame {
+            f.pts_ms
+        } else {
+            target_ms
+        };
 
-    /// Performs seek, flushes decoder buffers, and drains presentation ring.
-    fn seek(&mut self, target_ms: u64, video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>) -> u64 {
-        let (dummy_tx, _) = channel();
-        self.seek_preroll(target_ms, video_ring, &dummy_tx, 0, 1.0, 0)
+        // Composite active bitmap subtitle onto the landed video frame before returning
+        if let Some(ref mut frame) = first_video_frame {
+            let pts_ms = frame.pts_ms;
+            let active_sub = self
+                .selected_subtitle_track_index
+                .and_then(|idx| self.available_subtitle_tracks.get(idx));
+            composite_active_bitmap_subtitle(frame, active_sub, pts_ms, subtitle_delay_ms);
+        }
+
+        // Preroll independent audio demuxer (bounded <= 64 audio packets) aligned to landed PTS
+        if let (Some(ref mut ad), Some(audio_id), Some(ref mut adec)) = (
+            self.audio_demuxer.as_mut(),
+            self.audio_track_id,
+            self.audio_decoder.as_mut(),
+        ) {
+            let mut audio_packets = 0usize;
+            while audio_packets < 64 {
+                match ad.read_packet() {
+                    Ok(Some(packet)) => {
+                        if packet.track_id == audio_id {
+                            audio_packets += 1;
+                            self.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
+                            let dur = packet.duration_ms.unwrap_or(25);
+                            let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                            if delayed_pts + dur >= actual_landed_pts {
+                                if let Ok(pcm_frames) =
+                                    adec.decode_packet_us(&packet.data, packet.pts_us)
+                                {
+                                    if Self::trim_and_send_audio_frames(
+                                        pcm_frames,
+                                        actual_landed_pts,
+                                        audio_delay_ms,
+                                        audio_tx,
+                                        audio_generation,
+                                    ) {
+                                        first_audio_sent = true;
+                                        if delayed_pts > actual_landed_pts.saturating_add(80) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.audio_eof_reached = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = first_audio_sent;
+        }
+
+        (actual_landed_pts, first_video_frame)
     }
 
     /// Performs non-disruptive audio track catch-up preroll without flushing video or resetting clock.
     ///
-    /// Seeks container demuxer back to `current_pts`, rapidly decodes audio frames for the new track
-    /// from `current_pts` up to the latest demuxed video position, trims boundary samples, scales volume,
-    /// and pre-fills `audio_tx` to prevent audio sink underruns. Video packets prior to the last demuxed
-    /// DTS are skipped, leaving the video pipeline and presentation clock completely continuous.
+    /// When the dedicated `audio_demuxer` is present, seeks ONLY `audio_demuxer` in <1ms without
+    /// touching the primary demuxer, video decoder, or `pending_video_packets`. Falls back to
+    /// single-demuxer catch-up when `audio_demuxer` is absent.
     fn switch_audio_track_preroll(
         &mut self,
         current_pts: u64,
         audio_tx: &Sender<AudioWorkerCommand>,
         audio_generation: u64,
-        effective_vol: f32,
         audio_delay_ms: i64,
     ) {
+        if let (Some(ref mut ad), Some(audio_id), Some(ref mut adec)) = (
+            self.audio_demuxer.as_mut(),
+            self.audio_track_id,
+            self.audio_decoder.as_mut(),
+        ) {
+            let _ = ad.seek_to(current_pts);
+            self.audio_eof_reached = false;
+            self.last_demuxed_audio_pts_ms = Some(current_pts);
+
+            let mut packets_read = 0usize;
+            while packets_read < 64 {
+                match ad.read_packet() {
+                    Ok(Some(packet)) => {
+                        if packet.track_id != audio_id {
+                            continue;
+                        }
+                        packets_read += 1;
+                        self.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
+                        let dur = packet.duration_ms.unwrap_or(25);
+                        let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
+                        if delayed_pts + dur >= current_pts {
+                            if let Ok(pcm_frames) =
+                                adec.decode_packet_us(&packet.data, packet.pts_us)
+                            {
+                                Self::trim_and_send_audio_frames(
+                                    pcm_frames,
+                                    current_pts,
+                                    audio_delay_ms,
+                                    audio_tx,
+                                    audio_generation,
+                                );
+                            }
+                            if delayed_pts > current_pts.saturating_add(120) {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.audio_eof_reached = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            return;
+        }
+
         let catchup_dts = self.last_demuxed_video_dts;
         let _ = self.demuxer.seek_to(current_pts);
         self.eof_reached = false;
@@ -696,27 +1080,18 @@ impl PlaybackSession {
                         let dur = packet.duration_ms.unwrap_or(25);
                         let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
                         if delayed_pts + dur >= current_pts {
+                            self.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
                             if let Some(ref mut adec) = self.audio_decoder {
-                                if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
-                                    for mut pcm in pcm_frames {
-                                        if pcm.pts_ms < current_pts {
-                                            let diff_ms = current_pts - pcm.pts_ms;
-                                            let num_frames = (diff_ms * pcm.sample_rate as u64 / 1000) as usize;
-                                            let float_count = num_frames * pcm.channels as usize;
-                                            if float_count < pcm.samples.len() {
-                                                pcm.samples.drain(0..float_count);
-                                                pcm.pts_ms = current_pts;
-                                            } else {
-                                                continue;
-                                            }
-                                        }
-                                        apply_gain(&mut pcm.samples, effective_vol);
-                                        let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
-                                            pts_ms: pcm.pts_ms,
-                                            samples: pcm.samples,
-                                            generation: audio_generation,
-                                        });
-                                    }
+                                if let Ok(pcm_frames) =
+                                    adec.decode_packet_us(&packet.data, packet.pts_us)
+                                {
+                                    Self::trim_and_send_audio_frames(
+                                        pcm_frames,
+                                        current_pts,
+                                        audio_delay_ms,
+                                        audio_tx,
+                                        audio_generation,
+                                    );
                                 }
                             }
                         }
@@ -749,114 +1124,142 @@ impl PlaybackSession {
     }
 }
 
-/// Active watch-party role and networking engine.
-enum WatchPartyRole {
-    None,
-    Host {
-        server: HostServer,
-        _room: String,
-        local_username: String,
-        client_names: HashMap<SocketAddr, String>,
-        last_state_broadcast: Instant,
-        last_member_update: Instant,
-        last_probe_sent: Instant,
-        _upnp_guard: Option<UpnpMappingGuard>,
-        _crypto: Option<Arc<RoomCryptoSession>>,
-    },
-    Client {
-        client: ClientNode,
-        _room: String,
-        local_username: String,
-        host_username: String,
-        last_probe_sent: Instant,
-        last_member_update: Instant,
-        _crypto: Option<Arc<RoomCryptoSession>>,
-    },
-}
-
-/// Helper extracting local sender name for announcements and chat records.
-fn get_sender_name(party_role: &WatchPartyRole) -> String {
-    match party_role {
-        WatchPartyRole::Host { local_username, .. } => local_username.clone(),
-        WatchPartyRole::Client { local_username, .. } => local_username.clone(),
-        WatchPartyRole::None => std::env::var("USER").unwrap_or_else(|_| "You".to_string()),
+/// Stamps `frame` with `generation` and attempts lock-free push into `video_ring`,
+/// saving into `overflow_frame` if the ring is full. Never calls `try_pop()`.
+#[inline]
+fn push_video_frame_stamped(
+    mut frame: VideoFrameRGBA,
+    generation: u64,
+    video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>,
+    overflow_frame: &mut Option<VideoFrameRGBA>,
+) -> bool {
+    frame.set_generation(generation);
+    if let Err(err) = video_ring.try_push(frame) {
+        *overflow_frame = Some(err.item);
+        false
+    } else {
+        true
     }
 }
 
-/// Helper broadcasting a standardized chat announcement locally and across connected room peers.
-fn broadcast_chat_announcement(
-    text: &str,
-    now: Instant,
+/// Attempts non-blocking packet submission (`try_send_packet_with_dts`) with `EAGAIN` drain/retry,
+/// compositing active bitmap subtitles onto decoded RGBA frames before pushing to `video_ring`.
+#[allow(clippy::too_many_arguments)]
+fn feed_video_packet_with_backpressure(
+    packet: DemuxPacket,
+    vdec: &mut UniversalVideoDecoder,
+    rgba_pool: &RgbaFramePool,
+    unsent_video_packet: &mut Option<DemuxPacket>,
+    active_subtitle_track: Option<&CommonSubtitleTrack>,
+    subtitle_delay_ms: i64,
+    generation: u64,
+    video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>,
+    overflow_frame: &mut Option<VideoFrameRGBA>,
+) {
+    let drain_ready = |vdec: &mut UniversalVideoDecoder,
+                       overflow_frame: &mut Option<VideoFrameRGBA>| {
+        while overflow_frame.is_none() {
+            match vdec.receive_frame_rgba_pooled(rgba_pool, generation) {
+                Ok(Some(mut rgba)) => {
+                    let pts_ms = rgba.pts_ms;
+                    composite_active_bitmap_subtitle(
+                        &mut rgba,
+                        active_subtitle_track,
+                        pts_ms,
+                        subtitle_delay_ms,
+                    );
+                    if !push_video_frame_stamped(rgba, generation, video_ring, overflow_frame) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    };
+
+    match vdec.try_send_packet_with_dts(
+        &packet.data,
+        packet.pts_ms,
+        packet.dts_ms,
+        packet.is_keyframe,
+    ) {
+        Ok(true) => {
+            drain_ready(vdec, overflow_frame);
+        }
+        Ok(false) => {
+            // Decoder input queue full (EAGAIN): drain decoded output frames and retry once
+            drain_ready(vdec, overflow_frame);
+            if overflow_frame.is_some() {
+                *unsent_video_packet = Some(packet);
+                return;
+            }
+            match vdec.try_send_packet_with_dts(
+                &packet.data,
+                packet.pts_ms,
+                packet.dts_ms,
+                packet.is_keyframe,
+            ) {
+                Ok(true) => {
+                    drain_ready(vdec, overflow_frame);
+                }
+                Ok(false) => {
+                    *unsent_video_packet = Some(packet);
+                }
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Synchronizes session seek preroll, `MasterClock` epoch update, stamped first frame push,
+/// and audio worker reset/pause state without ever calling `video_ring.try_pop()`.
+#[allow(clippy::too_many_arguments)]
+fn perform_session_seek(
+    sess: &mut PlaybackSession,
+    target_ms: u64,
+    was_playing: bool,
     clock: &MasterClock,
-    party_role: &mut WatchPartyRole,
+    video_ring: &SpscRingBuffer<VideoFrameRGBA, 32>,
+    overflow_frame: &mut Option<VideoFrameRGBA>,
+    audio_tx: &Sender<AudioWorkerCommand>,
+    current_audio_generation: &mut u64,
+    audio_delay_ms: i64,
+    subtitle_delay_ms: i64,
     event_tx: &Sender<UiEvent>,
-) {
-    let wall_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let media_ms = clock.current_pts(now).max(0.0) as u64;
-    let rec = RoomAnnouncement::create_record(wall_ms, media_ms, text);
-    let wire_bytes = rec.to_network_bytes();
+) -> u64 {
+    *overflow_frame = None;
+    let now = Instant::now();
+    clock.set_state(now, PlaybackState::Seeking);
 
-    match party_role {
-        WatchPartyRole::Host { server, .. } => {
-            let _ = server.broadcast_chat_message(&wire_bytes);
-        }
-        WatchPartyRole::Client { client, .. } => {
-            let _ = client.send_chat_message_with_pts(&wire_bytes, media_ms);
-        }
-        WatchPartyRole::None => {}
+    *current_audio_generation = current_audio_generation.wrapping_add(1);
+    let _ = audio_tx.send(AudioWorkerCommand::Reset);
+
+    let (landed_pts, first_frame) = sess.seek_preroll(
+        target_ms,
+        audio_tx,
+        *current_audio_generation,
+        audio_delay_ms,
+        subtitle_delay_ms,
+        Some(event_tx),
+    );
+
+    let resume_now = Instant::now();
+    clock.seek_to(landed_pts as f64, resume_now);
+    let current_gen = clock.seek_generation();
+    if let Some(frame) = first_frame {
+        let _ = push_video_frame_stamped(frame, current_gen, video_ring, overflow_frame);
     }
 
-    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
-}
-
-/// Helper broadcasting local peer media status to room peers.
-fn broadcast_local_peer_status(
-    has_media: bool,
-    is_ready: bool,
-    duration_ms: u64,
-    file_size_bytes: u64,
-    filename: &str,
-    media_hash: [u8; 32],
-    party_role: &mut WatchPartyRole,
-) {
-    match party_role {
-        WatchPartyRole::Host {
-            server,
-            local_username,
-            ..
-        } => {
-            let status = PeerStatusPayload::with_hash(
-                0,
-                has_media,
-                is_ready,
-                duration_ms,
-                file_size_bytes,
-                local_username.clone(),
-                filename.to_string(),
-                media_hash,
-            );
-            let _ = server.broadcast_peer_status(&status);
-        }
-        WatchPartyRole::Client {
-            client,
-            local_username,
-            ..
-        } => {
-            let _ = client.send_peer_status_with_hash(
-                has_media,
-                is_ready,
-                duration_ms,
-                file_size_bytes,
-                local_username,
-                filename,
-                media_hash,
-            );
-        }
-        WatchPartyRole::None => {}
+    if was_playing {
+        clock.set_state(resume_now, PlaybackState::Playing);
+        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+    } else {
+        clock.set_state(resume_now, PlaybackState::Paused);
+        let _ = audio_tx.send(AudioWorkerCommand::Pause);
     }
+
+    landed_pts
 }
 
 /// Runs the background playback worker loop in a dedicated OS thread.
@@ -888,12 +1291,27 @@ pub fn run_playback_worker(
     let mut current_audio_generation: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
-        // 1. Drain all pending UI commands
+        // 1. Drain all pending UI commands, coalescing consecutive Seek commands
+        let mut command_batch = Vec::new();
         while let Ok(cmd) = command_rx.try_recv() {
+            command_batch.push(cmd);
+        }
+        let last_seek_index = command_batch
+            .iter()
+            .rposition(|cmd| matches!(cmd, PlayerCommand::Seek(_)));
+
+        for (cmd_idx, cmd) in command_batch.into_iter().enumerate() {
+            if matches!(cmd, PlayerCommand::Seek(_)) && Some(cmd_idx) != last_seek_index {
+                continue;
+            }
             match cmd {
                 PlayerCommand::OpenFile(path) => {
                     current_audio_generation = current_audio_generation.wrapping_add(1);
                     let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                    let _ = audio_tx.send(AudioWorkerCommand::SetVolume(volume));
+                    let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
+                    let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                    let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
                     match PlaybackSession::open(&path) {
                         Ok(new_session) => {
                             let dur_ms = new_session.duration_ms;
@@ -923,25 +1341,8 @@ pub fn run_playback_worker(
                                 .map(|t| t.display_label())
                                 .collect();
 
-                            let ui_subtitle_tracks: Vec<syncverse_ui::gui::subtitle_overlay::SubtitleTrack> = new_session
-                                .available_subtitle_tracks
-                                .iter()
-                                .map(|t| {
-                                    let cues = t.cues.iter().map(|c| syncverse_ui::gui::subtitle_overlay::SubtitleCue {
-                                        start_ms: c.start.as_millis() as i64,
-                                        end_ms: c.end.as_millis() as i64,
-                                        text: c.text.clone(),
-                                    }).collect();
-                                    syncverse_ui::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
-                                        t.id,
-                                        t.display_label(),
-                                        t.language.clone(),
-                                        cues,
-                                        t.format.clone(),
-                                        t.source == syncverse_common::subtitles::SubtitleSource::External,
-                                    )
-                                })
-                                .collect();
+                            let ui_subtitle_tracks =
+                                to_ui_subtitle_tracks(&new_session.available_subtitle_tracks);
 
                             let audio_items: Vec<syncverse_ui::gui::dialogs::AudioTrackItem> = new_session
                                 .available_audio_tracks
@@ -963,6 +1364,12 @@ pub fn run_playback_worker(
                             let _ = event_tx.send(UiEvent::AudioDataDiscovered(audio_items));
                             let _ = event_tx.send(UiEvent::VideoMetadataDiscovered(new_session.video_metadata.clone()));
                             let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_subtitle_tracks));
+                            if let Some(sub_idx) = new_session.selected_subtitle_track_index {
+                                let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
+                                    track_index: Some(sub_idx),
+                                    name: new_session.available_subtitle_tracks[sub_idx].display_label(),
+                                });
+                            }
                             let _ = event_tx.send(UiEvent::ChaptersDiscovered(new_session.chapters.clone()));
                             if let Some(at) = new_session.available_audio_tracks.first() {
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
@@ -973,13 +1380,13 @@ pub fn run_playback_worker(
 
                             session = Some(new_session);
                             overflow_frame = None;
-                            while video_ring.try_pop().is_some() {}
                             current_audio_generation = current_audio_generation.wrapping_add(1);
                             let _ = audio_tx.send(AudioWorkerCommand::Reset);
 
                             let now = Instant::now();
                             clock.seek_to(0.0, now);
                             clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
 
                             if let WatchPartyRole::Host { server, .. } = &mut party_role {
                                 server.set_media_state(0, speed, false);
@@ -1076,15 +1483,45 @@ pub fn run_playback_worker(
                     force_play = true;
                     gate_blocked = false;
                     let now = Instant::now();
-                    clock.set_state(now, PlaybackState::Playing);
-                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    let current_pts = clock.current_pts(now).max(0.0) as u64;
 
                     let sender = get_sender_name(&party_role);
-                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                        let current_pts = clock.current_pts(now).max(0.0) as u64;
-                        server.set_media_state(current_pts, speed, false);
-                        let _ = server.prepare_barrier_unpause(50);
-                        let _ = server.broadcast_room_state();
+                    match &mut party_role {
+                        WatchPartyRole::Host {
+                            server,
+                            pending_commit_unpause_ms,
+                            barrier_committed,
+                            ..
+                        } => {
+                            if server.clients().is_empty() {
+                                clock.set_state(now, PlaybackState::Playing);
+                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                server.set_media_state(current_pts, speed, false);
+                                let _ = server.broadcast_room_state();
+                            } else {
+                                clock.set_state(now, PlaybackState::Paused);
+                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                server.set_media_state(current_pts, speed, true);
+                                *pending_commit_unpause_ms =
+                                    server.prepare_barrier_unpause(50).ok();
+                                *barrier_committed = false;
+                                let _ = server.broadcast_room_state();
+                            }
+                        }
+                        WatchPartyRole::Client { .. } => {
+                            clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                            send_client_peer_control(
+                                &mut party_role,
+                                PeerControlAction::Play,
+                                current_pts,
+                                speed,
+                            );
+                        }
+                        WatchPartyRole::None => {
+                            clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                        }
                     }
 
                     let msg = RoomAnnouncement::resumed(&sender);
@@ -1099,22 +1536,31 @@ pub fn run_playback_worker(
                         let current_pts = clock.current_pts(now);
                         let dur = session.as_ref().map(|s| s.duration_ms).unwrap_or(0);
                         if dur > 0 && current_pts >= dur as f64 {
-                            overflow_frame = None;
-                            while video_ring.try_pop().is_some() {}
-                            current_audio_generation = current_audio_generation.wrapping_add(1);
-                            let _ = audio_tx.send(AudioWorkerCommand::Reset);
                             if let Some(ref mut sess) = session {
-                                sess.seek(0, &video_ring);
+                                perform_session_seek(
+                                    sess,
+                                    0,
+                                    false,
+                                    &clock,
+                                    &video_ring,
+                                    &mut overflow_frame,
+                                    &audio_tx,
+                                    &mut current_audio_generation,
+                                    audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
+                                );
+                            } else {
+                                overflow_frame = None;
+                                current_audio_generation = current_audio_generation.wrapping_add(1);
+                                let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                                clock.seek_to(0.0, now);
                             }
-                            clock.seek_to(0.0, now);
                         }
 
                         // Unpause trigger: evaluate unpause gate across room peers
                         let mut unready_peers = Vec::new();
-                        let in_watch_party = match &party_role {
-                            WatchPartyRole::Host { .. } | WatchPartyRole::Client { .. } => true,
-                            WatchPartyRole::None => false,
-                        };
+                        let in_watch_party = !matches!(party_role, WatchPartyRole::None);
 
                         if in_watch_party {
                             // Check local readiness
@@ -1188,14 +1634,43 @@ pub fn run_playback_worker(
                         } else {
                             // Unpause allowed or force_play override active
                             gate_blocked = false;
-                            clock.set_state(now, PlaybackState::Playing);
-                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                            let current_pts_u64 = clock.current_pts(now).max(0.0) as u64;
 
-                            if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                                let current_pts = clock.current_pts(now).max(0.0) as u64;
-                                server.set_media_state(current_pts, speed, false);
-                                let _ = server.prepare_barrier_unpause(50);
-                                let _ = server.broadcast_room_state();
+                            match &mut party_role {
+                                WatchPartyRole::Host {
+                                    server,
+                                    pending_commit_unpause_ms,
+                                    barrier_committed,
+                                    ..
+                                } => {
+                                    if server.clients().is_empty() {
+                                        clock.set_state(now, PlaybackState::Playing);
+                                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                        server.set_media_state(current_pts_u64, speed, false);
+                                        let _ = server.broadcast_room_state();
+                                    } else {
+                                        clock.set_state(now, PlaybackState::Paused);
+                                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                        server.set_media_state(current_pts_u64, speed, true);
+                                        *pending_commit_unpause_ms =
+                                            server.prepare_barrier_unpause(50).ok();
+                                        *barrier_committed = false;
+                                        let _ = server.broadcast_room_state();
+                                    }
+                                }
+                                WatchPartyRole::Client { .. } => {
+                                    // Delegate room unpause to host so two-phase barrier synchronizes start
+                                    send_client_peer_control(
+                                        &mut party_role,
+                                        PeerControlAction::Play,
+                                        current_pts_u64,
+                                        speed,
+                                    );
+                                }
+                                WatchPartyRole::None => {
+                                    clock.set_state(now, PlaybackState::Playing);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                }
                             }
 
                             let msg = RoomAnnouncement::resumed(&sender);
@@ -1212,11 +1687,30 @@ pub fn run_playback_worker(
                         gate_blocked = false;
                         clock.set_state(now, PlaybackState::Paused);
                         let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                        let current_pts = clock.current_pts(now).max(0.0) as u64;
 
-                        if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                            let current_pts = clock.current_pts(now).max(0.0) as u64;
-                            server.set_media_state(current_pts, speed, true);
-                            let _ = server.broadcast_room_state();
+                        match &mut party_role {
+                            WatchPartyRole::Host {
+                                server,
+                                pending_commit_unpause_ms,
+                                barrier_committed,
+                                ..
+                            } => {
+                                server.reset_barrier();
+                                *pending_commit_unpause_ms = None;
+                                *barrier_committed = false;
+                                server.set_media_state(current_pts, speed, true);
+                                let _ = server.broadcast_room_state();
+                            }
+                            WatchPartyRole::Client { .. } => {
+                                send_client_peer_control(
+                                    &mut party_role,
+                                    PeerControlAction::Pause,
+                                    current_pts,
+                                    speed,
+                                );
+                            }
+                            WatchPartyRole::None => {}
                         }
 
                         let msg = RoomAnnouncement::paused(&sender);
@@ -1225,62 +1719,88 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::Stop => {
                     let now = Instant::now();
-                    clock.seek_to(0.0, now);
-                    clock.set_state(now, PlaybackState::Paused);
                     gate_blocked = false;
-                    overflow_frame = None;
-                    while video_ring.try_pop().is_some() {}
-                    current_audio_generation = current_audio_generation.wrapping_add(1);
-                    let _ = audio_tx.send(AudioWorkerCommand::Reset);
                     if let Some(ref mut sess) = session {
-                        sess.seek(0, &video_ring);
+                        perform_session_seek(
+                            sess,
+                            0,
+                            false,
+                            &clock,
+                            &video_ring,
+                            &mut overflow_frame,
+                            &audio_tx,
+                            &mut current_audio_generation,
+                            audio_delay_ms,
+                            subtitle_delay_ms,
+                            &event_tx,
+                        );
+                    } else {
+                        clock.seek_to(0.0, now);
+                        clock.set_state(now, PlaybackState::Paused);
+                        overflow_frame = None;
+                        current_audio_generation = current_audio_generation.wrapping_add(1);
+                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
                     }
-                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                    if let WatchPartyRole::Host {
+                        server,
+                        pending_commit_unpause_ms,
+                        barrier_committed,
+                        ..
+                    } = &mut party_role
+                    {
+                        server.reset_barrier();
+                        *pending_commit_unpause_ms = None;
+                        *barrier_committed = false;
                         server.set_media_state(0, speed, true);
                         let _ = server.broadcast_room_state();
                     }
                 }
                 PlayerCommand::Seek(target_ms) => {
-                    overflow_frame = None;
                     let was_playing = clock.is_playing();
-                    let now = Instant::now();
-                    clock.set_state(now, PlaybackState::Seeking);
-                    clock.seek_to(target_ms as f64, now);
-
-                    current_audio_generation = current_audio_generation.wrapping_add(1);
-                    let _ = audio_tx.send(AudioWorkerCommand::Reset);
-
                     let landed_pts = if let Some(ref mut sess) = session {
-                        let effective_vol = if is_muted { 0.0 } else { volume };
-                        sess.seek_preroll(
+                        perform_session_seek(
+                            sess,
                             target_ms,
+                            was_playing,
+                            &clock,
                             &video_ring,
+                            &mut overflow_frame,
                             &audio_tx,
-                            current_audio_generation,
-                            effective_vol,
+                            &mut current_audio_generation,
                             audio_delay_ms,
+                            subtitle_delay_ms,
+                            &event_tx,
                         )
                     } else {
+                        let now = Instant::now();
+                        overflow_frame = None;
+                        current_audio_generation = current_audio_generation.wrapping_add(1);
+                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                        clock.seek_to(target_ms as f64, now);
+                        if was_playing {
+                            clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                        } else {
+                            clock.set_state(now, PlaybackState::Paused);
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                        }
                         target_ms
                     };
-
                     let resume_now = Instant::now();
-                    clock.seek_to(landed_pts as f64, resume_now);
-                    if was_playing {
-                        clock.set_state(resume_now, PlaybackState::Playing);
-                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
-                    } else {
-                        clock.set_state(resume_now, PlaybackState::Paused);
-                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                    }
 
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
                             server.set_media_state(landed_pts, speed, !was_playing);
                             let _ = server.broadcast_room_state();
                         }
-                        WatchPartyRole::Client { client, .. } => {
-                            let _ = client.send_seek(landed_pts);
+                        WatchPartyRole::Client { .. } => {
+                            send_client_peer_control(
+                                &mut party_role,
+                                PeerControlAction::Seek,
+                                landed_pts,
+                                speed,
+                            );
                         }
                         WatchPartyRole::None => {}
                     }
@@ -1292,17 +1812,31 @@ pub fn run_playback_worker(
                     speed = spd.clamp(0.2, 4.0);
                     let now = Instant::now();
                     clock.reanchor(now, speed);
-                    if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                        let current_pts = clock.current_pts(now).max(0.0) as u64;
-                        server.set_media_state(current_pts, speed, !clock.is_playing());
-                        let _ = server.broadcast_room_state();
+                    let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                    let current_pts = clock.current_pts(now).max(0.0) as u64;
+                    match &mut party_role {
+                        WatchPartyRole::Host { server, .. } => {
+                            server.set_media_state(current_pts, speed, !clock.is_playing());
+                            let _ = server.broadcast_room_state();
+                        }
+                        WatchPartyRole::Client { .. } => {
+                            send_client_peer_control(
+                                &mut party_role,
+                                PeerControlAction::SetSpeed,
+                                current_pts,
+                                speed,
+                            );
+                        }
+                        WatchPartyRole::None => {}
                     }
                 }
                 PlayerCommand::SetVolume(vol) => {
                     volume = vol.clamp(0.0, 2.0);
-                    if volume > 0.0 {
+                    if volume > 0.0 && is_muted {
                         is_muted = false;
+                        let _ = audio_tx.send(AudioWorkerCommand::SetMuted(false));
                     }
+                    let _ = audio_tx.send(AudioWorkerCommand::SetVolume(volume));
                     let boost_suffix = if volume > 1.0 { " [Boost]" } else { "" };
                     let _ = event_tx.send(UiEvent::HudNotification {
                         text: format!("Volume: {}%{}", (volume * 100.0).round() as u32, boost_suffix),
@@ -1311,6 +1845,7 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::ToggleMute => {
                     is_muted = !is_muted;
+                    let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
                     let _ = event_tx.send(UiEvent::HudNotification {
                         text: if is_muted {
                             "Muted".to_string()
@@ -1329,13 +1864,15 @@ pub fn run_playback_worker(
 
                                 current_audio_generation = current_audio_generation.wrapping_add(1);
                                 let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                                let _ = audio_tx.send(AudioWorkerCommand::SetVolume(volume));
+                                let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
+                                let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                                let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
 
-                                let effective_vol = if is_muted { 0.0 } else { volume };
                                 sess.switch_audio_track_preroll(
                                     current_pts,
                                     &audio_tx,
                                     current_audio_generation,
-                                    effective_vol,
                                     audio_delay_ms,
                                 );
 
@@ -1368,13 +1905,15 @@ pub fn run_playback_worker(
 
                             current_audio_generation = current_audio_generation.wrapping_add(1);
                             let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                            let _ = audio_tx.send(AudioWorkerCommand::SetVolume(volume));
+                            let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
+                            let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                            let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
 
-                            let effective_vol = if is_muted { 0.0 } else { volume };
                             sess.switch_audio_track_preroll(
                                 current_pts,
                                 &audio_tx,
                                 current_audio_generation,
-                                effective_vol,
                                 audio_delay_ms,
                             );
 
@@ -1397,15 +1936,19 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::SetAudioDelay(delay_ms) => {
                     audio_delay_ms = delay_ms.clamp(-5000, 5000);
+                    let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
                     let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
                 }
                 PlayerCommand::AdjustAudioDelay(delta_ms) => {
                     audio_delay_ms = (audio_delay_ms + delta_ms).clamp(-5000, 5000);
+                    let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
                     let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
                 }
                 PlayerCommand::SelectSubtitleTrack(track_index) => {
                     if let Some(ref mut sess) = session {
                         let (idx, name) = sess.select_subtitle_track(track_index);
+                        let ui_tracks = to_ui_subtitle_tracks(&sess.available_subtitle_tracks);
+                        let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_tracks));
                         let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
                             track_index: idx,
                             name: name.clone(),
@@ -1424,6 +1967,8 @@ pub fn run_playback_worker(
                 PlayerCommand::CycleSubtitleTrack => {
                     if let Some(ref mut sess) = session {
                         let (next_idx, name) = sess.cycle_subtitle_track();
+                        let ui_tracks = to_ui_subtitle_tracks(&sess.available_subtitle_tracks);
+                        let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_tracks));
                         let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
                             track_index: next_idx,
                             name: name.clone(),
@@ -1456,18 +2001,35 @@ pub fn run_playback_worker(
                             .and_then(|s| s.to_str())
                             .unwrap_or("srt")
                             .to_string();
-                        let track = syncverse_common::subtitles::SubtitleTrack::new(
+                        let track = syncverse_demux::subtitles::parse_subtitle_file_with_fps(
+                            &path,
                             next_track_id,
-                            syncverse_common::subtitles::SubtitleSource::External,
-                            ext,
-                            None,
-                            filename,
-                            Vec::new(),
-                        );
+                            Some(&filename),
+                            sess.video_fps,
+                        )
+                        .unwrap_or_else(|_| {
+                            CommonSubtitleTrack::new(
+                                next_track_id,
+                                SubtitleSource::External,
+                                ext,
+                                None,
+                                filename.clone(),
+                                Vec::new(),
+                            )
+                        });
                         let track_idx = sess.available_subtitle_tracks.len();
                         sess.available_subtitle_tracks.push(track);
-                        sess.selected_subtitle_track_index = Some(track_idx);
-                        sess.subtitle_track_id = None;
+                        let (selected_idx, name) = sess.select_subtitle_track(Some(track_idx));
+                        let ui_tracks = to_ui_subtitle_tracks(&sess.available_subtitle_tracks);
+                        let _ = event_tx.send(UiEvent::SubtitleDataDiscovered(ui_tracks));
+                        let _ = event_tx.send(UiEvent::SubtitleTrackSelected {
+                            track_index: selected_idx,
+                            name: name.clone(),
+                        });
+                        let _ = event_tx.send(UiEvent::HudNotification {
+                            text: format!("Subtitles: {name}"),
+                            timestamp: Instant::now(),
+                        });
                     }
                 }
                 PlayerCommand::SetSubtitleDelay(delay_ms) => {
@@ -1525,45 +2087,49 @@ pub fn run_playback_worker(
                         Ok(ParsedSlashCommand::Seek { target_pts_ms }) => {
                             let duration = session.as_ref().map(|s| s.duration_ms).unwrap_or(u64::MAX);
                             let bounded_target = target_pts_ms.min(duration);
-                            overflow_frame = None;
                             let was_playing = clock.is_playing();
-                            clock.set_state(now, PlaybackState::Seeking);
-                            clock.seek_to(bounded_target as f64, now);
-
-                            current_audio_generation = current_audio_generation.wrapping_add(1);
-                            let _ = audio_tx.send(AudioWorkerCommand::Reset);
-
                             let landed_pts = if let Some(ref mut sess) = session {
-                                let effective_vol = if is_muted { 0.0 } else { volume };
-                                sess.seek_preroll(
+                                perform_session_seek(
+                                    sess,
                                     bounded_target,
+                                    was_playing,
+                                    &clock,
                                     &video_ring,
+                                    &mut overflow_frame,
                                     &audio_tx,
-                                    current_audio_generation,
-                                    effective_vol,
+                                    &mut current_audio_generation,
                                     audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
                                 )
                             } else {
+                                overflow_frame = None;
+                                current_audio_generation = current_audio_generation.wrapping_add(1);
+                                let _ = audio_tx.send(AudioWorkerCommand::Reset);
+                                clock.seek_to(bounded_target as f64, now);
+                                if was_playing {
+                                    clock.set_state(now, PlaybackState::Playing);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                } else {
+                                    clock.set_state(now, PlaybackState::Paused);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                }
                                 bounded_target
                             };
 
                             let resume_now = Instant::now();
-                            clock.seek_to(landed_pts as f64, resume_now);
-                            if was_playing {
-                                clock.set_state(resume_now, PlaybackState::Playing);
-                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
-                            } else {
-                                clock.set_state(resume_now, PlaybackState::Paused);
-                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                            }
-
                             match &mut party_role {
                                 WatchPartyRole::Host { server, .. } => {
                                     server.set_media_state(landed_pts, speed, !was_playing);
                                     let _ = server.broadcast_room_state();
                                 }
-                                WatchPartyRole::Client { client, .. } => {
-                                    let _ = client.send_seek(landed_pts);
+                                WatchPartyRole::Client { .. } => {
+                                    send_client_peer_control(
+                                        &mut party_role,
+                                        PeerControlAction::Seek,
+                                        landed_pts,
+                                        speed,
+                                    );
                                 }
                                 WatchPartyRole::None => {}
                             }
@@ -1586,6 +2152,7 @@ pub fn run_playback_worker(
                             let new_mute = enabled.unwrap_or(!is_muted);
                             if new_mute != is_muted {
                                 is_muted = new_mute;
+                                let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
                                 let _ = event_tx.send(UiEvent::HudNotification {
                                     text: if is_muted {
                                         "Muted".to_string()
@@ -1600,10 +2167,22 @@ pub fn run_playback_worker(
                             let new_speed = (speed_permille as f64 / 1000.0).clamp(0.2, 4.0);
                             speed = new_speed;
                             clock.reanchor(now, speed);
-                            if let WatchPartyRole::Host { server, .. } = &mut party_role {
-                                let current_pts = clock.current_pts(now).max(0.0) as u64;
-                                server.set_media_state(current_pts, speed, !clock.is_playing());
-                                let _ = server.broadcast_room_state();
+                            let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                            let current_pts = clock.current_pts(now).max(0.0) as u64;
+                            match &mut party_role {
+                                WatchPartyRole::Host { server, .. } => {
+                                    server.set_media_state(current_pts, speed, !clock.is_playing());
+                                    let _ = server.broadcast_room_state();
+                                }
+                                WatchPartyRole::Client { .. } => {
+                                    send_client_peer_control(
+                                        &mut party_role,
+                                        PeerControlAction::SetSpeed,
+                                        current_pts,
+                                        speed,
+                                    );
+                                }
+                                WatchPartyRole::None => {}
                             }
                             let _ = event_tx.send(UiEvent::HudNotification {
                                 text: format!("Speed: {:.2}x", speed),
@@ -1612,6 +2191,7 @@ pub fn run_playback_worker(
                         }
                         Ok(ParsedSlashCommand::AudioDelay { delay_ms }) => {
                             audio_delay_ms = delay_ms.clamp(-5000, 5000);
+                            let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
                             let _ = event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
                             let _ = event_tx.send(UiEvent::HudNotification {
                                 text: format!("Audio Delay: {:+} ms", audio_delay_ms),
@@ -1770,31 +2350,49 @@ pub fn run_playback_worker(
                     password,
                     enable_upnp,
                 } => {
-                    let bind_addr = format!("0.0.0.0:{}", port);
-                    match HostServer::bind(&bind_addr) {
+                    #[cfg(target_os = "linux")]
+                    let bind_res = HostServer::bind(format!("[::]:{}", port))
+                        .or_else(|_| HostServer::bind(format!("0.0.0.0:{}", port)));
+                    #[cfg(not(target_os = "linux"))]
+                    let bind_res = HostServer::bind(&format!("0.0.0.0:{}", port));
+
+                    match bind_res {
                         Ok(mut server) => {
                             let now = Instant::now();
                             let current_pts = clock.current_pts(now).max(0.0) as u64;
                             let is_paused = !clock.is_playing();
-                            server.set_media_state(current_pts, speed, is_paused);
-
-                            let (upnp_st, upnp_guard) = if enable_upnp {
-                                UpnpMappingGuard::map_port(port)
-                            } else {
-                                (
-                                    UpnpStatus::Disabled {
-                                        reason: "UPnP disabled by user".to_string(),
-                                    },
-                                    None,
-                                )
-                            };
 
                             let crypto = password
                                 .as_deref()
                                 .and_then(|pwd| RoomCryptoSession::from_password(&room, pwd).ok())
                                 .map(Arc::new);
+                            server.set_crypto(crypto.clone());
+                            server.set_media_state(current_pts, speed, is_paused);
+
+                            let upnp_rx = if enable_upnp {
+                                Some(spawn_upnp_mapping(port))
+                            } else {
+                                let _ = event_tx.send(UiEvent::UpnpStatusUpdated {
+                                    is_mapped: false,
+                                    external_ip: None,
+                                    port,
+                                    message: "UPnP disabled by user".to_string(),
+                                });
+                                None
+                            };
 
                             let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                            server.set_host_peer_status(PeerStatusPayload::with_hash(
+                                0,
+                                session.is_some(),
+                                local_ready,
+                                dur_ms.unwrap_or(0),
+                                current_file_size,
+                                username.clone(),
+                                current_file_name.clone().unwrap_or_default(),
+                                current_media_hash,
+                            ));
+
                             let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
                                 username.clone(),
                                 true,
@@ -1821,28 +2419,6 @@ pub fn run_playback_worker(
                             );
                             let _ = event_tx.send(UiEvent::NewChatRecord(rec));
 
-                            match &upnp_st {
-                                UpnpStatus::Active { external_ip, port } => {
-                                    let upnp_msg = format!("🌐 UPnP Port Forwarded: {}:{}", external_ip.as_deref().unwrap_or("WAN"), port);
-                                    let upnp_rec = ChatRecord::new_text(wall_ms, current_pts, [0u8; 16], "System".to_string(), &upnp_msg);
-                                    let _ = event_tx.send(UiEvent::NewChatRecord(upnp_rec));
-                                    let _ = event_tx.send(UiEvent::UpnpStatusUpdated {
-                                        is_mapped: true,
-                                        external_ip: external_ip.clone(),
-                                        port: *port,
-                                        message: "Port mapped successfully".to_string(),
-                                    });
-                                }
-                                UpnpStatus::Disabled { reason } => {
-                                    let _ = event_tx.send(UiEvent::UpnpStatusUpdated {
-                                        is_mapped: false,
-                                        external_ip: None,
-                                        port,
-                                        message: reason.clone(),
-                                    });
-                                }
-                            }
-
                             party_role = WatchPartyRole::Host {
                                 server,
                                 _room: room,
@@ -1850,9 +2426,14 @@ pub fn run_playback_worker(
                                 client_names: HashMap::new(),
                                 last_state_broadcast: now,
                                 last_member_update: now,
+                                last_peer_count: 0,
                                 last_probe_sent: now,
-                                _upnp_guard: upnp_guard,
+                                upnp_rx,
+                                _upnp_guard: None,
+                                upnp_port: port,
                                 _crypto: crypto,
+                                pending_commit_unpause_ms: None,
+                                barrier_committed: false,
                             };
 
                             broadcast_local_peer_status(
@@ -1866,7 +2447,7 @@ pub fn run_playback_worker(
                             );
                         }
                         Err(e) => {
-                            eprintln!("[ERROR] Failed to bind HostServer on {}: {}", bind_addr, e);
+                            eprintln!("[ERROR] Failed to bind HostServer on port {}: {}", port, e);
                             let wall_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
@@ -1889,25 +2470,26 @@ pub fn run_playback_worker(
                     password,
                 } => {
                     let target_addr: Option<SocketAddr> = addr
-                        .to_socket_addrs()
+                        .parse::<SocketAddr>()
                         .ok()
-                        .and_then(|mut iter| iter.next());
+                        .or_else(|| addr.to_socket_addrs().ok().and_then(|mut iter| iter.next()));
 
                     if let Some(target) = target_addr {
-                        let client_id = (SystemTime::now()
+                        let client_id = ((SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis() as u32)
                             .unwrap_or(1))
-                            & 0x7FFFFFFF;
+                            & 0x7FFFFFFF)
+                            .max(1);
 
                         let crypto = password
                             .as_deref()
                             .and_then(|pwd| RoomCryptoSession::from_password(&room, pwd).ok())
                             .map(Arc::new);
 
-                        match ClientNode::bind("0.0.0.0:0", target, client_id) {
+                        match ClientNode::bind_for_target(target, client_id) {
                             Ok(mut client) => {
-                                let _ = client.send_ntp_probe();
+                                client.set_crypto(crypto.clone());
 
                                 let now = Instant::now();
                                 let wall_ms = SystemTime::now()
@@ -1915,17 +2497,9 @@ pub fn run_playback_worker(
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
                                 let current_pts = clock.current_pts(now).max(0.0) as u64;
-
-                                let join_rec = ChatRecord::new_text(
-                                    wall_ms,
-                                    current_pts,
-                                    [0u8; 16],
-                                    username.clone(),
-                                    &format!("👋 Joined room '{}'", room),
-                                );
-                                let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
-
                                 let dur_ms = session.as_ref().map(|s| s.duration_ms);
+
+                                // Send immediate join handshake: peer status, initial NTP probe, sync snapshot request, and join chat
                                 let _ = client.send_peer_status_with_hash(
                                     session.is_some(),
                                     local_ready,
@@ -1935,6 +2509,17 @@ pub fn run_playback_worker(
                                     current_file_name.as_deref().unwrap_or(""),
                                     current_media_hash,
                                 );
+                                let _ = client.send_ntp_probe();
+                                let _ = client.request_sync_snapshot();
+
+                                let join_rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    current_pts,
+                                    [0u8; 16],
+                                    username.clone(),
+                                    &format!("👋 Joined room '{}'", room),
+                                );
+                                let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
 
                                 let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
                                     username.clone(),
@@ -1964,7 +2549,10 @@ pub fn run_playback_worker(
                                     host_username: "Host".to_string(),
                                     last_probe_sent: now,
                                     last_member_update: now,
+                                    last_peer_count: 0,
                                     _crypto: crypto,
+                                    initial_sync_locked: false,
+                                    last_pll_update: now,
                                 };
                             }
                             Err(e) => {
@@ -2062,19 +2650,23 @@ pub fn run_playback_worker(
                     } else {
                         current_pts.saturating_sub(step_ms)
                     };
-                    clock.seek_to(target as f64, now);
+                    let was_playing = clock.is_playing();
                     if let Some(ref mut sess) = session {
-                        current_audio_generation = current_audio_generation.wrapping_add(1);
-                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
-                        let effective_vol = if is_muted { 0.0 } else { volume };
-                        sess.seek_preroll(
+                        perform_session_seek(
+                            sess,
                             target,
+                            was_playing,
+                            &clock,
                             &video_ring,
+                            &mut overflow_frame,
                             &audio_tx,
-                            current_audio_generation,
-                            effective_vol,
+                            &mut current_audio_generation,
                             audio_delay_ms,
+                            subtitle_delay_ms,
+                            &event_tx,
                         );
+                    } else {
+                        clock.seek_to(target as f64, now);
                     }
                 }
                 PlayerCommand::ToggleLoop => {
@@ -2124,40 +2716,77 @@ pub fn run_playback_worker(
         let mut did_work = false;
         if let Some(ref mut sess) = session {
             if clock.is_playing() {
+                let current_gen = clock.seek_generation();
+
                 // First push any pending overflow frame if ring has space
                 if let Some(frame) = overflow_frame.take() {
-                    if let Err(err) = video_ring.try_push(frame) {
-                        overflow_frame = Some(err.item);
-                    } else {
+                    if push_video_frame_stamped(frame, current_gen, &video_ring, &mut overflow_frame) {
                         did_work = true;
                     }
                 }
 
-                // Decode pending video packets if video_ring has room
-                while overflow_frame.is_none() && !sess.pending_video_packets.is_empty() {
-                    if let Some(packet) = sess.pending_video_packets.pop_front() {
+                // Retry previously EAGAIN-rejected video packet before pulling new ones
+                if overflow_frame.is_none() {
+                    if let Some(packet) = sess.unsent_video_packet.take() {
                         if let Some(ref mut vdec) = sess.video_decoder {
-                            let _ = vdec.send_packet(
-                                &packet.data,
-                                packet.pts_ms,
-                                packet.dts_ms,
-                                packet.is_keyframe,
+                            let active_sub = sess
+                                .selected_subtitle_track_index
+                                .and_then(|idx| sess.available_subtitle_tracks.get(idx));
+                            feed_video_packet_with_backpressure(
+                                packet,
+                                vdec,
+                                &sess.rgba_pool,
+                                &mut sess.unsent_video_packet,
+                                active_sub,
+                                subtitle_delay_ms,
+                                current_gen,
+                                &video_ring,
+                                &mut overflow_frame,
                             );
-                            while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
-                                if let Err(err) = video_ring.try_push(rgba) {
-                                    overflow_frame = Some(err.item);
-                                    break;
-                                }
-                            }
                         }
                         did_work = true;
                     }
                 }
 
-                // Demux new packets from container if pending_video_packets is not overfull (< 64 packets)
-                if !sess.eof_reached && sess.pending_video_packets.len() < 64 {
+                // Decode pending video packets while decoder accepts and ring has room
+                // Cap per-iteration video decodes so UI commands (Seek/Pause/Audio switch) stay sub-frame.
+                const MAX_VIDEO_DECODE_PER_ITER: usize = 3;
+                let mut video_decoded_this_iter = 0usize;
+                while overflow_frame.is_none()
+                    && sess.unsent_video_packet.is_none()
+                    && !sess.pending_video_packets.is_empty()
+                    && video_decoded_this_iter < MAX_VIDEO_DECODE_PER_ITER
+                {
+                    if let Some(packet) = sess.pending_video_packets.pop_front() {
+                        if let Some(ref mut vdec) = sess.video_decoder {
+                            let active_sub = sess
+                                .selected_subtitle_track_index
+                                .and_then(|idx| sess.available_subtitle_tracks.get(idx));
+                            feed_video_packet_with_backpressure(
+                                packet,
+                                vdec,
+                                &sess.rgba_pool,
+                                &mut sess.unsent_video_packet,
+                                active_sub,
+                                subtitle_delay_ms,
+                                current_gen,
+                                &video_ring,
+                                &mut overflow_frame,
+                            );
+                        }
+                        video_decoded_this_iter += 1;
+                        did_work = true;
+                    }
+                }
+
+                // Demux new packets from primary container (video + all subtitles, plus audio if single demuxer)
+                if !sess.eof_reached
+                    && sess.pending_video_packets.len() < 64
+                    && sess.unsent_video_packet.is_none()
+                    && video_decoded_this_iter < MAX_VIDEO_DECODE_PER_ITER
+                {
                     let mut packets_read = 0;
-                    while packets_read < 32 {
+                    while packets_read < 32 && video_decoded_this_iter < MAX_VIDEO_DECODE_PER_ITER {
                         match sess.demuxer.read_packet() {
                             Ok(Some(packet)) => {
                                 packets_read += 1;
@@ -2167,54 +2796,63 @@ pub fn run_playback_worker(
                                 if Some(packet.track_id) == sess.video_track_id {
                                     let pkt_dts = packet.dts_ms.unwrap_or(packet.pts_ms);
                                     sess.last_demuxed_video_dts = Some(pkt_dts);
-                                    if sess.pending_video_packets.is_empty() && overflow_frame.is_none() {
+                                    if sess.pending_video_packets.is_empty()
+                                        && overflow_frame.is_none()
+                                        && sess.unsent_video_packet.is_none()
+                                    {
                                         if let Some(ref mut vdec) = sess.video_decoder {
-                                            let _ = vdec.send_packet(
-                                                &packet.data,
-                                                packet.pts_ms,
-                                                packet.dts_ms,
-                                                packet.is_keyframe,
+                                            let active_sub = sess
+                                                .selected_subtitle_track_index
+                                                .and_then(|idx| sess.available_subtitle_tracks.get(idx));
+                                            feed_video_packet_with_backpressure(
+                                                packet,
+                                                vdec,
+                                                &sess.rgba_pool,
+                                                &mut sess.unsent_video_packet,
+                                                active_sub,
+                                                subtitle_delay_ms,
+                                                current_gen,
+                                                &video_ring,
+                                                &mut overflow_frame,
                                             );
-                                            while let Ok(Some(rgba)) = vdec.receive_frame_rgba() {
-                                                if let Err(err) = video_ring.try_push(rgba) {
-                                                    overflow_frame = Some(err.item);
-                                                    break;
-                                                }
-                                            }
+                                            video_decoded_this_iter += 1;
                                         }
                                     } else {
                                         sess.pending_video_packets.push_back(packet);
                                     }
-                                } else if Some(packet.track_id) == sess.audio_track_id {
+                                } else if sess.audio_demuxer.is_none()
+                                    && Some(packet.track_id) == sess.audio_track_id
+                                {
+                                    sess.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
                                     if let Some(ref mut adec) = sess.audio_decoder {
-                                        let delayed_pts = (packet.pts_ms as i64 + audio_delay_ms).max(0) as u64;
-                                        if let Ok(pcm_frames) = adec.decode_packet(&packet.data, delayed_pts) {
-                                            let effective_vol = if is_muted { 0.0 } else { volume };
-                                            for mut pcm in pcm_frames {
-                                                apply_gain(&mut pcm.samples, effective_vol);
-                                                let _ = audio_tx.send(AudioWorkerCommand::TimestampedSamples {
-                                                    pts_ms: pcm.pts_ms,
-                                                    samples: pcm.samples,
-                                                    generation: current_audio_generation,
-                                                });
+                                        if let Ok(pcm_frames) =
+                                            adec.decode_packet_us(&packet.data, packet.pts_us)
+                                        {
+                                            for pcm in pcm_frames {
+                                                if !pcm.samples.is_empty() {
+                                                    let _ = audio_tx.send(
+                                                        AudioWorkerCommand::TimestampedSamples {
+                                                            pts_ms: pcm.pts_ms,
+                                                            samples: pcm.samples,
+                                                            generation: current_audio_generation,
+                                                        },
+                                                    );
+                                                }
                                             }
                                         }
                                     }
-                                } else if Some(packet.track_id) == sess.subtitle_track_id {
-                                    let text = if let Ok(s) = std::str::from_utf8(&packet.data) {
-                                        clean_demuxed_subtitle_packet(s)
-                                    } else {
-                                        String::new()
-                                    };
-                                    if !text.is_empty() {
-                                        let dur = packet.duration_ms.unwrap_or(3000);
-                                        let cue = syncverse_ui::gui::subtitle_overlay::SubtitleCue {
-                                            start_ms: packet.pts_ms as i64,
-                                            end_ms: (packet.pts_ms + dur) as i64,
-                                            text,
-                                        };
-                                        let _ = event_tx.send(UiEvent::SubtitleCueDemuxed(cue));
-                                    }
+                                } else if let Some(entry) =
+                                    sess.subtitle_decoders.get_mut(&packet.track_id)
+                                {
+                                    process_embedded_subtitle_packet(
+                                        entry,
+                                        &packet.data,
+                                        packet.pts_ms,
+                                        packet.duration_ms.unwrap_or(3000),
+                                        &mut sess.available_subtitle_tracks,
+                                        sess.selected_subtitle_track_index,
+                                        Some(&event_tx),
+                                    );
                                 }
 
                                 if sess.video_track_id.is_none() {
@@ -2224,15 +2862,100 @@ pub fn run_playback_worker(
                                     }
                                 }
 
-                                if sess.pending_video_packets.len() >= 64 {
+                                if sess.pending_video_packets.len() >= 64
+                                    || sess.unsent_video_packet.is_some()
+                                {
                                     break;
                                 }
                             }
                             Ok(None) => {
                                 sess.eof_reached = true;
+                                if let Some(ref mut vdec) = sess.video_decoder {
+                                    if !sess.video_eof_sent {
+                                        let _ = vdec.send_eof();
+                                        sess.video_eof_sent = true;
+                                    }
+                                    while overflow_frame.is_none() {
+                                        match vdec.receive_frame_rgba_pooled(
+                                            &sess.rgba_pool,
+                                            current_gen,
+                                        ) {
+                                            Ok(Some(mut rgba)) => {
+                                                let pts_ms = rgba.pts_ms;
+                                                let active_sub = sess
+                                                    .selected_subtitle_track_index
+                                                    .and_then(|idx| {
+                                                        sess.available_subtitle_tracks.get(idx)
+                                                    });
+                                                composite_active_bitmap_subtitle(
+                                                    &mut rgba,
+                                                    active_sub,
+                                                    pts_ms,
+                                                    subtitle_delay_ms,
+                                                );
+                                                if !push_video_frame_stamped(
+                                                    rgba,
+                                                    current_gen,
+                                                    &video_ring,
+                                                    &mut overflow_frame,
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                }
                                 break;
                             }
                             Err(_) => break,
+                        }
+                    }
+                }
+
+                // Feed independent audio demuxer (bounded read-ahead <= 500ms ahead of master clock)
+                if let (Some(ref mut ad), Some(audio_id), Some(ref mut adec)) = (
+                    sess.audio_demuxer.as_mut(),
+                    sess.audio_track_id,
+                    sess.audio_decoder.as_mut(),
+                ) {
+                    if !sess.audio_eof_reached {
+                        let target_audio_pts =
+                            clock.current_pts(Instant::now()).max(0.0) as u64 + 500;
+                        let mut audio_pkts = 0usize;
+                        while audio_pkts < 32
+                            && sess.last_demuxed_audio_pts_ms.unwrap_or(0) < target_audio_pts
+                        {
+                            match ad.read_packet() {
+                                Ok(Some(packet)) => {
+                                    if packet.track_id != audio_id {
+                                        continue;
+                                    }
+                                    audio_pkts += 1;
+                                    did_work = true;
+                                    sess.last_demuxed_audio_pts_ms = Some(packet.pts_ms);
+                                    if let Ok(pcm_frames) =
+                                        adec.decode_packet_us(&packet.data, packet.pts_us)
+                                    {
+                                        for pcm in pcm_frames {
+                                            if !pcm.samples.is_empty() {
+                                                let _ = audio_tx.send(
+                                                    AudioWorkerCommand::TimestampedSamples {
+                                                        pts_ms: pcm.pts_ms,
+                                                        samples: pcm.samples,
+                                                        generation: current_audio_generation,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    sess.audio_eof_reached = true;
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
                         }
                     }
                 }
@@ -2240,6 +2963,9 @@ pub fn run_playback_worker(
         }
 
         // 3. Process watch-party networking and synchronize clocks
+        if poll_host_upnp_status(&mut party_role, &clock, &event_tx) {
+            did_work = true;
+        }
         match &mut party_role {
             WatchPartyRole::Host {
                 server,
@@ -2248,9 +2974,14 @@ pub fn run_playback_worker(
                 client_names,
                 last_state_broadcast,
                 last_member_update,
+                last_peer_count,
                 last_probe_sent,
+                upnp_rx: _,
                 _upnp_guard: _,
+                upnp_port: _,
                 _crypto: _,
+                pending_commit_unpause_ms,
+                barrier_committed,
             } => {
                 // Poll incoming UDP datagrams
                 while let Ok(Some((_, sender_addr))) = server.poll_and_process() {
@@ -2258,6 +2989,133 @@ pub fn run_playback_worker(
                     client_names
                         .entry(sender_addr)
                         .or_insert_with(|| format!("Peer-{}", sender_addr.port()));
+                }
+
+                // Immediately push cached host status + peer statuses + room state to new joiners
+                if let Ok(welcomed) = server.flush_welcome_to_new_peers() {
+                    if welcomed > 0 {
+                        did_work = true;
+                    }
+                }
+
+                // Drain bidirectional PeerControl commands sent by clients
+                let peer_controls = server.poll_peer_controls();
+                for (_addr, ctrl) in peer_controls {
+                    did_work = true;
+                    let ctrl_now = Instant::now();
+                    match ctrl.action {
+                        PeerControlAction::Seek => {
+                            let was_playing = clock.is_playing();
+                            let landed_pts = if let Some(ref mut sess) = session {
+                                perform_session_seek(
+                                    sess,
+                                    ctrl.media_pts_ms,
+                                    was_playing,
+                                    &clock,
+                                    &video_ring,
+                                    &mut overflow_frame,
+                                    &audio_tx,
+                                    &mut current_audio_generation,
+                                    audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
+                                )
+                            } else {
+                                clock.seek_to(ctrl.media_pts_ms as f64, ctrl_now);
+                                ctrl.media_pts_ms
+                            };
+                            server.set_media_state(landed_pts, speed, !was_playing);
+                            let _ = server.broadcast_room_state();
+                        }
+                        PeerControlAction::Pause => {
+                            gate_blocked = false;
+                            clock.set_state(ctrl_now, PlaybackState::Paused);
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                            server.reset_barrier();
+                            *pending_commit_unpause_ms = None;
+                            *barrier_committed = false;
+                            let cur_pts = clock.current_pts(ctrl_now).max(0.0) as u64;
+                            server.set_media_state(cur_pts, speed, true);
+                            let _ = server.broadcast_room_state();
+                        }
+                        PeerControlAction::Play => {
+                            let unready_exists = !force_play
+                                && (!local_ready
+                                    || session.is_none()
+                                    || !server.are_all_users_ready());
+                            if unready_exists {
+                                clock.set_state(ctrl_now, PlaybackState::Paused);
+                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                gate_blocked = true;
+                                let unready: Vec<String> = server
+                                    .get_unready_clients()
+                                    .into_iter()
+                                    .map(|(cid, uname)| {
+                                        if uname.is_empty() {
+                                            format!("Peer-{}", cid)
+                                        } else {
+                                            uname
+                                        }
+                                    })
+                                    .collect();
+                                let msg = RoomAnnouncement::gate_waiting(&unready);
+                                let _ = event_tx.send(UiEvent::UnpauseBlocked {
+                                    unready_peers: unready,
+                                    message: msg,
+                                });
+                            } else {
+                                gate_blocked = false;
+                                let cur_pts = clock.current_pts(ctrl_now).max(0.0) as u64;
+                                if server.clients().is_empty() {
+                                    clock.set_state(ctrl_now, PlaybackState::Playing);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                                    server.set_media_state(cur_pts, speed, false);
+                                    let _ = server.broadcast_room_state();
+                                } else if pending_commit_unpause_ms.is_none() {
+                                    clock.set_state(ctrl_now, PlaybackState::Paused);
+                                    let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                    server.set_media_state(cur_pts, speed, true);
+                                    *pending_commit_unpause_ms =
+                                        server.prepare_barrier_unpause(50).ok();
+                                    *barrier_committed = false;
+                                    let _ = server.broadcast_room_state();
+                                }
+                            }
+                        }
+                        PeerControlAction::SetSpeed => {
+                            speed = ctrl.rate_f64().clamp(0.2, 4.0);
+                            clock.reanchor(ctrl_now, speed);
+                            let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
+                            let cur_pts = clock.current_pts(ctrl_now).max(0.0) as u64;
+                            server.set_media_state(cur_pts, speed, !clock.is_playing());
+                            let _ = server.broadcast_room_state();
+                        }
+                        PeerControlAction::RequestSyncSnapshot => {}
+                    }
+                }
+
+                // Progress two-phase barrier unpause commit -> scheduled synchronized resumption
+                if let Some(target_ms) = *pending_commit_unpause_ms {
+                    if !*barrier_committed
+                        && (server.are_all_clients_ready()
+                            || server.is_barrier_prepare_timed_out(Duration::from_millis(800)))
+                    {
+                        let _ = server.commit_barrier_unpause(target_ms);
+                        *barrier_committed = true;
+                        did_work = true;
+                    }
+                    if *barrier_committed && server.current_server_wall_ms() >= target_ms {
+                        *pending_commit_unpause_ms = None;
+                        *barrier_committed = false;
+                        let _ = server.check_scheduled_unpause();
+                        let unpause_now = Instant::now();
+                        clock.set_state(unpause_now, PlaybackState::Playing);
+                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                        let current_pts = clock.current_pts(unpause_now).max(0.0) as u64;
+                        server.set_media_state(current_pts, speed, false);
+                        let _ = server.broadcast_room_state();
+                        did_work = true;
+                    }
                 }
 
                 // Process pending chat messages
@@ -2295,8 +3153,10 @@ pub fn run_playback_worker(
                     }
                 }
 
-                // Periodic room state broadcast (~4 Hz)
-                if now.duration_since(*last_state_broadcast) >= Duration::from_millis(250) {
+                // Periodic room state broadcast (~4 Hz) when not mid-barrier commit
+                if pending_commit_unpause_ms.is_none()
+                    && now.duration_since(*last_state_broadcast) >= Duration::from_millis(250)
+                {
                     *last_state_broadcast = now;
                     let current_pts = clock.current_pts(now).max(0.0) as u64;
                     let is_paused = !clock.is_playing();
@@ -2304,8 +3164,12 @@ pub fn run_playback_worker(
                     let _ = server.broadcast_room_state();
                 }
 
-                // Periodic member list update (~2 Hz)
-                if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
+                // Member list update (immediate on peer count change, otherwise ~2 Hz)
+                let current_peer_count = server.clients().len();
+                if current_peer_count != *last_peer_count
+                    || now.duration_since(*last_member_update) >= Duration::from_millis(500)
+                {
+                    *last_peer_count = current_peer_count;
                     *last_member_update = now;
                     let local_dur = session.as_ref().map(|s| s.duration_ms);
                     let local_hash = if current_media_hash != [0u8; 32] {
@@ -2379,7 +3243,10 @@ pub fn run_playback_worker(
                 host_username,
                 last_probe_sent,
                 last_member_update,
+                last_peer_count,
                 _crypto: _,
+                initial_sync_locked,
+                last_pll_update,
             } => {
                 // Poll incoming UDP datagrams
                 while let Ok(Some(_)) = client.poll_and_process() {
@@ -2405,79 +3272,137 @@ pub fn run_playback_worker(
                 }
 
                 let now = Instant::now();
-                // Send NTP probes to host (~1 Hz)
-                if now.duration_since(*last_probe_sent) >= Duration::from_millis(1000) {
+                // Dynamic NTP probe cadence: 75ms startup burst -> 1000ms steady state
+                if now.duration_since(*last_probe_sent) >= client.recommended_ntp_probe_interval() {
                     *last_probe_sent = now;
                     let _ = client.send_ntp_probe();
                 }
 
+                // Check two-phase barrier scheduled unpause instant
+                if client.check_scheduled_unpause() {
+                    clock.set_state(now, PlaybackState::Playing);
+                    let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    did_work = true;
+                }
+
                 // Synchronize playback timeline from host's RoomState
                 if let Some(room_state) = client.latest_room_state().cloned() {
-                    let theta_hat = client.filtered_offset_nanos().unwrap_or(0.0);
-                    let now_nanos = client.current_local_nanos();
-                    let target_pts_ms = room_state.compute_target_media_pts(now_nanos, theta_hat);
-                    let local_pts_ms = clock.current_pts(now).max(0.0) as u64;
-                    client.set_local_pts_ms(local_pts_ms);
-
-                    // Sync pause/play state
-                    if room_state.is_paused && clock.is_playing() {
-                        clock.set_state(now, PlaybackState::Paused);
-                        let _ = audio_tx.send(AudioWorkerCommand::Pause);
-                    } else if !room_state.is_paused && !clock.is_playing() {
-                        clock.set_state(now, PlaybackState::Playing);
-                        let _ = audio_tx.send(AudioWorkerCommand::Resume);
-                    }
-
-                    // Tri-zone drift sync:
-                    let drift_ms = (target_pts_ms as i64 - local_pts_ms as i64).abs();
-                    if drift_ms > 1500 {
-                        // Zone 3: Hard seek
-                        current_audio_generation = current_audio_generation.wrapping_add(1);
-                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
-                        if let Some(ref mut sess) = session {
-                            let was_playing = clock.is_playing();
-                            clock.set_state(now, PlaybackState::Seeking);
-                            clock.seek_to(target_pts_ms as f64, now);
-                            let effective_vol = if is_muted { 0.0 } else { volume };
-                            let landed = sess.seek_preroll(
-                                target_pts_ms,
-                                &video_ring,
-                                &audio_tx,
-                                current_audio_generation,
-                                effective_vol,
-                                audio_delay_ms,
-                            );
-                            let resume_now = Instant::now();
-                            clock.seek_to(landed as f64, resume_now);
-                            if was_playing {
-                                clock.set_state(resume_now, PlaybackState::Playing);
-                                let _ = audio_tx.send(AudioWorkerCommand::Resume);
+                    if client.scheduled_unpause_local_ms().is_some() {
+                        // Armed in barrier prepare: stay paused and snap within <= 25ms before unpause
+                        if clock.is_playing() {
+                            clock.set_state(now, PlaybackState::Paused);
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                        }
+                        let local_pts_ms = clock.current_pts(now).max(0.0) as u64;
+                        let drift_ms =
+                            (room_state.tau_ref_media_ms as i64 - local_pts_ms as i64).unsigned_abs();
+                        if drift_ms > 25 {
+                            if let Some(ref mut sess) = session {
+                                perform_session_seek(
+                                    sess,
+                                    room_state.tau_ref_media_ms,
+                                    false,
+                                    &clock,
+                                    &video_ring,
+                                    &mut overflow_frame,
+                                    &audio_tx,
+                                    &mut current_audio_generation,
+                                    audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
+                                );
                             } else {
-                                clock.set_state(resume_now, PlaybackState::Paused);
-                                let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                                clock.seek_to(room_state.tau_ref_media_ms as f64, now);
                             }
                         }
-                    } else if drift_ms > 15 && clock.is_playing() {
-                        // Zone 2: Micro-speed steering
-                        if let Some(corr) = client.update_pll(0.025) {
-                            let target_speed = room_state.r_target;
-                            let steered_speed = corr
-                                .speed_multiplier
-                                .clamp(target_speed * 0.96, target_speed * 1.04);
-                            clock.reanchor(now, steered_speed);
+                    } else {
+                        // Sync pause/play state without echoing back
+                        if room_state.is_paused && clock.is_playing() {
+                            clock.set_state(now, PlaybackState::Paused);
+                            let _ = audio_tx.send(AudioWorkerCommand::Pause);
+                        } else if !room_state.is_paused && !clock.is_playing() {
+                            clock.set_state(now, PlaybackState::Playing);
+                            let _ = audio_tx.send(AudioWorkerCommand::Resume);
                         }
-                    } else if drift_ms <= 15 && clock.is_playing() {
-                        // Zone 1: Deadband - reanchor client clock to room_state.r_target
-                        let target_speed = room_state.r_target;
-                        if (clock.speed() - target_speed).abs() > 1e-4 {
-                            speed = target_speed;
-                            clock.reanchor(now, target_speed);
+
+                        let theta_hat = client.filtered_offset_nanos().unwrap_or(0.0);
+                        let now_nanos = client.current_local_nanos();
+                        let target_pts_ms =
+                            room_state.compute_target_media_pts(now_nanos, theta_hat);
+                        let local_pts_ms = clock.current_pts(now).max(0.0) as u64;
+                        client.set_local_pts_ms(local_pts_ms);
+
+                        let drift_ms =
+                            (target_pts_ms as i64 - local_pts_ms as i64).unsigned_abs();
+
+                        if client.ntp_accepted_count() >= 1 {
+                            if client.should_snap_immediately(
+                                drift_ms,
+                                clock.is_playing(),
+                                *initial_sync_locked,
+                            ) {
+                                let was_playing = clock.is_playing();
+                                if let Some(ref mut sess) = session {
+                                    perform_session_seek(
+                                        sess,
+                                        target_pts_ms,
+                                        was_playing,
+                                        &clock,
+                                        &video_ring,
+                                        &mut overflow_frame,
+                                        &audio_tx,
+                                        &mut current_audio_generation,
+                                        audio_delay_ms,
+                                        subtitle_delay_ms,
+                                        &event_tx,
+                                    );
+                                } else {
+                                    clock.seek_to(target_pts_ms as f64, now);
+                                }
+                                *initial_sync_locked = true;
+                            } else {
+                                *initial_sync_locked = true;
+                                if drift_ms > 15 && clock.is_playing() {
+                                    // Zone 2: 5Hz gated micro-speed PLL steering
+                                    if now.duration_since(*last_pll_update)
+                                        >= Duration::from_millis(200)
+                                    {
+                                        let actual_dt = now
+                                            .duration_since(*last_pll_update)
+                                            .as_secs_f64()
+                                            .clamp(0.05, 1.0);
+                                        *last_pll_update = now;
+                                        if let Some(corr) = client.update_pll(actual_dt) {
+                                            let target_speed = room_state.r_target;
+                                            let steered_speed = corr
+                                                .speed_multiplier
+                                                .clamp(target_speed * 0.96, target_speed * 1.04);
+                                            clock.reanchor(now, steered_speed);
+                                            let _ = audio_tx
+                                                .send(AudioWorkerCommand::SetSpeed(steered_speed));
+                                        }
+                                    }
+                                } else if drift_ms <= 15 && clock.is_playing() {
+                                    // Zone 1: Deadband - restore target rate
+                                    let target_speed = room_state.r_target;
+                                    if (clock.speed() - target_speed).abs() > 1e-4 {
+                                        speed = target_speed;
+                                        clock.reanchor(now, target_speed);
+                                        let _ = audio_tx
+                                            .send(AudioWorkerCommand::SetSpeed(target_speed));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                // Periodic member list update (~2 Hz)
-                if now.duration_since(*last_member_update) >= Duration::from_millis(500) {
+                // Member list update (immediate on peer status arrival/change, otherwise ~2 Hz)
+                let current_peer_count = client.peer_statuses().len();
+                if current_peer_count != *last_peer_count
+                    || now.duration_since(*last_member_update) >= Duration::from_millis(500)
+                {
+                    *last_peer_count = current_peer_count;
                     *last_member_update = now;
                     let local_dur = session.as_ref().map(|s| s.duration_ms);
                     let local_hash = if current_media_hash != [0u8; 32] {
@@ -2566,18 +3491,19 @@ pub fn run_playback_worker(
             if dur_ms > 0 && current_pts_ms >= dur_ms as f64 {
                 if is_loop_enabled {
                     if let Some(ref mut sess) = session {
-                        current_audio_generation = current_audio_generation.wrapping_add(1);
-                        let _ = audio_tx.send(AudioWorkerCommand::Reset);
-                        let effective_vol = if is_muted { 0.0 } else { volume };
-                        let landed = sess.seek_preroll(
+                        perform_session_seek(
+                            sess,
                             0,
+                            is_playing,
+                            &clock,
                             &video_ring,
+                            &mut overflow_frame,
                             &audio_tx,
-                            current_audio_generation,
-                            effective_vol,
+                            &mut current_audio_generation,
                             audio_delay_ms,
+                            subtitle_delay_ms,
+                            &event_tx,
                         );
-                        clock.seek_to(landed as f64, now);
                     } else {
                         clock.seek_to(0.0, now);
                     }
@@ -2749,11 +3675,10 @@ pub fn run_playback_worker(
             exchange.publish(snap);
         }
 
-        // 5. Rate-limit thread execution
+        // 5. Sleep only when idle so decode/network bursts run with minimum jitter
         if !did_work {
-            thread::sleep(Duration::from_millis(10));
-        } else {
-            thread::sleep(Duration::from_millis(1));
+            let sleep_ms = if clock.is_playing() { 1 } else { 4 };
+            thread::sleep(Duration::from_millis(sleep_ms));
         }
     }
 }
@@ -2767,6 +3692,7 @@ pub fn launch_desktop_player_app(
     let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
     let (command_tx, command_rx) = channel::<PlayerCommand>();
     let (audio_tx, audio_rx) = channel::<AudioWorkerCommand>();
+    let audio_shutdown_tx = audio_tx.clone();
     let (event_tx, event_rx) = channel::<UiEvent>();
     let running = Arc::new(AtomicBool::new(true));
 
@@ -2811,8 +3737,9 @@ pub fn launch_desktop_player_app(
         event_rx,
     );
 
-    // Stop background workers on exit
+    // Stop background workers cleanly on exit
     running.store(false, Ordering::Relaxed);
+    let _ = audio_shutdown_tx.send(AudioWorkerCommand::Shutdown);
     let _ = worker_handle.join();
     let _ = audio_handle.join();
 
