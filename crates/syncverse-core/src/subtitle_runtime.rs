@@ -254,7 +254,7 @@ pub(crate) fn composite_active_bitmap_subtitle(
         return;
     }
 
-    let effective_pts_ms = (pts_ms as i64).saturating_add(subtitle_delay_ms).max(0) as u64;
+    let effective_pts_ms = (pts_ms as i64).saturating_sub(subtitle_delay_ms).max(0) as u64;
     let effective_time = MediaTime::from_millis(effective_pts_ms);
     let active_cues = track.active_cues_at(effective_time);
     if active_cues.is_empty() {
