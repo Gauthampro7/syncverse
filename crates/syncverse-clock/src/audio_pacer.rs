@@ -349,6 +349,7 @@ mod tests {
         let pacer = AudioPacer::default_48k_stereo().unwrap();
         let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Playing);
         let now = Instant::now();
+        clock.seek_to(1000.0, now);
 
         // 1. On-time frame (delta = 5ms -> PlayNow)
         assert_eq!(
@@ -465,6 +466,7 @@ mod tests {
         let pacer = AudioPacer::default_48k_stereo().unwrap();
         let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Playing);
         let now = Instant::now();
+        clock.seek_to(1000.0, now);
 
         // Baseline: frame 1000ms, delay 0 -> delta 0 -> PlayNow
         assert_eq!(
@@ -505,6 +507,7 @@ mod tests {
         let clock = MasterClock::new(1000.0, 1.0, PlaybackState::Playing);
         let spsc = SpscRingBuffer::<AudioFramePCM, 64>::new();
         let now = Instant::now();
+        clock.seek_to(1000.0, now);
 
         assert_eq!(pacer.output_latency_ms(), 0);
         pacer.set_output_latency_ms(40);
