@@ -8,6 +8,12 @@ use crate::command::PlayerCommand;
 use crate::gui::aspect_ratio::AspectRatioOverride;
 use crate::gui::sidebar::{RoomMember, SidebarState};
 
+/// Computes the viewport-clamped maximum size for modal windows so none overflow compact or high-DPI screens.
+#[inline]
+fn modal_max_size(ctx: &Context) -> Vec2 {
+    (ctx.content_rect().size() - Vec2::new(24.0, 24.0)).max(Vec2::new(240.0, 160.0))
+}
+
 /// Queries the local network interface IP address without external dependencies.
 pub fn get_local_lan_ip() -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -75,17 +81,20 @@ impl HostPartyDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("🌐 Host Watch Party Room")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(420.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(420.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.label(RichText::new("Host a deterministic clock-synchronized watch party.").italics().color(Color32::from_rgb(156, 163, 175)));
                 ui.separator();
 
@@ -153,7 +162,7 @@ impl HostPartyDialog {
 
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -179,14 +188,13 @@ impl HostPartyDialog {
                             )];
                             sidebar.local_username = self.username.clone();
 
-                            self.is_open = false;
+                            close_clicked = true;
                         }
                     });
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
     }
 }
 
@@ -239,17 +247,20 @@ impl ConnectPartyDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("🔗 Connect to Watch Party")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(400.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(400.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.label(RichText::new("Connect to a friend's watch party room.").italics().color(Color32::from_rgb(156, 163, 175)));
                 ui.separator();
 
@@ -286,7 +297,7 @@ impl ConnectPartyDialog {
 
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -316,14 +327,13 @@ impl ConnectPartyDialog {
                             )];
                             sidebar.local_username = self.username.clone();
 
-                            self.is_open = false;
+                            close_clicked = true;
                         }
                     });
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
     }
 }
 
@@ -347,17 +357,20 @@ impl ShortcutsDialog {
         }
 
         let mut is_open = self.is_open;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("⌨ Keyboard Shortcuts & Controls Guide")
             .open(&mut is_open)
             .resizable(true)
-            .default_width(560.0)
-            .default_height(480.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .hscroll(true)
+            .default_size(Vec2::new(560.0, 480.0).min(max_size))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Media Playback & Navigation");
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.heading("Media Playback & Navigation");
                     egui::Grid::new("nav_shortcuts_grid")
                         .num_columns(2)
                         .spacing([16.0, 6.0])
@@ -367,7 +380,7 @@ impl ShortcutsDialog {
                             ui.label("Toggle Play / Pause");
                             ui.end_row();
 
-                            ui.label(RichText::new("F11 / Alt + Enter / Double-Click").monospace().strong());
+                            ui.label(RichText::new("F / F11 / Alt+Enter / Double-Click").monospace().strong());
                             ui.label("Toggle Fullscreen Mode");
                             ui.end_row();
 
@@ -535,11 +548,11 @@ impl ShortcutsDialog {
                             ui.label("Cycle Audio Track Sequentially");
                             ui.end_row();
 
-                            ui.label(RichText::new("G / F").monospace().strong());
+                            ui.label(RichText::new("J / K").monospace().strong());
                             ui.label("Adjust Audio Delay (-50 ms / +50 ms)");
                             ui.end_row();
 
-                            ui.label(RichText::new("Shift + G").monospace().strong());
+                            ui.label(RichText::new("Shift + J").monospace().strong());
                             ui.label("Reset Audio Delay to 0 ms (Synchronized)");
                             ui.end_row();
                         });
@@ -555,11 +568,11 @@ impl ShortcutsDialog {
                             ui.label("Cycle Subtitle Track (Including Off)");
                             ui.end_row();
 
-                            ui.label(RichText::new("H / J").monospace().strong());
+                            ui.label(RichText::new("G / H").monospace().strong());
                             ui.label("Adjust Subtitle Delay (-50 ms / +50 ms)");
                             ui.end_row();
 
-                            ui.label(RichText::new("Shift + H").monospace().strong());
+                            ui.label(RichText::new("Shift + G").monospace().strong());
                             ui.label("Reset Subtitle Delay to 0 ms (Synchronized)");
                             ui.end_row();
 
@@ -614,7 +627,6 @@ impl ShortcutsDialog {
                             ui.label("Print peer RTT, clock offset (θ), and PLL micro-steering health");
                             ui.end_row();
                         });
-                });
             });
 
         self.is_open = is_open;
@@ -641,17 +653,20 @@ impl AboutDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("ℹ About Syncverse")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(460.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(460.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.heading("Syncverse");
                     ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(96, 165, 250)));
@@ -672,13 +687,12 @@ impl AboutDialog {
                 ui.separator();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
     }
 }
 
@@ -751,7 +765,7 @@ impl AudioTrackItem {
 pub enum AudioConfigAction {
     /// Switch active audio track to specified track ID.
     SelectTrack(u64),
-    /// Set normalized audio volume [0.0, 1.0].
+    /// Set normalized audio volume [0.0, 2.0].
     SetVolume(f32),
     /// Toggle audio mute state.
     ToggleMute,
@@ -768,7 +782,7 @@ pub struct AudioConfigDialog {
     pub tracks: Vec<AudioTrackItem>,
     /// Currently selected audio track ID.
     pub selected_track_id: Option<u64>,
-    /// Normalized volume in range [0.0, 1.0].
+    /// Normalized volume in range [0.0, 2.0] (up to 200% boost).
     pub volume: f32,
     /// Whether audio output is currently muted.
     pub is_muted: bool,
@@ -818,9 +832,9 @@ impl AudioConfigDialog {
         self.selected_track_id = Some(track_id);
     }
 
-    /// Sets volume normalized [0.0, 1.0].
+    /// Sets volume normalized [0.0, 2.0] (0% to 200% boost).
     pub fn set_volume(&mut self, vol: f32) {
-        self.volume = vol.clamp(0.0, 1.0);
+        self.volume = vol.clamp(0.0, 2.0);
         if self.volume > 0.0 {
             self.is_muted = false;
         }
@@ -858,17 +872,20 @@ impl AudioConfigDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("🔊 Audio Settings")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(450.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(450.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("Configure audio streams, output volume, and sync calibration.")
                         .italics()
@@ -887,15 +904,26 @@ impl AudioConfigDialog {
                     });
                 } else {
                     egui::ScrollArea::vertical()
+                        .id_salt("audio_tracks_scroll")
                         .max_height(140.0)
                         .show(ui, |ui| {
                             for track in &self.tracks {
                                 let is_selected = self.selected_track_id == Some(track.id);
                                 let label = track.display_label();
-                                if ui.radio(is_selected, label).clicked() {
-                                    self.selected_track_id = Some(track.id);
-                                    actions.push(AudioConfigAction::SelectTrack(track.id));
-                                }
+                                ui.horizontal(|ui| {
+                                    let radio_resp = ui.radio(is_selected, "");
+                                    let label_resp = ui
+                                        .add(
+                                            egui::Label::new(&label)
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(&label);
+                                    if radio_resp.clicked() || label_resp.clicked() {
+                                        self.selected_track_id = Some(track.id);
+                                        actions.push(AudioConfigAction::SelectTrack(track.id));
+                                    }
+                                });
                             }
                         });
                 }
@@ -903,9 +931,9 @@ impl AudioConfigDialog {
                 ui.add_space(8.0);
                 ui.separator();
 
-                // 2. Volume & Quick Mute
+                // 2. Volume & Quick Mute (0..=200% parity with ControlsBar)
                 ui.heading("Volume & Output Gain");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let mute_label = if self.is_muted { "🔇 Muted" } else { "🔊 Mute" };
                     let mute_btn = egui::Button::new(
                         RichText::new(mute_label)
@@ -921,15 +949,30 @@ impl AudioConfigDialog {
                         actions.push(AudioConfigAction::ToggleMute);
                     }
 
-                    let pct = (self.effective_volume() * 100.0).round() as u32;
+                    let eff_vol = self.effective_volume();
+                    let pct = (eff_vol * 100.0).round() as u32;
+                    let pct_color = if eff_vol > 1.0 {
+                        Color32::from_rgb(250, 204, 21)
+                    } else {
+                        Color32::from_rgb(226, 232, 240)
+                    };
                     ui.label(
                         RichText::new(format!("{:3}%", pct))
                             .monospace()
-                            .strong(),
+                            .strong()
+                            .color(pct_color),
                     );
+                    if eff_vol > 1.0 {
+                        ui.label(
+                            RichText::new("[Boost]")
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(250, 204, 21)),
+                        );
+                    }
 
                     let mut vol = self.volume;
-                    let slider = egui::Slider::new(&mut vol, 0.0..=1.0)
+                    let slider = egui::Slider::new(&mut vol, 0.0..=2.0)
                         .show_value(false)
                         .trailing_fill(true);
                     if ui.add(slider).changed() {
@@ -975,7 +1018,7 @@ impl AudioConfigDialog {
                     actions.push(AudioConfigAction::SetDelayMs(self.delay_ms));
                 }
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("-250 ms").clicked() {
                         self.set_delay_ms(self.delay_ms - 250);
                     }
@@ -1001,13 +1044,12 @@ impl AudioConfigDialog {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
         actions
     }
 }
@@ -1174,17 +1216,20 @@ impl VideoConfigDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("🎬 Video Settings")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(460.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(460.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("Configure aspect ratio framing, playback speed, and stream properties.")
                         .italics()
@@ -1209,7 +1254,7 @@ impl VideoConfigDialog {
 
                 // 2. Playback Speed Control
                 ui.heading("Playback Speed");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for &spd in &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                         let label = format!("{:.2}x", spd);
                         let is_selected = (self.speed - spd).abs() < 0.01;
@@ -1220,7 +1265,7 @@ impl VideoConfigDialog {
                     }
                 });
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let mut spd = self.speed;
                     let slider = egui::Slider::new(&mut spd, 0.25..=4.0)
                         .step_by(0.05)
@@ -1275,13 +1320,12 @@ impl VideoConfigDialog {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
         actions
     }
 }
@@ -1490,12 +1534,13 @@ impl SubtitleConfigDialog {
             let picked = rfd::FileDialog::new()
                 .set_title("Open Subtitle File — Syncverse")
                 .add_filter(
-                    "All Supported Subtitles (*.srt, *.vtt, *.ass, *.ssa)",
-                    &["srt", "vtt", "ass", "ssa"],
+                    "All Supported Subtitles (*.srt, *.vtt, *.ass, *.ssa, *.sub)",
+                    &["srt", "vtt", "ass", "ssa", "sub"],
                 )
                 .add_filter("SubRip Subtitles (*.srt)", &["srt"])
                 .add_filter("WebVTT Subtitles (*.vtt)", &["vtt"])
                 .add_filter("Advanced SubStation Alpha (*.ass, *.ssa)", &["ass", "ssa"])
+                .add_filter("MicroDVD / SubViewer (*.sub)", &["sub"])
                 .add_filter("All Files (*)", &["*"])
                 .pick_file();
 
@@ -1527,34 +1572,18 @@ impl SubtitleConfigDialog {
     pub fn show(&mut self, ctx: &Context) -> Vec<SubtitleConfigAction> {
         let mut actions = Vec::new();
 
-        // Check if an external subtitle file was selected via background thread
+        // Check if an external subtitle file was selected via background thread.
+        // Do NOT pre-insert into `self.tracks` here: `app.rs` inserts the parsed track once
+        // background loading finishes, preventing duplicate entries and track-ID desync.
         if let Some(path) = self.poll_file_dialog() {
             let filename = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("external.srt")
                 .to_string();
-            let format = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("srt")
-                .to_uppercase();
-
-            let new_id = self.tracks.len();
-            let track_item = SubtitleTrackItem {
-                id: new_id,
-                title: filename.clone(),
-                language: None,
-                format,
-                is_external: true,
-                file_path: Some(path.clone()),
-            };
-            self.tracks.push(track_item);
-            self.selected_track_id = Some(new_id);
-            self.status_message = Some(format!("Loaded external subtitle: {}", filename));
+            self.status_message = Some(format!("Loading external subtitle: {}", filename));
 
             actions.push(SubtitleConfigAction::LoadExternal(path));
-            actions.push(SubtitleConfigAction::SelectTrack(Some(new_id)));
         }
 
         if !self.is_open {
@@ -1562,17 +1591,20 @@ impl SubtitleConfigDialog {
         }
 
         let mut is_open = self.is_open;
+        let mut close_clicked = false;
+        let screen = ctx.content_rect();
+        let max_size = modal_max_size(ctx);
         egui::Window::new("💬 Subtitle Settings")
             .open(&mut is_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(480.0)
-            .max_width(ctx.content_rect().width() - 20.0)
-            .max_height(ctx.content_rect().height() - 20.0)
+            .vscroll(true)
+            .default_width(480.0f32.min(max_size.x))
+            .max_size(max_size)
+            .constrain_to(screen)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("Select embedded or external subtitles and calibrate display timing.")
                         .italics()
@@ -1594,21 +1626,32 @@ impl SubtitleConfigDialog {
 
                 if self.tracks.is_empty() {
                     ui.label(
-                        RichText::new("No subtitle tracks detected. Load an external .srt, .vtt, or .ass file below.")
+                        RichText::new("No subtitle tracks detected. Load an external .srt, .vtt, .ass, .ssa, or .sub file below.")
                             .italics()
                             .color(Color32::from_rgb(156, 163, 175)),
                     );
                 } else {
                     egui::ScrollArea::vertical()
+                        .id_salt("subtitle_tracks_scroll")
                         .max_height(140.0)
                         .show(ui, |ui| {
                             for track in &self.tracks {
                                 let is_selected = self.selected_track_id == Some(track.id);
                                 let label = track.display_label();
-                                if ui.radio(is_selected, label).clicked() {
-                                    self.selected_track_id = Some(track.id);
-                                    actions.push(SubtitleConfigAction::SelectTrack(Some(track.id)));
-                                }
+                                ui.horizontal(|ui| {
+                                    let radio_resp = ui.radio(is_selected, "");
+                                    let label_resp = ui
+                                        .add(
+                                            egui::Label::new(&label)
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(&label);
+                                    if radio_resp.clicked() || label_resp.clicked() {
+                                        self.selected_track_id = Some(track.id);
+                                        actions.push(SubtitleConfigAction::SelectTrack(Some(track.id)));
+                                    }
+                                });
                             }
                         });
                 }
@@ -1618,7 +1661,7 @@ impl SubtitleConfigDialog {
 
                 // 2. Load External Subtitle File
                 ui.heading("External Subtitles");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let picker_btn_text = if self.is_file_dialog_active {
                         "⏳ Opening File Picker..."
                     } else {
@@ -1630,7 +1673,7 @@ impl SubtitleConfigDialog {
                     }
 
                     ui.label(
-                        RichText::new("(.srt, .vtt, .ass, .ssa)")
+                        RichText::new("(.srt, .vtt, .ass, .ssa, .sub)")
                             .small()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
@@ -1655,9 +1698,9 @@ impl SubtitleConfigDialog {
                 let delay_status = if self.delay_ms == 0 {
                     "0 ms (Synchronized)".to_string()
                 } else if self.delay_ms > 0 {
-                    format!("+{} ms (Subtitles Early / Ahead)", self.delay_ms)
+                    format!("+{} ms (Subtitles Delayed / Later)", self.delay_ms)
                 } else {
-                    format!("{} ms (Subtitles Delayed)", self.delay_ms)
+                    format!("{} ms (Subtitles Early / Earlier)", self.delay_ms)
                 };
 
                 ui.label(
@@ -1678,7 +1721,7 @@ impl SubtitleConfigDialog {
                     actions.push(SubtitleConfigAction::SetDelayMs(self.delay_ms));
                 }
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("-250 ms").clicked() {
                         self.set_delay_ms(self.delay_ms - 250);
                     }
@@ -1713,7 +1756,7 @@ impl SubtitleConfigDialog {
                 let mut config_changed = false;
 
                 // Font scale slider (50% to 200%)
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Font Scale:");
                     let prev_scale = self.font_scale_percent;
                     let scale_slider = egui::Slider::new(&mut self.font_scale_percent, 50.0..=200.0)
@@ -1729,7 +1772,7 @@ impl SubtitleConfigDialog {
                 });
 
                 // Text color edit button & Outline shadow toggle
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Text Color:");
                     if ui.color_edit_button_srgba(&mut self.overlay_config.text_color).changed() {
                         config_changed = true;
@@ -1743,7 +1786,7 @@ impl SubtitleConfigDialog {
                 });
 
                 // Background fill opacity slider (0% to 100%)
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Background Fill Opacity:");
                     let opacity_slider = egui::Slider::new(&mut self.background_opacity_percent, 0.0..=100.0)
                         .suffix("%")
@@ -1765,13 +1808,12 @@ impl SubtitleConfigDialog {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        self.is_open = false;
+                        close_clicked = true;
                     }
                 });
             });
-            });
 
-        self.is_open = is_open;
+        self.is_open = is_open && !close_clicked;
         actions
     }
 }
@@ -1973,5 +2015,127 @@ mod tests {
         assert!((dlg.font_scale_percent - 200.0).abs() < 1e-2);
         assert!(!dlg.overlay_config.enable_shadow);
         assert_eq!(dlg.overlay_config().font_scale_ratio, 0.070);
+    }
+
+    #[test]
+    fn test_audio_config_dialog_200_percent_volume_parity() {
+        let mut dlg = AudioConfigDialog::new();
+        dlg.volume = 1.5; // Opened while ControlsBar is at 150% Boost
+        dlg.open();
+
+        let ctx = Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 360.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ctx| {
+            let _ = dlg.show(ctx);
+        });
+        out.textures_delta.clear();
+
+        // Must preserve 150% (1.5) instead of snapping down to 100% (1.0)
+        assert!((dlg.volume - 1.5).abs() < 1e-6);
+        assert!((dlg.effective_volume() - 1.5).abs() < 1e-6);
+
+        dlg.set_volume(2.0);
+        assert!((dlg.volume - 2.0).abs() < 1e-6);
+        dlg.set_volume(2.5);
+        assert!((dlg.volume - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_subtitle_config_dialog_external_load_no_duplicate_track() {
+        let mut dlg = SubtitleConfigDialog::new();
+        dlg.open();
+
+        let (tx, rx) = channel();
+        dlg.file_dialog_rx = Some(rx);
+        dlg.is_file_dialog_active = true;
+
+        let ext_path = PathBuf::from("/tmp/movie.en.sub");
+        tx.send(ext_path.clone()).unwrap();
+
+        let ctx = Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            let actions = dlg.show(ctx);
+            assert_eq!(actions, vec![SubtitleConfigAction::LoadExternal(ext_path.clone())]);
+        });
+        out.textures_delta.clear();
+
+        // Must NOT pre-insert into `dlg.tracks`; `app.rs` inserts once background parse finishes
+        assert!(dlg.tracks.is_empty());
+        assert_eq!(dlg.selected_track_id, None);
+    }
+
+    #[test]
+    fn test_all_dialogs_viewport_clamped_on_640x360() {
+        let ctx = Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 360.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        let mut host = HostPartyDialog::default();
+        host.open();
+        let mut connect = ConnectPartyDialog::default();
+        connect.open();
+        let mut shortcuts = ShortcutsDialog::default();
+        shortcuts.open();
+        let mut about = AboutDialog::default();
+        about.open();
+        let mut audio = AudioConfigDialog::new();
+        audio.set_tracks(vec![AudioTrackItem::new(
+            0,
+            "Very Long Audio Track Title That Should Truncate Cleanly Without Blowing Up Modal Width",
+            "dts-hd ma",
+        )]);
+        audio.open();
+        let mut video = VideoConfigDialog::new();
+        video.open();
+        let mut sub = SubtitleConfigDialog::new();
+        sub.add_track(SubtitleTrackItem::new(
+            0,
+            "Very Long External Subtitle Filename That Should Truncate Cleanly In The Radio List.srt",
+            "srt",
+        ));
+        sub.open();
+
+        let mut sidebar = SidebarState::default();
+        let (tx, _rx) = channel();
+
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(raw.clone(), |ctx| {
+                host.show(ctx, &mut sidebar, &tx);
+                connect.show(ctx, &mut sidebar, &tx);
+                shortcuts.show(ctx);
+                about.show(ctx);
+                let _ = audio.show(ctx);
+                let _ = video.show(ctx);
+                let _ = sub.show(ctx);
+            });
+            out.textures_delta.clear();
+        }
+
+        for title in [
+            "🌐 Host Watch Party Room",
+            "🔗 Connect to Watch Party",
+            "⌨ Keyboard Shortcuts & Controls Guide",
+            "ℹ About Syncverse",
+            "🔊 Audio Settings",
+            "🎬 Video Settings",
+            "💬 Subtitle Settings",
+        ] {
+            let rect = ctx
+                .memory(|m| m.area_rect(egui::Id::unique(Some(title))))
+                .unwrap_or_else(|| panic!("Missing area_rect for {}", title));
+            assert!(
+                screen.contains_rect(rect),
+                "Dialog '{}' rect {:?} overflowed 640x360 {:?}",
+                title,
+                rect,
+                screen
+            );
+        }
     }
 }

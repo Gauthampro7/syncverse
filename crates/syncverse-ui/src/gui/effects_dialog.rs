@@ -1,6 +1,6 @@
 //! Unified Audio & Video Effects and Adjustments dialog (Ctrl+E) conforming to VLC extended settings.
 
-use egui::{Align2, Color32, ComboBox, Context, CornerRadius, RichText, Slider, Stroke, Vec2, Window};
+use egui::{Color32, ComboBox, Context, CornerRadius, RichText, Slider, Stroke, Vec2, Window};
 use syncverse_codecs::audio::{AudioEqualizerConfig, EqualizerPreset, BAND_FREQUENCIES};
 use crate::gui::video_effects::VideoColorAdjustments;
 
@@ -103,22 +103,32 @@ impl EffectsDialog {
 
         let mut actions = Vec::new();
         let mut close_dialog = false;
+        let mut is_open = self.is_open;
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             close_dialog = true;
         }
 
+        let screen = ctx.content_rect();
+        let max_size = (screen.size() - Vec2::new(24.0, 24.0)).max(Vec2::new(240.0, 160.0));
+        let default_size = Vec2::new(560.0, 420.0).min(max_size);
+        let default_pos = screen.center() - default_size * 0.5;
+
         Window::new("🎛 Effects and Adjustments")
+            .open(&mut is_open)
             .collapsible(false)
-            .resizable(false)
-            .pivot(Align2::CENTER_CENTER)
-            .fixed_pos(ctx.content_rect().center())
-            .fixed_size(Vec2::new(560.0, 420.0))
+            .resizable(true)
+            .movable(true)
+            .vscroll(true)
+            .default_pos(default_pos)
+            .default_size(default_size)
+            .max_size(max_size)
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
                 // Tab Header
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(self.active_tab == EffectsTab::Audio, "🎵 Audio Effects").clicked() {
                         self.active_tab = EffectsTab::Audio;
                     }
@@ -133,32 +143,30 @@ impl EffectsDialog {
                     EffectsTab::Audio => {
                         // 1. Equalizer Section
                         let mut eq_changed = false;
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.checkbox(&mut self.equalizer_config.enabled, "Enable 10-Band Equalizer").changed() {
                                 eq_changed = true;
                             }
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("↺ Reset to Flat").clicked() {
-                                    self.equalizer_config = AudioEqualizerConfig::flat();
-                                    self.selected_preset = EqualizerPreset::Flat;
-                                    eq_changed = true;
-                                }
-
-                                // Presets Dropdown
-                                ComboBox::from_id_salt("eq_presets_dropdown")
-                                    .selected_text(self.selected_preset.name())
-                                    .show_ui(ui, |ui| {
-                                        for preset in EqualizerPreset::ALL {
-                                            if ui.selectable_label(self.selected_preset == *preset, preset.name()).clicked() {
-                                                self.selected_preset = *preset;
-                                                self.equalizer_config = AudioEqualizerConfig::from_preset(*preset);
-                                                eq_changed = true;
-                                            }
+                            ui.label("Preset:");
+                            // Presets Dropdown
+                            ComboBox::from_id_salt("eq_presets_dropdown")
+                                .selected_text(self.selected_preset.name())
+                                .show_ui(ui, |ui| {
+                                    for preset in EqualizerPreset::ALL {
+                                        if ui.selectable_label(self.selected_preset == *preset, preset.name()).clicked() {
+                                            self.selected_preset = *preset;
+                                            self.equalizer_config = AudioEqualizerConfig::from_preset(*preset);
+                                            eq_changed = true;
                                         }
-                                    });
-                                ui.label("Preset:");
-                            });
+                                    }
+                                });
+
+                            if ui.button("↺ Reset to Flat").clicked() {
+                                self.equalizer_config = AudioEqualizerConfig::flat();
+                                self.selected_preset = EqualizerPreset::Flat;
+                                eq_changed = true;
+                            }
                         });
 
                         ui.add_space(4.0);
@@ -178,39 +186,43 @@ impl EffectsDialog {
 
                         ui.add_space(6.0);
 
-                        // 10 Vertical Band Sliders
+                        // 10 Vertical Band Sliders (horizontal scroll when viewport < 560px)
                         ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                for (i, &freq) in BAND_FREQUENCIES.iter().enumerate() {
-                                    ui.vertical(|ui| {
-                                        let label = if freq >= 1000.0 {
-                                            format!("{:.0}k", freq / 1000.0)
-                                        } else {
-                                            format!("{:.0}", freq)
-                                        };
-                                        ui.label(RichText::new(label).small().color(Color32::from_rgb(150, 150, 165)));
+                            egui::ScrollArea::horizontal()
+                                .id_salt("effects_eq_bands_hscroll")
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for (i, &freq) in BAND_FREQUENCIES.iter().enumerate() {
+                                            ui.vertical(|ui| {
+                                                let label = if freq >= 1000.0 {
+                                                    format!("{:.0}k", freq / 1000.0)
+                                                } else {
+                                                    format!("{:.0}", freq)
+                                                };
+                                                ui.label(RichText::new(label).small().color(Color32::from_rgb(150, 150, 165)));
 
-                                        let slider = ui.add_sized(
-                                            [36.0, 130.0],
-                                            Slider::new(&mut self.equalizer_config.bands[i], -20.0..=20.0)
-                                                .vertical()
-                                                .show_value(false),
-                                        );
-                                        if slider.changed() {
-                                            eq_changed = true;
+                                                let slider = ui.add_sized(
+                                                    [36.0, 130.0],
+                                                    Slider::new(&mut self.equalizer_config.bands[i], -20.0..=20.0)
+                                                        .vertical()
+                                                        .show_value(false),
+                                                );
+                                                if slider.changed() {
+                                                    eq_changed = true;
+                                                }
+
+                                                let gain_val = self.equalizer_config.bands[i];
+                                                let gain_text = format!("{:+.0}", gain_val);
+                                                let text_color = if gain_val.abs() > 0.05 {
+                                                    Color32::from_rgb(56, 189, 248)
+                                                } else {
+                                                    Color32::from_rgb(120, 120, 135)
+                                                };
+                                                ui.label(RichText::new(gain_text).size(9.0).color(text_color));
+                                            });
                                         }
-
-                                        let gain_val = self.equalizer_config.bands[i];
-                                        let gain_text = format!("{:+.0}", gain_val);
-                                        let text_color = if gain_val.abs() > 0.05 {
-                                            Color32::from_rgb(56, 189, 248)
-                                        } else {
-                                            Color32::from_rgb(120, 120, 135)
-                                        };
-                                        ui.label(RichText::new(gain_text).size(9.0).color(text_color));
                                     });
-                                }
-                            });
+                                });
                         });
 
                         if eq_changed {
@@ -221,7 +233,7 @@ impl EffectsDialog {
                         ui.separator();
 
                         // 2. Dynamics Compressor (Night Mode) & Stereo Pan
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             // Compressor
                             ui.vertical(|ui| {
                                 let mut comp_changed = false;
@@ -276,16 +288,14 @@ impl EffectsDialog {
 
                     EffectsTab::Video => {
                         let mut vid_changed = false;
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.checkbox(&mut self.video_adjustments.enabled, "Enable Video Adjustments").changed() {
                                 vid_changed = true;
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("↺ Reset to Defaults").clicked() {
-                                    self.video_adjustments.reset();
-                                    vid_changed = true;
-                                }
-                            });
+                            if ui.button("↺ Reset to Defaults").clicked() {
+                                self.video_adjustments.reset();
+                                vid_changed = true;
+                            }
                         });
 
                         ui.add_space(8.0);
@@ -367,7 +377,7 @@ impl EffectsDialog {
                 });
             });
 
-        if close_dialog {
+        if close_dialog || !is_open {
             self.close();
         }
 
@@ -408,5 +418,57 @@ mod tests {
 
         assert!(dlg.equalizer_config.enabled);
         assert_eq!(dlg.equalizer_config.bands, EqualizerPreset::Rock.band_gains());
+    }
+
+    #[test]
+    fn test_effects_dialog_viewport_bounded_and_draggable() {
+        for (w, h) in [(480.0, 320.0), (1280.0, 720.0)] {
+            let ctx = Context::default();
+            let mut dlg = EffectsDialog::new();
+            dlg.open(EffectsTab::Audio);
+
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            };
+
+            // Run 2 frames so egui commits window layout rect into memory
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(raw.clone(), |ctx| {
+                    let _ = dlg.show(ctx);
+                });
+                out.textures_delta.clear();
+            }
+
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            let win_rect =
+                ctx.memory(|m| m.area_rect(egui::Id::unique(Some("🎛 Effects and Adjustments"))));
+            let rect = win_rect.expect("EffectsDialog window rect must be recorded");
+            assert!(
+                screen.contains_rect(rect),
+                "EffectsDialog {:?} escaped viewport {:?}",
+                rect,
+                screen
+            );
+            assert!(dlg.is_open);
+
+            // Pressing Escape closes the dialog
+            let esc_raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(esc_raw, |ctx| {
+                let _ = dlg.show(ctx);
+            });
+            out.textures_delta.clear();
+            assert!(!dlg.is_open);
+        }
     }
 }

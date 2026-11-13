@@ -253,10 +253,50 @@ impl Default for SubtitleOverlayConfig {
     }
 }
 
+/// Borrowed RGBA8888 bitmap subtitle cue view for image-based subtitle formats (PGS, VobSub, DVB).
+#[derive(Debug, Clone, Copy)]
+pub struct SubtitleBitmapView<'a> {
+    /// Tightly packed RGBA8888 pixel buffer (`width * height * 4` bytes).
+    pub rgba: &'a [u8],
+    /// Bitmap width in pixels.
+    pub width: u32,
+    /// Bitmap height in pixels.
+    pub height: u32,
+    /// Optional normalized top-left X coordinate in `[0.0, 1.0]` relative to `video_rect`.
+    pub norm_x: Option<f32>,
+    /// Optional normalized top-left Y coordinate in `[0.0, 1.0]` relative to `video_rect`.
+    pub norm_y: Option<f32>,
+    /// Optional reference video canvas width in pixels for proportional scaling.
+    pub canvas_width: Option<u32>,
+    /// Optional reference video canvas height in pixels for proportional scaling.
+    pub canvas_height: Option<u32>,
+    /// Cache key identifying the uploaded bitmap texture.
+    pub cache_key: u64,
+}
+
 /// Subtitle overlay rendering engine anchored strictly within the active video frame.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct SubtitleOverlay {
     config: SubtitleOverlayConfig,
+    bitmap_cache: std::cell::RefCell<Option<(u64, u32, u32, egui::TextureHandle)>>,
+}
+
+impl Clone for SubtitleOverlay {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            bitmap_cache: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for SubtitleOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubtitleOverlay")
+            .field("config", &self.config)
+            .field("has_bitmap_cache", &self.bitmap_cache.borrow().is_some())
+            .finish()
+    }
 }
 
 impl SubtitleOverlay {
@@ -264,12 +304,16 @@ impl SubtitleOverlay {
     pub fn new() -> Self {
         Self {
             config: SubtitleOverlayConfig::default(),
+            bitmap_cache: std::cell::RefCell::new(None),
         }
     }
 
     /// Constructs a new `SubtitleOverlay` with custom configuration.
     pub fn with_config(config: SubtitleOverlayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            bitmap_cache: std::cell::RefCell::new(None),
+        }
     }
 
     /// Returns a shared reference to the current configuration.
@@ -291,7 +335,111 @@ impl SubtitleOverlay {
 
     /// Renders subtitle text anchored inside `video_rect` using an `egui::Ui`.
     pub fn render(&self, ui: &mut Ui, video_rect: Rect, text: &str) -> Option<Rect> {
-        self.render_with_painter(ui.painter(), video_rect, text)
+        if self.config.render_outside_video {
+            self.render_with_painter(ui.painter(), video_rect, text)
+        } else {
+            if video_rect.width() <= 0.0 || video_rect.height() <= 0.0 {
+                return None;
+            }
+            let clipped = ui.painter_at(video_rect);
+            self.render_with_painter(&clipped, video_rect, text)
+        }
+    }
+
+    /// Renders an RGBA8888 bitmap subtitle cue (PGS, VobSub, DVB) proportionally inside `video_rect`.
+    ///
+    /// Caches the uploaded GPU texture internally by `(cache_key, width, height)` so repeated frames
+    /// reuse the existing `egui::TextureHandle` without redundant texture uploads.
+    pub fn render_bitmap(
+        &self,
+        ui: &mut Ui,
+        video_rect: Rect,
+        bitmap: SubtitleBitmapView<'_>,
+    ) -> Option<Rect> {
+        if bitmap.width == 0
+            || bitmap.height == 0
+            || video_rect.width() <= 0.0
+            || video_rect.height() <= 0.0
+        {
+            return None;
+        }
+
+        let expected_len = (bitmap.width as usize)
+            .checked_mul(bitmap.height as usize)
+            .and_then(|n| n.checked_mul(4))?;
+        if bitmap.rgba.len() < expected_len {
+            return None;
+        }
+
+        let tex_id = {
+            let mut cache = self.bitmap_cache.borrow_mut();
+            let hit = cache.as_ref().is_some_and(|(k, w, h, _)| {
+                *k == bitmap.cache_key && *w == bitmap.width && *h == bitmap.height
+            });
+            if hit {
+                cache.as_ref().map(|(_, _, _, handle)| handle.id())
+            } else {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [bitmap.width as usize, bitmap.height as usize],
+                    &bitmap.rgba[..expected_len],
+                );
+                let handle = ui.ctx().load_texture(
+                    "syncverse_subtitle_bitmap",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                let id = handle.id();
+                *cache = Some((bitmap.cache_key, bitmap.width, bitmap.height, handle));
+                Some(id)
+            }
+        }?;
+
+        let (mut draw_w, mut draw_h) = match (bitmap.canvas_width, bitmap.canvas_height) {
+            (Some(cw), Some(ch)) if cw > 0 && ch > 0 => {
+                let scale = (video_rect.width() / cw as f32).min(video_rect.height() / ch as f32);
+                (bitmap.width as f32 * scale, bitmap.height as f32 * scale)
+            }
+            _ => (bitmap.width as f32, bitmap.height as f32),
+        };
+
+        if draw_w > video_rect.width() || draw_h > video_rect.height() {
+            let fit_scale = (video_rect.width() / draw_w).min(video_rect.height() / draw_h);
+            draw_w *= fit_scale;
+            draw_h *= fit_scale;
+        }
+
+        if draw_w <= 0.0 || draw_h <= 0.0 {
+            return None;
+        }
+
+        let desired_x = match bitmap.norm_x {
+            Some(nx) => video_rect.left() + nx.clamp(0.0, 1.0) * video_rect.width(),
+            None => video_rect.center().x - draw_w * 0.5,
+        };
+        let desired_y = match bitmap.norm_y {
+            Some(ny) => video_rect.top() + ny.clamp(0.0, 1.0) * video_rect.height(),
+            None => {
+                let bottom_pad = (video_rect.height() * self.config.bottom_padding_ratio).max(4.0);
+                video_rect.bottom() - bottom_pad - draw_h
+            }
+        };
+
+        let max_x = (video_rect.right() - draw_w).max(video_rect.left());
+        let max_y = (video_rect.bottom() - draw_h).max(video_rect.top());
+        let clamped_x = desired_x.clamp(video_rect.left(), max_x);
+        let clamped_y = desired_y.clamp(video_rect.top(), max_y);
+
+        let dest_rect = Rect::from_min_size(pos2(clamped_x, clamped_y), vec2(draw_w, draw_h))
+            .intersect(video_rect);
+        if dest_rect.width() <= 0.0 || dest_rect.height() <= 0.0 {
+            return None;
+        }
+
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        ui.painter_at(video_rect)
+            .image(tex_id, dest_rect, uv, Color32::WHITE);
+
+        Some(dest_rect)
     }
 
     /// Renders subtitle text anchored strictly inside `video_rect` using an `egui::Painter`.
@@ -301,7 +449,7 @@ impl SubtitleOverlay {
     /// - Pill bounding box is strictly clamped within `video_rect` (never spills into letterbox/pillarbox margins).
     /// - GPU scissor clip rect is applied to prevent any raster leakage.
     /// - Proportional font size clamped between `min_font_size` (14pt) and `max_font_size` (36pt).
-    /// - High-contrast text on dark translucent pill background with drop shadow.
+    /// - High-contrast text on dark translucent pill background with crisp multi-tap outline and drop shadow.
     pub fn render_with_painter(
         &self,
         painter: &Painter,
@@ -343,32 +491,30 @@ impl SubtitleOverlay {
         let desired_min_y = pill_bottom_y - pill_size.y;
         let desired_max_y = pill_bottom_y;
 
-        // 5. Strictly clamp pill bounds inside video_rect
-        let (min_x, max_x, min_y, max_y) = if self.config.render_outside_video {
-            (desired_min_x, desired_max_x, desired_min_y, desired_max_y)
+        // 5. Strictly clamp pill bounds inside video_rect (top-edge & height clamped)
+        let (pill_rect, clipped_painter) = if self.config.render_outside_video {
+            let r = Rect::from_min_max(
+                pos2(desired_min_x.round(), desired_min_y.round()),
+                pos2(desired_max_x.round(), desired_max_y.round()),
+            );
+            if r.width() <= 0.0 || r.height() <= 0.0 {
+                return None;
+            }
+            (r, painter.clone())
         } else {
-            (
-                desired_min_x.max(video_rect.left()),
-                desired_max_x.min(video_rect.right()),
-                desired_min_y.max(video_rect.top()),
-                desired_max_y.min(video_rect.bottom()),
-            )
-        };
-
-        if min_x >= max_x || min_y >= max_y {
-            return None;
-        }
-
-        let pill_rect = Rect::from_min_max(
-            pos2(min_x.round(), min_y.round()),
-            pos2(max_x.round(), max_y.round()),
-        );
-
-        // 6. Ensure painter is strictly clipped to video_rect
-        let clipped_painter = if self.config.render_outside_video {
-            painter.clone()
-        } else {
-            painter.with_clip_rect(video_rect)
+            let r_min_x = desired_min_x.round().max(video_rect.left());
+            let r_max_x = desired_max_x.round().min(video_rect.right());
+            let r_min_y = desired_min_y.round().max(video_rect.top());
+            let r_max_y = desired_max_y.round().min(video_rect.bottom());
+            if r_min_x >= r_max_x || r_min_y >= r_max_y {
+                return None;
+            }
+            let r = Rect::from_min_max(pos2(r_min_x, r_min_y), pos2(r_max_x, r_max_y))
+                .intersect(video_rect);
+            if r.width() <= 0.0 || r.height() <= 0.0 {
+                return None;
+            }
+            (r, painter.with_clip_rect(video_rect))
         };
 
         // 7. Draw dark translucent background pill
@@ -388,20 +534,32 @@ impl SubtitleOverlay {
             );
         }
 
-        // 8. Text position centered inside pill_rect with integer pixel snapping
+        // 8. Text position centered inside pill_rect with integer pixel snapping and top-edge guard
         let text_pos = pos2(
-            (pill_rect.center().x - text_size.x / 2.0).round(),
-            (pill_rect.center().y - text_size.y / 2.0).round(),
+            (pill_rect.center().x - text_size.x / 2.0)
+                .max(pill_rect.left())
+                .round(),
+            (pill_rect.center().y - text_size.y / 2.0)
+                .max(pill_rect.top())
+                .round(),
         );
 
-        // 9. Render drop shadow for high readability over bright video backgrounds
+        // 9. Render crisp VLC multi-tap outline + drop shadow for bright scenes / 0% background opacity
         if self.config.enable_shadow {
-            let shadow_offset = vec2(1.0, 1.0);
-            clipped_painter.galley(
-                text_pos + shadow_offset,
-                galley.clone(),
-                self.config.text_shadow_color,
-            );
+            const OUTLINE_OFFSETS: [Vec2; 5] = [
+                vec2(-1.0, 0.0),
+                vec2(1.0, 0.0),
+                vec2(0.0, -1.0),
+                vec2(0.0, 1.0),
+                vec2(1.5, 1.5),
+            ];
+            for offset in OUTLINE_OFFSETS {
+                clipped_painter.galley(
+                    text_pos + offset,
+                    galley.clone(),
+                    self.config.text_shadow_color,
+                );
+            }
         }
 
         // 10. Render high-contrast main subtitle text
@@ -713,5 +871,131 @@ mod tests {
             assert!(rect_portrait.contains_rect(pill_portrait));
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_subtitle_overlay_top_edge_clamping_on_tiny_viewports() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let cfg = SubtitleOverlayConfig {
+                font_scale_ratio: 0.035 * 2.0,
+                min_font_size: 28.0,
+                max_font_size: 72.0,
+                pill_background_color: Color32::TRANSPARENT,
+                ..Default::default()
+            };
+            let overlay = SubtitleOverlay::with_config(cfg);
+
+            let tiny_rect = Rect::from_min_size(pos2(12.3, 15.7), vec2(180.0, 64.0));
+            let multiline = "Line 1: Huge 2.0x text\nLine 2: Must stay clamped\nLine 3: Inside tiny viewport";
+            let pill = overlay.render(ui, tiny_rect, multiline).unwrap();
+            assert!(
+                tiny_rect.contains_rect(pill),
+                "Pill {:?} escaped tiny viewport {:?}",
+                pill,
+                tiny_rect
+            );
+            assert!(pill.top() >= tiny_rect.top());
+            assert!(pill.height() <= tiny_rect.height());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_subtitle_overlay_bitmap_rendering_and_texture_cache_reuse() {
+        let ctx = egui::Context::default();
+        let overlay = SubtitleOverlay::new();
+        let video_rect = Rect::from_min_size(pos2(40.0, 20.0), vec2(640.0, 360.0));
+        let rgba = vec![255u8; 200 * 50 * 4];
+
+        // Frame 1: Initial bitmap upload (cache_key = 1)
+        let mut out1 = ctx.run_ui(Default::default(), |ui| {
+            let view = SubtitleBitmapView {
+                rgba: &rgba,
+                width: 200,
+                height: 50,
+                norm_x: None,
+                norm_y: None,
+                canvas_width: Some(1920),
+                canvas_height: Some(1080),
+                cache_key: 1,
+            };
+            let rect = overlay.render_bitmap(ui, video_rect, view).unwrap();
+            assert!(video_rect.contains_rect(rect));
+            // 1920x1080 -> 640x360 = 1/3 scale => 200/3 x 50/3
+            assert!((rect.width() / rect.height() - 4.0).abs() < 0.05);
+        });
+        let uploads_frame1 = out1
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(id, _)| matches!(id, egui::TextureId::Managed(n) if *n > 0))
+            .count();
+        assert_eq!(uploads_frame1, 1, "First render must upload bitmap texture");
+        out1.textures_delta.clear();
+
+        // Frame 2: Same cache_key -> reuses cached TextureHandle (0 new uploads)
+        let mut out2 = ctx.run_ui(Default::default(), |ui| {
+            let view = SubtitleBitmapView {
+                rgba: &rgba,
+                width: 200,
+                height: 50,
+                norm_x: Some(0.95),
+                norm_y: Some(0.95),
+                canvas_width: None,
+                canvas_height: None,
+                cache_key: 1,
+            };
+            let rect = overlay.render_bitmap(ui, video_rect, view).unwrap();
+            assert!(video_rect.contains_rect(rect));
+        });
+        let uploads_frame2 = out2
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(id, _)| matches!(id, egui::TextureId::Managed(n) if *n > 0))
+            .count();
+        assert_eq!(uploads_frame2, 0, "Repeated render with same cache_key must reuse texture");
+        out2.textures_delta.clear();
+
+        // Frame 3: New cache_key -> uploads new texture
+        let mut out3 = ctx.run_ui(Default::default(), |ui| {
+            let view = SubtitleBitmapView {
+                rgba: &rgba,
+                width: 200,
+                height: 50,
+                norm_x: None,
+                norm_y: None,
+                canvas_width: Some(1920),
+                canvas_height: Some(1080),
+                cache_key: 2,
+            };
+            let rect = overlay.render_bitmap(ui, video_rect, view).unwrap();
+            assert!(video_rect.contains_rect(rect));
+        });
+        let uploads_frame3 = out3
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(id, _)| matches!(id, egui::TextureId::Managed(n) if *n > 0))
+            .count();
+        assert_eq!(uploads_frame3, 1, "New cache_key must upload updated bitmap texture");
+        out3.textures_delta.clear();
+
+        // Invalid / degenerate buffer returns None
+        let mut out4 = ctx.run_ui(Default::default(), |ui| {
+            let bad = SubtitleBitmapView {
+                rgba: &[0u8; 4],
+                width: 100,
+                height: 100,
+                norm_x: None,
+                norm_y: None,
+                canvas_width: None,
+                canvas_height: None,
+                cache_key: 3,
+            };
+            assert_eq!(overlay.render_bitmap(ui, video_rect, bad), None);
+        });
+        out4.textures_delta.clear();
     }
 }
