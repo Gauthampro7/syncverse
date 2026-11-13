@@ -954,3 +954,134 @@ fn test_audio_stream_id_menu_subtitle_menu_escape_hierarchy_and_vlc_hotkeys() {
         ]
     );
 }
+
+#[test]
+fn test_pause_preserves_lookahead_and_paused_seek_same_pts_uploads() {
+    let ctx = Context::default();
+    let now = Instant::now();
+
+    // Part (a): While playing at gen 0, pausing preserves all future lookahead frames.
+    {
+        let clock = Arc::new(MasterClock::new(1000.0, 1.0, PlaybackState::Playing));
+        let ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+        let mut vp = VideoViewport::new();
+
+        let _ = ring.try_push(VideoFrameRGBA::new(64, 64, 1000).with_generation(0));
+        let _ = ring.try_push(VideoFrameRGBA::new(64, 64, 1040).with_generation(0));
+        let _ = ring.try_push(VideoFrameRGBA::new(64, 64, 1080).with_generation(0));
+        let _ = ring.try_push(VideoFrameRGBA::new(64, 64, 1120).with_generation(0));
+
+        // Frame 1 (Playing): uploads pts=1000.
+        let _ = capture_full_output(
+            ctx.run_ui(RawInput::default(), |ui| {
+                vp.update_playback(ui.ctx(), &ring, &clock, now);
+            }),
+            None,
+            None,
+            None,
+        );
+        // Frame 2 (Playing): pops pts=1040, sees Wait(40ms), stores it in pending_frame;
+        // pts=1080 and pts=1120 remain untouched in ring (ring.len() == 2).
+        let _ = capture_full_output(
+            ctx.run_ui(RawInput::default(), |ui| {
+                vp.update_playback(ui.ctx(), &ring, &clock, now);
+            }),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(vp.capture_frame().map(|f| f.pts_ms), Some(1000));
+        assert_eq!(ring.len(), 2);
+
+        // Pause clock and run multiple paused frames: must NOT drain pending_frame or ring.
+        clock.set_state(now, PlaybackState::Paused);
+        for _ in 0..3 {
+            let _ = capture_full_output(
+                ctx.run_ui(RawInput::default(), |ui| {
+                    vp.update_playback(ui.ctx(), &ring, &clock, now);
+                }),
+                None,
+                None,
+                None,
+            );
+        }
+        assert_eq!(
+            vp.capture_frame().map(|f| f.pts_ms),
+            Some(1000),
+            "Pausing must not jump ahead to future buffered frames"
+        );
+        assert_eq!(
+            ring.len(),
+            2,
+            "Future gen=0 frames in video_ring must remain intact while paused"
+        );
+
+        // Unpause at `resume_start` (clock is still at 1000ms), then advance 40ms of playback:
+        // pending_frame (pts=1040) is presented immediately in order.
+        let resume_start = now + Duration::from_millis(40);
+        clock.set_state(resume_start, PlaybackState::Playing);
+        let present_time = resume_start + Duration::from_millis(40);
+        let _ = capture_full_output(
+            ctx.run_ui(RawInput::default(), |ui| {
+                vp.update_playback(ui.ctx(), &ring, &clock, present_time);
+            }),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(vp.capture_frame().map(|f| f.pts_ms), Some(1040));
+        assert_eq!(ring.len(), 2);
+    }
+
+    // Part (b): Paused seek back to 0ms (same PTS as before, new generation=1) discards stale
+    // gen=0 frames, uploads gen=1 pts=0ms, and preserves gen=1 pts=40ms in video_ring.
+    {
+        let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+        let ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+        let mut vp = VideoViewport::new();
+
+        // Initial paused frame at pts=0, gen=0 (32x32).
+        let _ = ring.try_push(VideoFrameRGBA::new(32, 32, 0).with_generation(0));
+        let _ = capture_full_output(
+            ctx.run_ui(RawInput::default(), |ui| {
+                vp.update_playback(ui.ctx(), &ring, &clock, now);
+            }),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(vp.capture_frame().map(|f| (f.pts_ms, f.generation, f.width)), Some((0, 0, 32)));
+
+        // Queue leftover stale gen=0 frames, seek while paused -> gen=1, then push two gen=1 frames.
+        let _ = ring.try_push(VideoFrameRGBA::new(32, 32, 1040).with_generation(0));
+        let _ = ring.try_push(VideoFrameRGBA::new(32, 32, 1080).with_generation(0));
+        clock.seek_to(0.0, now);
+        assert_eq!(clock.seek_generation(), 1);
+
+        let _ = ring.try_push(VideoFrameRGBA::new(128, 72, 0).with_generation(1));
+        let _ = ring.try_push(VideoFrameRGBA::new(128, 72, 40).with_generation(1));
+
+        let _ = capture_full_output(
+            ctx.run_ui(RawInput::default(), |ui| {
+                vp.update_playback(ui.ctx(), &ring, &clock, now);
+            }),
+            None,
+            None,
+            None,
+        );
+
+        let presented = vp
+            .capture_frame()
+            .expect("Expected gen=1 pts=0ms frame to upload despite previous pts=0ms");
+        assert_eq!(presented.generation, 1);
+        assert_eq!(presented.pts_ms, 0);
+        assert_eq!(presented.width, 128);
+        assert_eq!(presented.height, 72);
+        assert_eq!(
+            ring.len(),
+            1,
+            "Second gen=1 frame (pts=40ms) must remain queued in video_ring"
+        );
+        assert_eq!(ring.try_pop().map(|f| (f.pts_ms, f.generation)), Some((40, 1)));
+    }
+}

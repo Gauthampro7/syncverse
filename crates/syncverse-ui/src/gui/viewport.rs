@@ -280,6 +280,7 @@ pub struct VideoViewport {
     texture: Option<TextureHandle>,
     texture_buffer: VideoTextureBuffer,
     current_pts_ms: Option<u64>,
+    last_uploaded_generation: Option<u64>,
     video_width: u32,
     video_height: u32,
     pending_frame: Option<VideoFrameRGBA>,
@@ -306,6 +307,7 @@ impl VideoViewport {
             texture: None,
             texture_buffer: VideoTextureBuffer::new(),
             current_pts_ms: None,
+            last_uploaded_generation: None,
             video_width: 0,
             video_height: 0,
             pending_frame: None,
@@ -343,16 +345,23 @@ impl VideoViewport {
         }
 
         if !clock.is_playing() {
-            let mut latest_frame = self.pending_frame.take();
-            while let Some(newer) = video_ring.try_pop() {
-                if newer.generation != current_gen {
-                    continue;
+            if self.last_uploaded_generation != Some(current_gen) || self.texture.is_none() {
+                let next_frame = if let Some(pending) = self.pending_frame.take() {
+                    Some(pending)
+                } else {
+                    let mut found = None;
+                    while let Some(candidate) = video_ring.try_pop() {
+                        if candidate.generation == current_gen {
+                            found = Some(candidate);
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some(frame) = next_frame {
+                    self.upload_frame(ctx, frame);
+                    ctx.request_repaint();
                 }
-                latest_frame = Some(newer);
-            }
-            if let Some(frame) = latest_frame {
-                self.upload_frame(ctx, frame);
-                ctx.request_repaint();
             }
             return;
         }
@@ -416,6 +425,7 @@ impl VideoViewport {
     pub fn clear_pending(&mut self) {
         self.pending_frame = None;
         self.current_pts_ms = None;
+        self.last_uploaded_generation = None;
     }
 
     /// Resets the viewport state and texture handle for a newly opened media stream.
@@ -424,6 +434,7 @@ impl VideoViewport {
         self.pending_frame = None;
         self.last_frame = None;
         self.current_pts_ms = None;
+        self.last_uploaded_generation = None;
         self.video_width = 0;
         self.video_height = 0;
         self.zoom_mode = ZoomMode::Fit;
@@ -435,7 +446,10 @@ impl VideoViewport {
 
     /// Uploads an owned frame's RGBA data to the `egui::TextureHandle` with zero heap clones.
     pub fn upload_frame(&mut self, ctx: &Context, frame: VideoFrameRGBA) {
-        if self.current_pts_ms == Some(frame.pts_ms) && self.texture.is_some() {
+        if self.current_pts_ms == Some(frame.pts_ms)
+            && self.last_uploaded_generation == Some(frame.generation)
+            && self.texture.is_some()
+        {
             return;
         }
 
@@ -457,6 +471,7 @@ impl VideoViewport {
         }
 
         self.current_pts_ms = Some(frame.pts_ms);
+        self.last_uploaded_generation = Some(frame.generation);
         self.video_width = frame.width;
         self.video_height = frame.height;
         self.last_frame = Some(frame);
@@ -464,7 +479,10 @@ impl VideoViewport {
 
     /// Uploads frame RGBA data to the `egui::TextureHandle`.
     pub fn upload_texture(&mut self, ctx: &Context, frame: &VideoFrameRGBA) {
-        if self.current_pts_ms == Some(frame.pts_ms) && self.texture.is_some() {
+        if self.current_pts_ms == Some(frame.pts_ms)
+            && self.last_uploaded_generation == Some(frame.generation)
+            && self.texture.is_some()
+        {
             return;
         }
         self.upload_frame(ctx, frame.clone());
@@ -475,6 +493,7 @@ impl VideoViewport {
         self.video_adjustments = adjustments;
         if let Some(frame) = self.last_frame.take() {
             self.current_pts_ms = None;
+            self.last_uploaded_generation = None;
             self.upload_frame(ctx, frame);
             ctx.request_repaint();
         }
