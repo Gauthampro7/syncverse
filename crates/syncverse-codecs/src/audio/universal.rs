@@ -63,8 +63,9 @@ pub struct UniversalAudioDecoder {
     decoder: ffmpeg_next::decoder::Audio,
     resampler: Option<ResamplerContext>,
     time_base: Option<Rational>,
-    current_packet_pts_ms: u64,
-    cumulative_samples_since_pts: u64,
+    anchored: bool,
+    base_pts_us: i64,
+    samples_since_anchor: u64,
     last_in_format: Option<Sample>,
     last_in_layout: Option<ChannelLayout>,
     last_in_rate: Option<u32>,
@@ -82,7 +83,8 @@ impl UniversalAudioDecoder {
         })?;
 
         let context = CodecContext::from_parameters(params)?;
-        let decoder = context.decoder().open_as(codec)?.audio()?;
+        let mut decoder = context.decoder().open_as(codec)?.audio()?;
+        decoder.set_packet_time_base(Rational(1, 1_000_000));
 
         let rational_tb = time_base.map(|(num, den)| Rational(num, den));
 
@@ -90,8 +92,9 @@ impl UniversalAudioDecoder {
             decoder,
             resampler: None,
             time_base: rational_tb,
-            current_packet_pts_ms: 0,
-            cumulative_samples_since_pts: 0,
+            anchored: false,
+            base_pts_us: 0,
+            samples_since_anchor: 0,
             last_in_format: None,
             last_in_layout: None,
             last_in_rate: None,
@@ -133,7 +136,8 @@ impl UniversalAudioDecoder {
             }
         }
 
-        let decoder = context.decoder().open_as(codec)?.audio()?;
+        let mut decoder = context.decoder().open_as(codec)?.audio()?;
+        decoder.set_packet_time_base(Rational(1, 1_000_000));
 
         let rational_tb = time_base.map(|(num, den)| Rational(num, den));
 
@@ -141,8 +145,9 @@ impl UniversalAudioDecoder {
             decoder,
             resampler: None,
             time_base: rational_tb,
-            current_packet_pts_ms: 0,
-            cumulative_samples_since_pts: 0,
+            anchored: false,
+            base_pts_us: 0,
+            samples_since_anchor: 0,
             last_in_format: None,
             last_in_layout: None,
             last_in_rate: None,
@@ -191,28 +196,65 @@ impl UniversalAudioDecoder {
         self.time_base = Some(Rational(num, den));
     }
 
+    /// Maximum tolerated drift (in microseconds) before re-anchoring the continuous sample clock.
+    const CONTINUITY_REANCHOR_THRESHOLD_US: i64 = 2_000;
+
+    /// Computes the expected continuous sample clock timestamp in microseconds.
+    #[inline]
+    fn expected_pts_us(&self) -> i64 {
+        let delta_us = ((self.samples_since_anchor as i128 * 1_000_000)
+            / TARGET_AUDIO_SAMPLE_RATE as i128) as i64;
+        self.base_pts_us.saturating_add(delta_us)
+    }
+
+    /// Decodes raw compressed audio packet bytes with explicit presentation timestamp in microseconds.
+    ///
+    /// Tracks continuous sample progression in exact integer samples (`base_pts_us + samples * 1_000_000 / 48_000`)
+    /// and only re-anchors `base_pts_us` when the decoded frame PTS diverges from the expected
+    /// continuous sample clock by more than `2_000 us` (2 ms).
+    pub fn decode_packet_us(
+        &mut self,
+        data: &[u8],
+        pts_us: i64,
+    ) -> Result<Vec<AudioFramePCM>, UniversalAudioError> {
+        let mut pkt = Packet::copy(data);
+        pkt.set_pts(Some(pts_us));
+
+        let mut output_frames = Vec::new();
+        let mut raw_frame = AudioFrame::empty();
+
+        if let Err(err) = self.decoder.send_packet(&pkt) {
+            if matches!(
+                err,
+                FfmpegError::Other { errno }
+                    if errno == ffmpeg_next::ffi::EAGAIN || errno == ffmpeg_next::ffi::EWOULDBLOCK
+            ) {
+                while self.decoder.receive_frame(&mut raw_frame).is_ok() {
+                    let pcm_frame = self.process_and_resample(&mut raw_frame, pts_us)?;
+                    output_frames.push(pcm_frame);
+                }
+                self.decoder.send_packet(&pkt)?;
+            } else {
+                return Err(err.into());
+            }
+        }
+
+        while self.decoder.receive_frame(&mut raw_frame).is_ok() {
+            let pcm_frame = self.process_and_resample(&mut raw_frame, pts_us)?;
+            output_frames.push(pcm_frame);
+        }
+
+        Ok(output_frames)
+    }
+
     /// Decodes raw compressed audio packet bytes with explicit presentation timestamp in milliseconds.
     pub fn decode_packet(
         &mut self,
         packet_data: &[u8],
         pts_ms: u64,
     ) -> Result<Vec<AudioFramePCM>, UniversalAudioError> {
-        self.current_packet_pts_ms = pts_ms;
-        self.cumulative_samples_since_pts = 0;
-
-        let mut pkt = Packet::copy(packet_data);
-        pkt.set_pts(Some(pts_ms as i64));
-        self.decoder.send_packet(&pkt)?;
-
-        let mut output_frames = Vec::new();
-        let mut raw_frame = AudioFrame::empty();
-
-        while self.decoder.receive_frame(&mut raw_frame).is_ok() {
-            let pcm_frame = self.process_and_resample(&mut raw_frame)?;
-            output_frames.push(pcm_frame);
-        }
-
-        Ok(output_frames)
+        let pts_us = (pts_ms as i64).saturating_mul(1000);
+        self.decode_packet_us(packet_data, pts_us)
     }
 
     /// Resets internal decoder buffers and resampler state (for random-access seek).
@@ -222,12 +264,14 @@ impl UniversalAudioDecoder {
         self.last_in_format = None;
         self.last_in_layout = None;
         self.last_in_rate = None;
-        self.current_packet_pts_ms = 0;
-        self.cumulative_samples_since_pts = 0;
+        self.anchored = false;
+        self.base_pts_us = 0;
+        self.samples_since_anchor = 0;
     }
 
     /// Flushes residual buffered frames from the decoder and the resampler delay line,
-    /// and resets the decoder state for subsequent playback.
+    /// and resets the decoder state (`avcodec_flush_buffers`, resampler, and sample counters)
+    /// so subsequent post-seek packets decode cleanly.
     pub fn flush(&mut self) -> Result<Vec<AudioFramePCM>, UniversalAudioError> {
         let _ = self.decoder.send_eof();
 
@@ -235,7 +279,8 @@ impl UniversalAudioDecoder {
         let mut raw_frame = AudioFrame::empty();
 
         while self.decoder.receive_frame(&mut raw_frame).is_ok() {
-            if let Ok(pcm_frame) = self.process_and_resample(&mut raw_frame) {
+            let fallback_us = self.expected_pts_us();
+            if let Ok(pcm_frame) = self.process_and_resample(&mut raw_frame, fallback_us) {
                 output_frames.push(pcm_frame);
             }
         }
@@ -252,15 +297,15 @@ impl UniversalAudioDecoder {
 
                     if resampler.flush(&mut flush_frame).is_ok() && flush_frame.samples() > 0 {
                         let plane = flush_frame.plane::<f32>(0);
-                        let samples: Vec<f32> = plane.iter().map(|&s| s.clamp(-1.0, 1.0)).collect();
-                        let pts = self.current_packet_pts_ms
-                            + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64);
-                        self.cumulative_samples_since_pts += flush_frame.samples() as u64;
+                        let samples: Vec<f32> = plane.iter().map(|&s| soft_clip_sample(s)).collect();
+                        let pts_us = self.expected_pts_us();
+                        let pts_ms = (pts_us.max(0) / 1000) as u64;
+                        self.samples_since_anchor += flush_frame.samples() as u64;
 
                         if let Ok(pcm_frame) = AudioFramePCM::new(
                             TARGET_AUDIO_SAMPLE_RATE,
                             TARGET_AUDIO_CHANNELS,
-                            pts,
+                            pts_ms,
                             samples,
                         ) {
                             output_frames.push(pcm_frame);
@@ -270,7 +315,7 @@ impl UniversalAudioDecoder {
             }
         }
 
-        // Reset the codec context buffers and EOF state so future packets can be decoded!
+        // Reset the codec context buffers, resampler, and sample clock so future post-seek packets decode cleanly.
         self.flush_buffers();
 
         Ok(output_frames)
@@ -280,7 +325,22 @@ impl UniversalAudioDecoder {
     fn process_and_resample(
         &mut self,
         raw_frame: &mut AudioFrame,
+        fallback_pts_us: i64,
     ) -> Result<AudioFramePCM, UniversalAudioError> {
+        let frame_in_pts_us = raw_frame
+            .timestamp()
+            .or_else(|| raw_frame.pts())
+            .unwrap_or(fallback_pts_us);
+
+        let expected_us = self.expected_pts_us();
+        if !self.anchored
+            || frame_in_pts_us.abs_diff(expected_us) > Self::CONTINUITY_REANCHOR_THRESHOLD_US as u64
+        {
+            self.base_pts_us = frame_in_pts_us;
+            self.samples_since_anchor = 0;
+            self.anchored = true;
+        }
+
         let in_format = raw_frame.format();
         let in_layout = effective_layout(raw_frame);
         let in_rate = raw_frame.rate();
@@ -326,11 +386,9 @@ impl UniversalAudioDecoder {
         let plane = out_frame.plane::<f32>(0);
         let samples: Vec<f32> = plane.iter().map(|&s| soft_clip_sample(s)).collect();
 
-        // Calculate PTS with millisecond precision anchored to container packet timestamp
-        let frame_pts_ms = self.current_packet_pts_ms
-            + (self.cumulative_samples_since_pts * 1000 / TARGET_AUDIO_SAMPLE_RATE as u64);
-
-        self.cumulative_samples_since_pts += out_samples_count as u64;
+        let frame_pts_us = self.expected_pts_us();
+        let frame_pts_ms = (frame_pts_us.max(0) / 1000) as u64;
+        self.samples_since_anchor += out_samples_count as u64;
 
         AudioFramePCM::new(
             TARGET_AUDIO_SAMPLE_RATE,
@@ -377,5 +435,130 @@ mod tests {
         let dec_dca = UniversalAudioDecoder::from_codec_name("dca", Some((1, 48000)), None);
         assert!(dec_dca.is_ok(), "from_codec_name('dca') must succeed: {:?}", dec_dca.err());
         assert_eq!(dec_dca.unwrap().codec_id(), Id::DTS);
+    }
+
+    fn ensure_48k_aac_fixture() -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from("/tmp/syncplay_codecs_challenge");
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join("aac_48k_subms.aac");
+        if !path.exists() {
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=0.4",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-c:a",
+                    "aac",
+                    "-f",
+                    "adts",
+                ])
+                .arg(&path)
+                .status()
+                .expect("run ffmpeg for aac fixture");
+            assert!(status.success(), "ffmpeg must create aac_48k_subms.aac");
+        }
+        path
+    }
+
+    #[test]
+    fn test_aac_sub_ms_continuous_pts_and_reanchor() {
+        let _ = ffmpeg_next::init();
+        let path = ensure_48k_aac_fixture();
+        let mut ictx = ffmpeg_next::format::input(&path).expect("open aac");
+        let stream = ictx
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .expect("audio stream");
+        let stream_index = stream.index();
+
+        let mut dec = UniversalAudioDecoder::from_parameters(
+            stream.parameters(),
+            Some((stream.time_base().0, stream.time_base().1)),
+        )
+        .expect("aac decoder");
+
+        let packets: Vec<Vec<u8>> = ictx
+            .packets()
+            .filter(|(s, _)| s.index() == stream_index)
+            .map(|(_, p)| p.data().unwrap_or(&[]).to_vec())
+            .collect();
+        assert!(packets.len() >= 10, "expected >= 10 AAC packets");
+
+        // Feed truncated millisecond timestamps (21.333ms per 1024-sample frame -> 0, 21, 42, 64, 85, ...)
+        let mut emitted_pts = Vec::new();
+        for (idx, pkt) in packets.iter().take(6).enumerate() {
+            let truncated_ms = ((idx as u64) * 1024 * 1000) / 48_000;
+            let frames = dec.decode_packet(pkt, truncated_ms).expect("decode_packet");
+            for f in frames {
+                emitted_pts.push((f.pts_ms, f.samples.len() / 2));
+            }
+        }
+        assert!(emitted_pts.len() >= 4, "expected >= 4 decoded frames");
+
+        // Verify continuous sample-accurate PTS progression (no re-anchor drift)
+        let mut cumulative_samples = 0u64;
+        for (pts_ms, sample_count) in &emitted_pts {
+            let expected_ms = (cumulative_samples * 1000) / 48_000;
+            assert_eq!(
+                *pts_ms, expected_ms,
+                "Expected sample-accurate PTS {}ms, got {}ms",
+                expected_ms, pts_ms
+            );
+            cumulative_samples += *sample_count as u64;
+        }
+
+        // Now feed a discontinuous PTS jump (+500_000 us = +500 ms > 2_000 us threshold) via decode_packet_us
+        let jump_us = ((cumulative_samples as i64) * 1_000_000 / 48_000) + 500_000;
+        let jump_frames = dec
+            .decode_packet_us(&packets[6], jump_us)
+            .expect("decode_packet_us jump");
+        assert!(!jump_frames.is_empty());
+        assert_eq!(jump_frames[0].pts_ms, (jump_us / 1000) as u64);
+    }
+
+    #[test]
+    fn test_audio_flush_resets_counters_and_resumes_cleanly() {
+        let _ = ffmpeg_next::init();
+        let path = ensure_48k_aac_fixture();
+        let mut ictx = ffmpeg_next::format::input(&path).expect("open aac");
+        let stream = ictx
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .expect("audio stream");
+        let stream_index = stream.index();
+
+        let mut dec = UniversalAudioDecoder::from_parameters(
+            stream.parameters(),
+            Some((stream.time_base().0, stream.time_base().1)),
+        )
+        .expect("aac decoder");
+
+        let packets: Vec<Vec<u8>> = ictx
+            .packets()
+            .filter(|(s, _)| s.index() == stream_index)
+            .map(|(_, p)| p.data().unwrap_or(&[]).to_vec())
+            .collect();
+
+        let _ = dec.decode_packet_us(&packets[0], 0).expect("pkt 0");
+        let _ = dec.decode_packet_us(&packets[1], 21_333).expect("pkt 1");
+
+        let _ = dec.flush().expect("flush");
+        assert!(!dec.anchored);
+        assert_eq!(dec.base_pts_us, 0);
+        assert_eq!(dec.samples_since_anchor, 0);
+        assert!(dec.resampler.is_none());
+
+        // Immediately decode post-seek packet at 120s
+        let resumed = dec
+            .decode_packet_us(&packets[2], 120_000_000)
+            .expect("post-flush decode");
+        assert!(!resumed.is_empty(), "post-seek packet must decode cleanly");
+        assert_eq!(resumed[0].pts_ms, 120_000);
     }
 }

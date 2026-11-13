@@ -131,6 +131,120 @@ pub fn yuv_to_rgb_bt709(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     (r, g, b)
 }
 
+/// Writes one converted RGBA pixel into `dst_row[x * 4 .. x * 4 + 4]`.
+#[inline(always)]
+fn write_rgba_pixel(
+    dst_row: &mut [u8],
+    x: usize,
+    y_val: u8,
+    r_chroma: i32,
+    g_chroma: i32,
+    b_chroma: i32,
+) {
+    let c = (y_val as i32) - 16;
+    let y_term = 298 * c;
+    let px = &mut dst_row[x * 4..x * 4 + 4];
+    px[0] = clamp_u8((y_term + r_chroma) >> 8);
+    px[1] = clamp_u8((y_term + g_chroma) >> 8);
+    px[2] = clamp_u8((y_term + b_chroma) >> 8);
+    px[3] = 255;
+}
+
+/// Shared row-sliced 2x2 chroma-reuse Q8 kernel parameterized over BT.601 vs BT.709.
+#[inline]
+fn convert_yuv420p_to_rgba_kernel<const BT709: bool>(
+    src: &VideoFrameYUV420p,
+    dst: &mut VideoFrameRGBA,
+) {
+    let width = src.width as usize;
+    let height = src.height as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let y_plane = src.y_plane.as_slice();
+    let u_plane = src.u_plane.as_slice();
+    let v_plane = src.v_plane.as_slice();
+    let dst_data = dst.data.as_mut_slice();
+
+    let stride_y = src.stride_y;
+    let stride_u = src.stride_u;
+    let stride_v = src.stride_v;
+    let dst_stride = dst.stride;
+    let dst_row_bytes = width * 4;
+
+    let half_h = height / 2;
+    let half_w = width / 2;
+
+    let chroma_fn = if BT709 {
+        chroma_terms_bt709
+    } else {
+        chroma_terms_bt601
+    };
+
+    for by in 0..half_h {
+        let y0 = by * 2;
+        let y1 = y0 + 1;
+        let y0_row = &y_plane[y0 * stride_y..y0 * stride_y + width];
+        let y1_row = &y_plane[y1 * stride_y..y1 * stride_y + width];
+        let u_row = &u_plane[by * stride_u..by * stride_u + width.div_ceil(2)];
+        let v_row = &v_plane[by * stride_v..by * stride_v + width.div_ceil(2)];
+
+        let (dst_head, dst_tail) = dst_data.split_at_mut(y1 * dst_stride);
+        let dst0_row = &mut dst_head[y0 * dst_stride..y0 * dst_stride + dst_row_bytes];
+        let dst1_row = &mut dst_tail[..dst_row_bytes];
+
+        for bx in 0..half_w {
+            let x0 = bx * 2;
+            let x1 = x0 + 1;
+
+            let (r_chroma, g_chroma, b_chroma) = chroma_fn(u_row[bx], v_row[bx]);
+
+            write_rgba_pixel(dst0_row, x0, y0_row[x0], r_chroma, g_chroma, b_chroma);
+            write_rgba_pixel(dst0_row, x1, y0_row[x1], r_chroma, g_chroma, b_chroma);
+            write_rgba_pixel(dst1_row, x0, y1_row[x0], r_chroma, g_chroma, b_chroma);
+            write_rgba_pixel(dst1_row, x1, y1_row[x1], r_chroma, g_chroma, b_chroma);
+        }
+
+        // Trailing column if width is odd
+        if !width.is_multiple_of(2) {
+            let x = width - 1;
+            let bx = x / 2;
+            let (r_chroma, g_chroma, b_chroma) = chroma_fn(u_row[bx], v_row[bx]);
+
+            write_rgba_pixel(dst0_row, x, y0_row[x], r_chroma, g_chroma, b_chroma);
+            write_rgba_pixel(dst1_row, x, y1_row[x], r_chroma, g_chroma, b_chroma);
+        }
+    }
+
+    // Trailing row if height is odd
+    if !height.is_multiple_of(2) {
+        let y = height - 1;
+        let by = y / 2;
+        let y_row = &y_plane[y * stride_y..y * stride_y + width];
+        let u_row = &u_plane[by * stride_u..by * stride_u + width.div_ceil(2)];
+        let v_row = &v_plane[by * stride_v..by * stride_v + width.div_ceil(2)];
+        let dst_row = &mut dst_data[y * dst_stride..y * dst_stride + dst_row_bytes];
+
+        for bx in 0..half_w {
+            let x0 = bx * 2;
+            let x1 = x0 + 1;
+            let (r_chroma, g_chroma, b_chroma) = chroma_fn(u_row[bx], v_row[bx]);
+
+            write_rgba_pixel(dst_row, x0, y_row[x0], r_chroma, g_chroma, b_chroma);
+            write_rgba_pixel(dst_row, x1, y_row[x1], r_chroma, g_chroma, b_chroma);
+        }
+
+        if !width.is_multiple_of(2) {
+            let x = width - 1;
+            let bx = x / 2;
+            let (r_chroma, g_chroma, b_chroma) = chroma_fn(u_row[bx], v_row[bx]);
+
+            write_rgba_pixel(dst_row, x, y_row[x], r_chroma, g_chroma, b_chroma);
+        }
+    }
+}
+
 /// Converts a planar YUV420p frame into a packed RGBA presentation frame using Q8 integer arithmetic.
 ///
 /// This hot loop performs zero heap allocations and uses an unrolled 2x2 chroma reuse kernel
@@ -150,290 +264,9 @@ pub fn convert_yuv420p_to_rgba(
         });
     }
 
-    let width = src.width as usize;
-    let height = src.height as usize;
-    let y_plane = src.y_plane.as_slice();
-    let u_plane = src.u_plane.as_slice();
-    let v_plane = src.v_plane.as_slice();
-    let dst_data = dst.data.as_mut_slice();
-
-    let stride_y = src.stride_y;
-    let stride_u = src.stride_u;
-    let stride_v = src.stride_v;
-    let dst_stride = dst.stride;
-
-    let half_h = height / 2;
-    let half_w = width / 2;
-
     match standard {
-        ColorStandard::Bt601 => {
-            // Main unrolled 2x2 blocks with chroma reuse
-            for by in 0..half_h {
-                let y0 = by * 2;
-                let y1 = y0 + 1;
-                let y0_offset = y0 * stride_y;
-                let y1_offset = y1 * stride_y;
-                let uv_row_offset = by * stride_u;
-                let v_row_offset = by * stride_v;
-                let dst0_offset = y0 * dst_stride;
-                let dst1_offset = y1 * dst_stride;
-
-                for bx in 0..half_w {
-                    let x0 = bx * 2;
-                    let x1 = x0 + 1;
-
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt601(u_val, v_val);
-
-                    // Pixel (x0, y0)
-                    let c00 = (y_plane[y0_offset + x0] as i32) - 16;
-                    let y_term00 = 298 * c00;
-                    let px00 = dst0_offset + x0 * 4;
-                    dst_data[px00] = clamp_u8((y_term00 + r_chroma) >> 8);
-                    dst_data[px00 + 1] = clamp_u8((y_term00 + g_chroma) >> 8);
-                    dst_data[px00 + 2] = clamp_u8((y_term00 + b_chroma) >> 8);
-                    dst_data[px00 + 3] = 255;
-
-                    // Pixel (x1, y0)
-                    let c10 = (y_plane[y0_offset + x1] as i32) - 16;
-                    let y_term10 = 298 * c10;
-                    let px10 = dst0_offset + x1 * 4;
-                    dst_data[px10] = clamp_u8((y_term10 + r_chroma) >> 8);
-                    dst_data[px10 + 1] = clamp_u8((y_term10 + g_chroma) >> 8);
-                    dst_data[px10 + 2] = clamp_u8((y_term10 + b_chroma) >> 8);
-                    dst_data[px10 + 3] = 255;
-
-                    // Pixel (x0, y1)
-                    let c01 = (y_plane[y1_offset + x0] as i32) - 16;
-                    let y_term01 = 298 * c01;
-                    let px01 = dst1_offset + x0 * 4;
-                    dst_data[px01] = clamp_u8((y_term01 + r_chroma) >> 8);
-                    dst_data[px01 + 1] = clamp_u8((y_term01 + g_chroma) >> 8);
-                    dst_data[px01 + 2] = clamp_u8((y_term01 + b_chroma) >> 8);
-                    dst_data[px01 + 3] = 255;
-
-                    // Pixel (x1, y1)
-                    let c11 = (y_plane[y1_offset + x1] as i32) - 16;
-                    let y_term11 = 298 * c11;
-                    let px11 = dst1_offset + x1 * 4;
-                    dst_data[px11] = clamp_u8((y_term11 + r_chroma) >> 8);
-                    dst_data[px11 + 1] = clamp_u8((y_term11 + g_chroma) >> 8);
-                    dst_data[px11 + 2] = clamp_u8((y_term11 + b_chroma) >> 8);
-                    dst_data[px11 + 3] = 255;
-                }
-
-                // Trailing column if width is odd
-                if !width.is_multiple_of(2) {
-                    let x = width - 1;
-                    let bx = x / 2;
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt601(u_val, v_val);
-
-                    let c0 = (y_plane[y0_offset + x] as i32) - 16;
-                    let y_term0 = 298 * c0;
-                    let px0 = dst0_offset + x * 4;
-                    dst_data[px0] = clamp_u8((y_term0 + r_chroma) >> 8);
-                    dst_data[px0 + 1] = clamp_u8((y_term0 + g_chroma) >> 8);
-                    dst_data[px0 + 2] = clamp_u8((y_term0 + b_chroma) >> 8);
-                    dst_data[px0 + 3] = 255;
-
-                    let c1 = (y_plane[y1_offset + x] as i32) - 16;
-                    let y_term1 = 298 * c1;
-                    let px1 = dst1_offset + x * 4;
-                    dst_data[px1] = clamp_u8((y_term1 + r_chroma) >> 8);
-                    dst_data[px1 + 1] = clamp_u8((y_term1 + g_chroma) >> 8);
-                    dst_data[px1 + 2] = clamp_u8((y_term1 + b_chroma) >> 8);
-                    dst_data[px1 + 3] = 255;
-                }
-            }
-
-            // Trailing row if height is odd
-            if !height.is_multiple_of(2) {
-                let y = height - 1;
-                let by = y / 2;
-                let y_offset = y * stride_y;
-                let uv_row_offset = by * stride_u;
-                let v_row_offset = by * stride_v;
-                let dst_row_offset = y * dst_stride;
-
-                for bx in 0..half_w {
-                    let x0 = bx * 2;
-                    let x1 = x0 + 1;
-
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt601(u_val, v_val);
-
-                    let c0 = (y_plane[y_offset + x0] as i32) - 16;
-                    let y_term0 = 298 * c0;
-                    let px0 = dst_row_offset + x0 * 4;
-                    dst_data[px0] = clamp_u8((y_term0 + r_chroma) >> 8);
-                    dst_data[px0 + 1] = clamp_u8((y_term0 + g_chroma) >> 8);
-                    dst_data[px0 + 2] = clamp_u8((y_term0 + b_chroma) >> 8);
-                    dst_data[px0 + 3] = 255;
-
-                    let c1 = (y_plane[y_offset + x1] as i32) - 16;
-                    let y_term1 = 298 * c1;
-                    let px1 = dst_row_offset + x1 * 4;
-                    dst_data[px1] = clamp_u8((y_term1 + r_chroma) >> 8);
-                    dst_data[px1 + 1] = clamp_u8((y_term1 + g_chroma) >> 8);
-                    dst_data[px1 + 2] = clamp_u8((y_term1 + b_chroma) >> 8);
-                    dst_data[px1 + 3] = 255;
-                }
-
-                if !width.is_multiple_of(2) {
-                    let x = width - 1;
-                    let bx = x / 2;
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt601(u_val, v_val);
-
-                    let c = (y_plane[y_offset + x] as i32) - 16;
-                    let y_term = 298 * c;
-                    let px = dst_row_offset + x * 4;
-                    dst_data[px] = clamp_u8((y_term + r_chroma) >> 8);
-                    dst_data[px + 1] = clamp_u8((y_term + g_chroma) >> 8);
-                    dst_data[px + 2] = clamp_u8((y_term + b_chroma) >> 8);
-                    dst_data[px + 3] = 255;
-                }
-            }
-        }
-        ColorStandard::Bt709 => {
-            // Main unrolled 2x2 blocks with chroma reuse
-            for by in 0..half_h {
-                let y0 = by * 2;
-                let y1 = y0 + 1;
-                let y0_offset = y0 * stride_y;
-                let y1_offset = y1 * stride_y;
-                let uv_row_offset = by * stride_u;
-                let v_row_offset = by * stride_v;
-                let dst0_offset = y0 * dst_stride;
-                let dst1_offset = y1 * dst_stride;
-
-                for bx in 0..half_w {
-                    let x0 = bx * 2;
-                    let x1 = x0 + 1;
-
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt709(u_val, v_val);
-
-                    // Pixel (x0, y0)
-                    let c00 = (y_plane[y0_offset + x0] as i32) - 16;
-                    let y_term00 = 298 * c00;
-                    let px00 = dst0_offset + x0 * 4;
-                    dst_data[px00] = clamp_u8((y_term00 + r_chroma) >> 8);
-                    dst_data[px00 + 1] = clamp_u8((y_term00 + g_chroma) >> 8);
-                    dst_data[px00 + 2] = clamp_u8((y_term00 + b_chroma) >> 8);
-                    dst_data[px00 + 3] = 255;
-
-                    // Pixel (x1, y0)
-                    let c10 = (y_plane[y0_offset + x1] as i32) - 16;
-                    let y_term10 = 298 * c10;
-                    let px10 = dst0_offset + x1 * 4;
-                    dst_data[px10] = clamp_u8((y_term10 + r_chroma) >> 8);
-                    dst_data[px10 + 1] = clamp_u8((y_term10 + g_chroma) >> 8);
-                    dst_data[px10 + 2] = clamp_u8((y_term10 + b_chroma) >> 8);
-                    dst_data[px10 + 3] = 255;
-
-                    // Pixel (x0, y1)
-                    let c01 = (y_plane[y1_offset + x0] as i32) - 16;
-                    let y_term01 = 298 * c01;
-                    let px01 = dst1_offset + x0 * 4;
-                    dst_data[px01] = clamp_u8((y_term01 + r_chroma) >> 8);
-                    dst_data[px01 + 1] = clamp_u8((y_term01 + g_chroma) >> 8);
-                    dst_data[px01 + 2] = clamp_u8((y_term01 + b_chroma) >> 8);
-                    dst_data[px01 + 3] = 255;
-
-                    // Pixel (x1, y1)
-                    let c11 = (y_plane[y1_offset + x1] as i32) - 16;
-                    let y_term11 = 298 * c11;
-                    let px11 = dst1_offset + x1 * 4;
-                    dst_data[px11] = clamp_u8((y_term11 + r_chroma) >> 8);
-                    dst_data[px11 + 1] = clamp_u8((y_term11 + g_chroma) >> 8);
-                    dst_data[px11 + 2] = clamp_u8((y_term11 + b_chroma) >> 8);
-                    dst_data[px11 + 3] = 255;
-                }
-
-                // Trailing column if width is odd
-                if !width.is_multiple_of(2) {
-                    let x = width - 1;
-                    let bx = x / 2;
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt709(u_val, v_val);
-
-                    let c0 = (y_plane[y0_offset + x] as i32) - 16;
-                    let y_term0 = 298 * c0;
-                    let px0 = dst0_offset + x * 4;
-                    dst_data[px0] = clamp_u8((y_term0 + r_chroma) >> 8);
-                    dst_data[px0 + 1] = clamp_u8((y_term0 + g_chroma) >> 8);
-                    dst_data[px0 + 2] = clamp_u8((y_term0 + b_chroma) >> 8);
-                    dst_data[px0 + 3] = 255;
-
-                    let c1 = (y_plane[y1_offset + x] as i32) - 16;
-                    let y_term1 = 298 * c1;
-                    let px1 = dst1_offset + x * 4;
-                    dst_data[px1] = clamp_u8((y_term1 + r_chroma) >> 8);
-                    dst_data[px1 + 1] = clamp_u8((y_term1 + g_chroma) >> 8);
-                    dst_data[px1 + 2] = clamp_u8((y_term1 + b_chroma) >> 8);
-                    dst_data[px1 + 3] = 255;
-                }
-            }
-
-            // Trailing row if height is odd
-            if !height.is_multiple_of(2) {
-                let y = height - 1;
-                let by = y / 2;
-                let y_offset = y * stride_y;
-                let uv_row_offset = by * stride_u;
-                let v_row_offset = by * stride_v;
-                let dst_row_offset = y * dst_stride;
-
-                for bx in 0..half_w {
-                    let x0 = bx * 2;
-                    let x1 = x0 + 1;
-
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt709(u_val, v_val);
-
-                    let c0 = (y_plane[y_offset + x0] as i32) - 16;
-                    let y_term0 = 298 * c0;
-                    let px0 = dst_row_offset + x0 * 4;
-                    dst_data[px0] = clamp_u8((y_term0 + r_chroma) >> 8);
-                    dst_data[px0 + 1] = clamp_u8((y_term0 + g_chroma) >> 8);
-                    dst_data[px0 + 2] = clamp_u8((y_term0 + b_chroma) >> 8);
-                    dst_data[px0 + 3] = 255;
-
-                    let c1 = (y_plane[y_offset + x1] as i32) - 16;
-                    let y_term1 = 298 * c1;
-                    let px1 = dst_row_offset + x1 * 4;
-                    dst_data[px1] = clamp_u8((y_term1 + r_chroma) >> 8);
-                    dst_data[px1 + 1] = clamp_u8((y_term1 + g_chroma) >> 8);
-                    dst_data[px1 + 2] = clamp_u8((y_term1 + b_chroma) >> 8);
-                    dst_data[px1 + 3] = 255;
-                }
-
-                if !width.is_multiple_of(2) {
-                    let x = width - 1;
-                    let bx = x / 2;
-                    let u_val = u_plane[uv_row_offset + bx];
-                    let v_val = v_plane[v_row_offset + bx];
-                    let (r_chroma, g_chroma, b_chroma) = chroma_terms_bt709(u_val, v_val);
-
-                    let c = (y_plane[y_offset + x] as i32) - 16;
-                    let y_term = 298 * c;
-                    let px = dst_row_offset + x * 4;
-                    dst_data[px] = clamp_u8((y_term + r_chroma) >> 8);
-                    dst_data[px + 1] = clamp_u8((y_term + g_chroma) >> 8);
-                    dst_data[px + 2] = clamp_u8((y_term + b_chroma) >> 8);
-                    dst_data[px + 3] = 255;
-                }
-            }
-        }
+        ColorStandard::Bt601 => convert_yuv420p_to_rgba_kernel::<false>(src, dst),
+        ColorStandard::Bt709 => convert_yuv420p_to_rgba_kernel::<true>(src, dst),
     }
 
     dst.pts_ms = src.pts_ms;

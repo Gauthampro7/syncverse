@@ -3,6 +3,7 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 use crate::error::CodecError;
 
 /// 64-byte aligned heap buffer with end-of-buffer SIMD tail padding.
@@ -10,6 +11,7 @@ pub struct AlignedBuffer {
     ptr: *mut u8,
     layout: Layout,
     len: usize,
+    cap: usize,
 }
 
 // SAFETY: AlignedBuffer owns unique heap allocation, can be safely sent across threads.
@@ -34,7 +36,44 @@ impl AlignedBuffer {
             ptr,
             layout,
             len: capacity,
+            cap: capacity,
         }
+    }
+
+    /// Returns the underlying allocated byte capacity of this buffer.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Adjusts the logical byte length within the already-allocated capacity without reallocating.
+    #[inline]
+    pub(crate) fn set_len_within_capacity(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.cap,
+            "new_len {} exceeds AlignedBuffer capacity {}",
+            new_len,
+            self.cap
+        );
+        self.len = new_len;
+    }
+
+    /// Returns a mutable 32-bit slice view when the buffer length is a multiple of 4 bytes.
+    #[inline]
+    pub(crate) fn as_mut_u32_slice(&mut self) -> &mut [u32] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        assert!(
+            self.len.is_multiple_of(4),
+            "AlignedBuffer length {} must be a multiple of 4 for u32 view",
+            self.len
+        );
+        // SAFETY:
+        // - `self.ptr` is non-null and 64-byte aligned (therefore strictly 4-byte aligned).
+        // - `self.len` is verified to be a multiple of 4 and `self.len <= self.cap <= self.layout.size()`.
+        // - `&mut self` guarantees exclusive mutable access for the returned slice lifetime.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u32, self.len / 4) }
     }
 
     /// Returns a slice to the allocated buffer.
@@ -161,6 +200,8 @@ impl VideoFrameYUV420p {
 pub struct VideoFrameRGBA {
     /// Presentation timestamp in milliseconds.
     pub pts_ms: u64,
+    /// Seek/epoch generation counter used to discard stale frames after seeks or track switches.
+    pub generation: u64,
     /// Visible width in pixels.
     pub width: u32,
     /// Visible height in pixels.
@@ -172,29 +213,200 @@ pub struct VideoFrameRGBA {
 }
 
 impl VideoFrameRGBA {
-    /// Allocates a new `VideoFrameRGBA` with 64-byte row alignment and Alpha pre-initialized to 255.
-    pub fn new(width: u32, height: u32, pts_ms: u64) -> Self {
+    /// Computes the 64-byte aligned row stride and total byte size for an RGBA frame.
+    #[inline]
+    fn geometry(width: u32, height: u32) -> (usize, usize) {
         let stride = (((width as usize) * 4) + 63) & !63;
         let total_size = stride * (height as usize);
+        (stride, total_size)
+    }
+
+    /// Allocates a new `VideoFrameRGBA` with 64-byte row alignment and Alpha pre-initialized to 255.
+    pub fn new(width: u32, height: u32, pts_ms: u64) -> Self {
+        let (stride, total_size) = Self::geometry(width, height);
         let mut buffer = AlignedBuffer::new(total_size);
 
-        // Pre-initialize alpha channel (every 4th byte) to 255
-        let slice = buffer.as_mut_slice();
-        for y in 0..(height as usize) {
-            let row_start = y * stride;
-            for x in 0..(width as usize) {
-                let pixel_start = row_start + x * 4;
-                slice[pixel_start + 3] = 255;
+        if width > 0 && height > 0 {
+            // Pre-initialize alpha channel to 255 in a vectorized 32-bit pass:
+            // [R=0, G=0, B=0, A=255] == 0xFF00_0000 in little-endian u32 representation.
+            let alpha_pixel = 0xFF00_0000_u32.to_le();
+            let w = width as usize;
+            let stride_u32 = stride / 4;
+            let u32_slice = buffer.as_mut_u32_slice();
+            if stride_u32 == w {
+                u32_slice.fill(alpha_pixel);
+            } else {
+                for row in u32_slice.chunks_exact_mut(stride_u32) {
+                    row[..w].fill(alpha_pixel);
+                }
             }
         }
 
         Self {
             pts_ms,
+            generation: 0,
             width,
             height,
             stride,
             data: buffer,
         }
+    }
+
+    /// Allocates a zeroed `VideoFrameRGBA` without filling alpha bytes.
+    ///
+    /// Intended for decoders and color converters (`sws_scale`, `convert_yuv420p_to_rgba`)
+    /// that immediately overwrite every RGBA pixel in the frame.
+    pub fn new_uninit_zeroed(width: u32, height: u32, pts_ms: u64) -> Self {
+        let (stride, total_size) = Self::geometry(width, height);
+        let buffer = AlignedBuffer::new(total_size);
+
+        Self {
+            pts_ms,
+            generation: 0,
+            width,
+            height,
+            stride,
+            data: buffer,
+        }
+    }
+
+    /// Builder method tagging this frame with a seek/epoch `generation`.
+    #[inline]
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
+
+    /// Updates the seek/epoch `generation` tag in place.
+    #[inline]
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+}
+
+/// Default maximum number of pooled RGBA buffers retained by [`RgbaFramePool`].
+const DEFAULT_RGBA_POOL_CAPACITY: usize = 48;
+
+#[derive(Debug)]
+struct RgbaFramePoolInner {
+    buffers: Mutex<Vec<AlignedBuffer>>,
+    max_buffers: usize,
+}
+
+/// Thread-safe bounded pool of 64-byte aligned RGBA frame buffers.
+///
+/// Reuses `AlignedBuffer` heap allocations across 1080p/4K video playback so the
+/// decoder avoids per-frame `mmap`/`munmap` kernel page faults. Cloning an
+/// `RgbaFramePool` shares the same underlying pool via `Arc`.
+#[derive(Debug, Clone)]
+pub struct RgbaFramePool {
+    inner: Arc<RgbaFramePoolInner>,
+}
+
+impl Default for RgbaFramePool {
+    fn default() -> Self {
+        Self::new(DEFAULT_RGBA_POOL_CAPACITY)
+    }
+}
+
+impl RgbaFramePool {
+    /// Creates a new `RgbaFramePool` retaining up to `max_buffers` recycled buffers.
+    pub fn new(max_buffers: usize) -> Self {
+        Self {
+            inner: Arc::new(RgbaFramePoolInner {
+                buffers: Mutex::new(Vec::with_capacity(max_buffers.min(DEFAULT_RGBA_POOL_CAPACITY))),
+                max_buffers,
+            }),
+        }
+    }
+
+    /// Acquires a `VideoFrameRGBA` backed by a pooled `AlignedBuffer` when one with
+    /// sufficient capacity is available, or allocates a new 64-byte aligned buffer otherwise.
+    pub fn acquire(&self, width: u32, height: u32, pts_ms: u64, generation: u64) -> VideoFrameRGBA {
+        let (stride, total_size) = VideoFrameRGBA::geometry(width, height);
+        if total_size == 0 {
+            return VideoFrameRGBA::new_uninit_zeroed(width, height, pts_ms)
+                .with_generation(generation);
+        }
+
+        let reused = {
+            let mut guard = self
+                .inner
+                .buffers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(idx) = guard.iter().rposition(|buf| buf.capacity() >= total_size) {
+                let mut buf = guard.swap_remove(idx);
+                buf.set_len_within_capacity(total_size);
+                Some(buf)
+            } else {
+                None
+            }
+        };
+
+        let data = reused.unwrap_or_else(|| AlignedBuffer::new(total_size));
+        VideoFrameRGBA {
+            pts_ms,
+            generation,
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    /// Returns a `VideoFrameRGBA`'s underlying `AlignedBuffer` to the pool for reuse.
+    ///
+    /// If the pool is at capacity, smaller stale buffers are evicted first so the pool
+    /// adapts smoothly to resolution upgrades; excess buffers are dropped outside the lock.
+    pub fn recycle(&self, frame: VideoFrameRGBA) {
+        let cap = frame.data.capacity();
+        if cap == 0 || self.inner.max_buffers == 0 {
+            return;
+        }
+
+        let evicted: Option<AlignedBuffer> = {
+            let mut guard = self
+                .inner
+                .buffers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.len() < self.inner.max_buffers {
+                guard.push(frame.data);
+                None
+            } else if let Some((min_idx, _)) = guard
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| b.capacity())
+                .filter(|(_, b)| b.capacity() < cap)
+            {
+                let old = std::mem::replace(&mut guard[min_idx], frame.data);
+                Some(old)
+            } else {
+                Some(frame.data)
+            }
+        };
+        drop(evicted);
+    }
+
+    /// Returns the number of buffers currently available in the pool.
+    pub fn len(&self) -> usize {
+        self.inner
+            .buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Returns `true` if the pool currently holds zero buffers.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the maximum number of buffers this pool can retain.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.max_buffers
     }
 }
 
@@ -284,8 +496,68 @@ mod tests {
         let frame = VideoFrameRGBA::new(1920, 1080, 0);
         assert_eq!(frame.stride, 1920 * 4); // 7680 (multiple of 64)
         assert_eq!(frame.data.len(), 7680 * 1080);
+        assert_eq!(frame.generation, 0);
         assert_eq!(frame.data[3], 255); // Alpha initialized
         assert_eq!(frame.data[7], 255);
+        assert_eq!(frame.data[frame.data.len() - 1], 255);
+    }
+
+    #[test]
+    fn test_rgba_frame_odd_width_and_generation() {
+        let mut frame = VideoFrameRGBA::new(854, 480, 123).with_generation(7);
+        assert_eq!(frame.pts_ms, 123);
+        assert_eq!(frame.generation, 7);
+        assert_eq!(frame.stride, 3456); // (854*4 + 63) & !63 = 3456
+        // Verify alpha=255 for active pixels and 0 in stride padding
+        assert_eq!(frame.data[853 * 4 + 3], 255);
+        assert_eq!(frame.data[854 * 4 + 3], 0);
+        assert_eq!(frame.data[frame.stride + 853 * 4 + 3], 255);
+
+        frame.set_generation(9);
+        assert_eq!(frame.generation, 9);
+
+        let uninit = VideoFrameRGBA::new_uninit_zeroed(64, 64, 50).with_generation(3);
+        assert_eq!(uninit.generation, 3);
+        assert_eq!(uninit.data[3], 0);
+        assert!(uninit.data.is_64_aligned());
+    }
+
+    #[test]
+    fn test_rgba_frame_pool_reuse_and_bounds() {
+        let pool = RgbaFramePool::new(2);
+        assert_eq!(pool.capacity(), 2);
+        assert!(pool.is_empty());
+
+        let f1 = pool.acquire(1920, 1080, 100, 1);
+        let ptr1 = f1.data.as_ptr() as usize;
+        assert_eq!(f1.generation, 1);
+        assert_eq!(f1.pts_ms, 100);
+        assert!(f1.data.is_64_aligned());
+
+        pool.recycle(f1);
+        assert_eq!(pool.len(), 1);
+
+        // Re-acquiring same or smaller size reuses the exact same allocation pointer!
+        let f2 = pool.acquire(1280, 720, 200, 2);
+        assert_eq!(f2.data.as_ptr() as usize, ptr1);
+        assert_eq!(f2.data.len(), f2.stride * 720);
+        assert_eq!(f2.generation, 2);
+        assert_eq!(f2.pts_ms, 200);
+        assert!(pool.is_empty());
+
+        // Returning f2 and upgrading to 4K allocates a larger buffer, and pool retains larger
+        pool.recycle(f2);
+        let f3 = pool.acquire(3840, 2160, 300, 3);
+        assert_ne!(f3.data.as_ptr() as usize, ptr1);
+        assert_eq!(pool.len(), 1); // 1080p buffer stayed in pool since 4K needed larger
+
+        // Pool capacity bound respected
+        let f4 = pool.acquire(640, 480, 400, 4); // reuses the 1080p buffer
+        let f5 = pool.acquire(640, 480, 500, 5);
+        pool.recycle(f3);
+        pool.recycle(f4);
+        pool.recycle(f5);
+        assert_eq!(pool.len(), 2);
     }
 
     #[test]
