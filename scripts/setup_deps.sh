@@ -62,10 +62,12 @@ fi
 # 2. Idempotency Check
 # ------------------------------------------------------------------------------
 AVCODEC_H="$DEPS_DIR/usr/include/ffmpeg/libavcodec/avcodec.h"
+ALSA_H="$DEPS_DIR/usr/include/alsa/asoundlib.h"
 LIBCLANG_SO="$DEPS_DIR/usr/lib64/libclang.so"
 AVCODEC_SO="$DEPS_DIR/usr/lib64/libavcodec.so"
+ASOUND_SO="$DEPS_DIR/usr/lib64/libasound.so"
 
-if [ $FORCE_REBUILD -eq 0 ] && [ -f "$AVCODEC_H" ] && [ -e "$LIBCLANG_SO" ] && [ -e "$AVCODEC_SO" ]; then
+if [ $FORCE_REBUILD -eq 0 ] && [ -f "$AVCODEC_H" ] && [ -f "$ALSA_H" ] && [ -e "$LIBCLANG_SO" ] && [ -e "$AVCODEC_SO" ] && [ -e "$ASOUND_SO" ]; then
   echo ">>> [INFO] Dependencies are already provisioned and verified in $DEPS_DIR."
   echo "    To re-extract, pass --force."
   exit 0
@@ -78,7 +80,7 @@ RPM_CACHE_DIR="$DEPS_DIR/.rpm_cache"
 mkdir -p "$RPM_CACHE_DIR"
 echo ">>> [2/6] Downloading development RPM packages to $RPM_CACHE_DIR..."
 
-RPM_TARGETS=("ffmpeg-devel" "clang-libs")
+RPM_TARGETS=("ffmpeg-devel" "clang-libs" "alsa-lib-devel")
 for target in "${RPM_TARGETS[@]}"; do
   # Check if cached RPM already exists
   CACHED_RPM=$(find "$RPM_CACHE_DIR" -name "${target}-*.rpm" | head -n 1)
@@ -112,14 +114,19 @@ if [ -n "$CLANG_VERSIONED" ]; then
   echo "  [OK] Linked libclang.so -> $CLANG_VERSIONED"
 fi
 
-# Resolve relative FFmpeg .so symlinks to absolute system libraries in /usr/lib64
+# Resolve relative FFmpeg & ALSA .so symlinks to absolute system libraries in /usr/lib64
 for so in "$DEPS_DIR/usr/lib64/"*.so; do
   [ -L "$so" ] || continue
   target=$(readlink "$so")
   if [[ "$target" != /* ]] && [ -e "/usr/lib64/$target" ]; then
     ln -sf "/usr/lib64/$target" "$so"
+  elif [ ! -e "$so" ] && [ -e "/usr/lib64/$(basename "$so").2" ]; then
+    ln -sf "/usr/lib64/$(basename "$so").2" "$so"
   fi
 done
+if [ ! -e "$ASOUND_SO" ] && [ -e "/usr/lib64/libasound.so.2" ]; then
+  ln -sf "/usr/lib64/libasound.so.2" "$ASOUND_SO"
+fi
 echo "  [OK] Resolved development .so symlinks to host shared libraries in /usr/lib64"
 
 # Fix includedir and prefix in .pc files
@@ -127,8 +134,16 @@ PKG_DIR="$DEPS_DIR/usr/lib64/pkgconfig"
 if [ -d "$PKG_DIR" ]; then
   for pc in "$PKG_DIR"/*.pc; do
     [ -f "$pc" ] || continue
+    pc_name="$(basename "$pc")"
     sed -i -E "s|^prefix=.*|prefix=${DEPS_DIR}/usr|g" "$pc"
-    sed -i -E "s|^includedir=.*|includedir=${DEPS_DIR}/usr/include/ffmpeg|g" "$pc"
+    case "$pc_name" in
+      libav*.pc|libsw*.pc)
+        sed -i -E "s|^includedir=.*|includedir=${DEPS_DIR}/usr/include/ffmpeg|g" "$pc"
+        ;;
+      *)
+        sed -i -E "s|^includedir=.*|includedir=${DEPS_DIR}/usr/include|g" "$pc"
+        ;;
+    esac
   done
   echo "  [OK] Adjusted includedir and prefix paths in $PKG_DIR/*.pc"
 fi
@@ -179,19 +194,32 @@ if [ ! -f "$AVCODEC_H" ]; then
   exit 1
 fi
 
+if [ ! -f "$ALSA_H" ]; then
+  echo "[FAIL] ALSA asoundlib.h not found at $ALSA_H" >&2
+  exit 1
+fi
+
 if [ ! -e "$LIBCLANG_SO" ]; then
   echo "[FAIL] libclang.so not found at $LIBCLANG_SO" >&2
+  exit 1
+fi
+
+if [ ! -e "$ASOUND_SO" ]; then
+  echo "[FAIL] libasound.so not found at $ASOUND_SO" >&2
   exit 1
 fi
 
 AVCODEC_VER=$(PKG_CONFIG_PATH="$PKG_DIR" pkg-config --modversion libavcodec 2>/dev/null || true)
 AVFORMAT_VER=$(PKG_CONFIG_PATH="$PKG_DIR" pkg-config --modversion libavformat 2>/dev/null || true)
 AVUTIL_VER=$(PKG_CONFIG_PATH="$PKG_DIR" pkg-config --modversion libavutil 2>/dev/null || true)
+ALSA_VER=$(PKG_CONFIG_PATH="$PKG_DIR" pkg-config --modversion alsa 2>/dev/null || true)
 
 echo "  [VERIFIED] libavcodec version:  $AVCODEC_VER"
 echo "  [VERIFIED] libavformat version: $AVFORMAT_VER"
 echo "  [VERIFIED] libavutil version:   $AVUTIL_VER"
+echo "  [VERIFIED] alsa version:        $ALSA_VER"
 echo "  [VERIFIED] libclang library:    $LIBCLANG_SO"
+echo "  [VERIFIED] libasound library:   $ASOUND_SO"
 echo "  [VERIFIED] GCC C include path:  $GCC_INC"
 
 echo ""
