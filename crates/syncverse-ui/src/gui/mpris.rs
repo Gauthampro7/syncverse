@@ -214,6 +214,11 @@ mod linux_mpris {
 pub struct MprisManager {
     state: Arc<Mutex<MprisPlaybackState>>,
     _handle: Option<std::thread::JoinHandle<()>>,
+    last_title: String,
+    last_playing: Option<bool>,
+    last_pos_sec: u64,
+    last_dur_ms: u64,
+    last_vol_milli: u32,
 }
 
 impl MprisManager {
@@ -251,6 +256,11 @@ impl MprisManager {
             Self {
                 state,
                 _handle: handle,
+                last_title: String::new(),
+                last_playing: None,
+                last_pos_sec: 0,
+                last_dur_ms: 0,
+                last_vol_milli: 0,
             }
         }
 
@@ -260,28 +270,63 @@ impl MprisManager {
             Self {
                 state,
                 _handle: None,
+                last_title: String::new(),
+                last_playing: None,
+                last_pos_sec: 0,
+                last_dur_ms: 0,
+                last_vol_milli: 0,
             }
         }
     }
 
     /// Updates current media and playback telemetry exposed on D-Bus.
+    ///
+    /// Caches the last published quantized state (`position_ms / 1000`, `volume` in milli-units)
+    /// so redundant per-frame UI updates return immediately without locking the shared mutex
+    /// or allocating strings.
     pub fn update(
-        &self,
+        &mut self,
         title: &str,
         is_playing: bool,
         position_ms: u64,
         duration_ms: u64,
         volume: f32,
     ) {
+        let pos_sec = position_ms / 1000;
+        let vol_milli = (volume.clamp(0.0, 2.0) * 1000.0).round() as u32;
+
+        if self.last_playing == Some(is_playing)
+            && self.last_title == title
+            && self.last_pos_sec == pos_sec
+            && self.last_dur_ms == duration_ms
+            && self.last_vol_milli == vol_milli
+        {
+            return;
+        }
+
+        self.last_title.clear();
+        self.last_title.push_str(title);
+        self.last_playing = Some(is_playing);
+        self.last_pos_sec = pos_sec;
+        self.last_dur_ms = duration_ms;
+        self.last_vol_milli = vol_milli;
+
         if let Ok(mut st) = self.state.lock() {
-            st.title = title.to_string();
-            st.status = if is_playing {
-                "Playing".to_string()
+            if st.title != title {
+                st.title.clear();
+                st.title.push_str(title);
+            }
+            let target_status = if is_playing {
+                "Playing"
             } else if position_ms > 0 {
-                "Paused".to_string()
+                "Paused"
             } else {
-                "Stopped".to_string()
+                "Stopped"
             };
+            if st.status != target_status {
+                st.status.clear();
+                st.status.push_str(target_status);
+            }
             st.position_us = (position_ms as i64) * 1000;
             st.duration_us = (duration_ms as i64) * 1000;
             st.volume = volume as f64;

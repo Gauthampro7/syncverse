@@ -1,6 +1,7 @@
 //! Main desktop graphical player application and eframe lifecycle coordinator.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncverse_codecs::VideoFrameRGBA;
 
 use crate::command::PlayerCommand;
-use crate::event::UiEvent;
+use crate::event::{SubtitleBitmapCue, TrackSubtitleEvent, UiEvent};
 use crate::gui::controls::{ControlsBarAction, ControlsBarState, PlaybackControlsBar};
 use crate::gui::dialogs::{AboutDialog, ConnectPartyDialog, HostPartyDialog, ShortcutsDialog};
 use crate::gui::drag_drop::{DragDropHandler, DroppedFileAction};
@@ -20,7 +21,7 @@ use crate::gui::file_dialog::FileDialogManager;
 use crate::gui::recent_files::RecentFilesManager;
 use crate::gui::sidebar::SidebarState;
 use crate::gui::subtitle_overlay::{
-    compute_effective_pts, find_active_cues, SubtitleCue, SubtitleOverlay, SubtitleTrack,
+    find_active_cues, SubtitleBitmapView, SubtitleCue, SubtitleOverlay, SubtitleTrack,
 };
 use crate::gui::viewport::VideoViewport;
 use crate::osd::OsdOverlay;
@@ -103,8 +104,12 @@ pub struct SyncverseApp {
     subtitle_overlay: SubtitleOverlay,
     active_subtitle_cues: Vec<SubtitleCue>,
     subtitle_track_data: Vec<SubtitleTrack>,
+    bitmap_subtitle_cues: BTreeMap<usize, Vec<(u64, SubtitleBitmapCue)>>,
+    bitmap_cue_seq: u64,
     bg_subtitle_tx: Sender<(PathBuf, Result<SubtitleTrack, String>)>,
     bg_subtitle_rx: Receiver<(PathBuf, Result<SubtitleTrack, String>)>,
+    bg_folder_scan_tx: Sender<(PathBuf, Vec<PathBuf>)>,
+    bg_folder_scan_rx: Receiver<(PathBuf, Vec<PathBuf>)>,
     cached_subtitle: RefCell<Option<CachedSubtitleLookup>>,
     aspect_ratio_index: usize,
     current_window_title: String,
@@ -136,6 +141,7 @@ impl Default for SyncverseApp {
         let (local_event_tx, local_event_rx) = channel::<UiEvent>();
         let (bg_subtitle_tx, bg_subtitle_rx) =
             channel::<(PathBuf, Result<SubtitleTrack, String>)>();
+        let (bg_folder_scan_tx, bg_folder_scan_rx) = channel::<(PathBuf, Vec<PathBuf>)>();
 
         let mut app = Self {
             viewport: VideoViewport::new(),
@@ -170,8 +176,12 @@ impl Default for SyncverseApp {
             subtitle_overlay: SubtitleOverlay::new(),
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
+            bitmap_subtitle_cues: BTreeMap::new(),
+            bitmap_cue_seq: 0,
             bg_subtitle_tx,
             bg_subtitle_rx,
+            bg_folder_scan_tx,
+            bg_folder_scan_rx,
             cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
@@ -236,6 +246,7 @@ impl SyncverseApp {
         let (local_event_tx, local_event_rx) = channel::<UiEvent>();
         let (bg_subtitle_tx, bg_subtitle_rx) =
             channel::<(PathBuf, Result<SubtitleTrack, String>)>();
+        let (bg_folder_scan_tx, bg_folder_scan_rx) = channel::<(PathBuf, Vec<PathBuf>)>();
 
         // Trigger asynchronous background update check on startup
         crate::gui::updater::spawn_update_check(
@@ -277,8 +288,12 @@ impl SyncverseApp {
             subtitle_overlay: SubtitleOverlay::new(),
             active_subtitle_cues: Vec::new(),
             subtitle_track_data: Vec::new(),
+            bitmap_subtitle_cues: BTreeMap::new(),
+            bitmap_cue_seq: 0,
             bg_subtitle_tx,
             bg_subtitle_rx,
+            bg_folder_scan_tx,
+            bg_folder_scan_rx,
             cached_subtitle: RefCell::new(None),
             aspect_ratio_index: 0,
             current_window_title: "Syncverse — Desktop Media Player".to_string(),
@@ -304,6 +319,82 @@ impl SyncverseApp {
             app.load_file(path);
         }
 
+        app
+    }
+
+    /// Constructs a `SyncverseApp` with explicit subsystems for headless integration testing
+    /// without requiring an `eframe::CreationContext` or spawning network update checks.
+    pub fn with_headless_subsystems(
+        exchange: Arc<TripleBufferSnapshotExchange>,
+        video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
+        clock: Arc<MasterClock>,
+        command_tx: Sender<PlayerCommand>,
+        event_rx: Receiver<UiEvent>,
+    ) -> Self {
+        let (local_event_tx, local_event_rx) = channel::<UiEvent>();
+        let (bg_subtitle_tx, bg_subtitle_rx) =
+            channel::<(PathBuf, Result<SubtitleTrack, String>)>();
+        let (bg_folder_scan_tx, bg_folder_scan_rx) = channel::<(PathBuf, Vec<PathBuf>)>();
+
+        let mut app = Self {
+            viewport: VideoViewport::new(),
+            controls_state: ControlsBarState::default(),
+            sidebar_state: SidebarState::default(),
+            file_dialog: FileDialogManager::new(),
+            recent_files: RecentFilesManager::load(),
+            host_dialog: HostPartyDialog::default(),
+            connect_dialog: ConnectPartyDialog::default(),
+            shortcuts_dialog: ShortcutsDialog::default(),
+            about_dialog: AboutDialog::default(),
+            exchange,
+            video_ring,
+            clock,
+            command_tx: command_tx.clone(),
+            event_rx,
+            local_event_tx,
+            local_event_rx,
+            chat_records: Vec::new(),
+            current_file: None,
+            update_info: None,
+            is_update_banner_dismissed: false,
+            update_status_toast: None,
+            unpause_blocked_banner: None,
+            osd_overlay: OsdOverlay::new(),
+            audio_delay_ms: 0,
+            subtitle_delay_ms: 0,
+            audio_track_index: 0,
+            audio_tracks: Vec::new(),
+            subtitle_track_index: None,
+            subtitle_tracks: Vec::new(),
+            subtitle_overlay: SubtitleOverlay::new(),
+            active_subtitle_cues: Vec::new(),
+            subtitle_track_data: Vec::new(),
+            bitmap_subtitle_cues: BTreeMap::new(),
+            bitmap_cue_seq: 0,
+            bg_subtitle_tx,
+            bg_subtitle_rx,
+            bg_folder_scan_tx,
+            bg_folder_scan_rx,
+            cached_subtitle: RefCell::new(None),
+            aspect_ratio_index: 0,
+            current_window_title: "Syncverse — Desktop Media Player".to_string(),
+            reaction_system: crate::gui::reactions::ReactionSystem::new(),
+            idle_inhibitor: crate::gui::inhibit::IdleInhibitor::new(),
+            mpris_manager: crate::gui::mpris::MprisManager::start(command_tx),
+            loop_enabled: false,
+            cached_clipboard: None,
+            last_sent_window_title: None,
+            was_minimized: bool::default(),
+            ab_repeat: crate::gui::ab_loop::AbRepeatState::default(),
+            playlist_manager: crate::gui::playlist::PlaylistManager::new(),
+            playlist_dialog: crate::gui::playlist::PlaylistDialog::new(),
+            media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
+            effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
+            jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
+        };
+        app.controls_state
+            .subtitle_dialog
+            .set_overlay_config(app.subtitle_overlay.config().clone());
         app
     }
 
@@ -340,6 +431,66 @@ impl SyncverseApp {
     /// Returns a mutable reference to the controls bar state.
     pub fn controls_state_mut(&mut self) -> &mut ControlsBarState {
         &mut self.controls_state
+    }
+
+    /// Returns a reference to the watch-party sidebar state.
+    pub fn sidebar_state(&self) -> &SidebarState {
+        &self.sidebar_state
+    }
+
+    /// Returns a mutable reference to the watch-party sidebar state.
+    pub fn sidebar_state_mut(&mut self) -> &mut SidebarState {
+        &mut self.sidebar_state
+    }
+
+    /// Returns a reference to the video viewport.
+    pub fn viewport(&self) -> &VideoViewport {
+        &self.viewport
+    }
+
+    /// Returns a mutable reference to the video viewport.
+    pub fn viewport_mut(&mut self) -> &mut VideoViewport {
+        &mut self.viewport
+    }
+
+    /// Returns a reference to the effects and filters dialog.
+    pub fn effects_dialog(&self) -> &crate::gui::effects_dialog::EffectsDialog {
+        &self.effects_dialog
+    }
+
+    /// Returns a mutable reference to the effects and filters dialog.
+    pub fn effects_dialog_mut(&mut self) -> &mut crate::gui::effects_dialog::EffectsDialog {
+        &mut self.effects_dialog
+    }
+
+    /// Returns a reference to the jump-to-time dialog.
+    pub fn jump_time_dialog(&self) -> &crate::gui::jump_time::JumpToTimeDialog {
+        &self.jump_time_dialog
+    }
+
+    /// Returns a mutable reference to the jump-to-time dialog.
+    pub fn jump_time_dialog_mut(&mut self) -> &mut crate::gui::jump_time::JumpToTimeDialog {
+        &mut self.jump_time_dialog
+    }
+
+    /// Returns the active unpause blocked banner if displayed.
+    pub fn unpause_blocked_banner(&self) -> Option<&UnpauseBlockedBanner> {
+        self.unpause_blocked_banner.as_ref()
+    }
+
+    /// Sets the currently displayed media file path without triggering background demuxer commands.
+    pub fn set_current_file(&mut self, path: Option<PathBuf>) {
+        self.current_file = path;
+    }
+
+    /// Resolves the container audio stream ID for a 0-based menu index.
+    fn resolve_audio_stream_id(&self, menu_idx: usize) -> u64 {
+        self.controls_state
+            .audio_dialog
+            .tracks
+            .get(menu_idx)
+            .map(|t| t.id)
+            .unwrap_or(menu_idx as u64)
     }
 
     /// Returns the current presentation audio delay in milliseconds.
@@ -468,17 +619,34 @@ impl SyncverseApp {
         }
     }
 
+    /// Truncates any active text cues covering `at_ms` so they end cleanly at `at_ms`.
+    fn truncate_active_text_cues(cues: &mut [SubtitleCue], at_ms: i64) {
+        let upper = cues.partition_point(|c| c.start_ms < at_ms);
+        for cue in &mut cues[..upper] {
+            if cue.end_ms > at_ms {
+                cue.end_ms = at_ms;
+            }
+        }
+    }
+
+    /// Inserts a text cue in chronological `start_ms` order, skipping exact duplicates from seeks.
+    fn insert_dedup_text_cue(cues: &mut Vec<SubtitleCue>, cue: SubtitleCue) {
+        let start = cues.partition_point(|c| c.start_ms < cue.start_ms);
+        let end = cues.partition_point(|c| c.start_ms <= cue.start_ms);
+        if cues[start..end]
+            .iter()
+            .any(|c| c.start_ms == cue.start_ms && c.end_ms == cue.end_ms && c.text == cue.text)
+        {
+            return;
+        }
+        cues.insert(end, cue);
+    }
+
     /// Selects the active subtitle track by index (`None` for Off/Disabled).
     pub fn select_subtitle_track(&mut self, track_idx: Option<usize>) {
         self.subtitle_track_index = track_idx;
         self.controls_state.subtitle_dialog.select_track(track_idx);
-        if let Some(idx) = track_idx {
-            if idx < self.subtitle_track_data.len() {
-                self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-            }
-        } else {
-            self.active_subtitle_cues.clear();
-        }
+        self.active_subtitle_cues.clear();
         self.invalidate_subtitle_cache();
         let _ = self.command_tx.send(PlayerCommand::SelectSubtitleTrack(track_idx));
     }
@@ -535,33 +703,24 @@ impl SyncverseApp {
         self.invalidate_subtitle_cache();
     }
 
-    /// Evaluates the currently active subtitle text based on current playback PTS and subtitle delay.
+    /// Evaluates the currently active subtitle text based on current playback PTS in milliseconds
+    /// and subtitle delay.
     ///
-    /// Supports both nanosecond timestamps (as emitted in `PlayerUiSnapshot`) and millisecond
-    /// timestamps (for direct presentation queries and test harnesses). Uses an internal cache
-    /// to eliminate redundant $O(\log N)$ cue searching and heap allocations across frames.
-    pub fn current_active_subtitle(&self, media_position_pts: u64) -> Option<String> {
+    /// Uses an internal interval cache to eliminate redundant $O(\log N)$ cue searching and heap
+    /// allocations across frames.
+    pub fn current_active_subtitle(&self, pts_ms: u64) -> Option<String> {
         let track_idx = self.subtitle_track_index?;
-
-        let effective_pts_ms = compute_effective_pts(media_position_pts, self.subtitle_delay_ms);
-        let direct_ms = media_position_pts as i64 + self.subtitle_delay_ms;
-
-        let query_ms = if media_position_pts < 1_000_000 {
-            direct_ms
-        } else {
-            effective_pts_ms
-        };
+        let query_ms = (pts_ms as i64).saturating_add(self.subtitle_delay_ms);
 
         // 1. Fast-path: Check cached subtitle interval
         if let Ok(cache_ref) = self.cached_subtitle.try_borrow() {
             if let Some(ref cache) = *cache_ref {
-                if cache.track_index == track_idx && cache.subtitle_delay_ms == self.subtitle_delay_ms {
-                    if query_ms >= cache.valid_start_ms && query_ms <= cache.valid_end_ms {
-                        return cache.text.clone();
-                    }
-                    if direct_ms >= cache.valid_start_ms && direct_ms <= cache.valid_end_ms {
-                        return cache.text.clone();
-                    }
+                if cache.track_index == track_idx
+                    && cache.subtitle_delay_ms == self.subtitle_delay_ms
+                    && query_ms >= cache.valid_start_ms
+                    && query_ms <= cache.valid_end_ms
+                {
+                    return cache.text.clone();
                 }
             }
         }
@@ -573,19 +732,7 @@ impl SyncverseApp {
             &self.active_subtitle_cues
         };
 
-        let (active_cues, target_query_ms) = {
-            let direct_matches = find_active_cues(cues, query_ms);
-            if direct_matches.is_empty() && query_ms != direct_ms {
-                let alt_matches = find_active_cues(cues, direct_ms);
-                if !alt_matches.is_empty() {
-                    (alt_matches, direct_ms)
-                } else {
-                    (direct_matches, query_ms)
-                }
-            } else {
-                (direct_matches, query_ms)
-            }
-        };
+        let active_cues = find_active_cues(cues, query_ms);
 
         let result_text = if active_cues.is_empty() {
             None
@@ -603,15 +750,15 @@ impl SyncverseApp {
         let (valid_start, valid_end) = if !active_cues.is_empty() {
             let earliest_end = active_cues.iter().map(|c| c.end_ms).min().unwrap_or(i64::MAX);
             let latest_start = active_cues.iter().map(|c| c.start_ms).max().unwrap_or(i64::MIN);
-            let upper = cues.partition_point(|c| c.start_ms <= target_query_ms);
+            let upper = cues.partition_point(|c| c.start_ms <= query_ms);
             let next_start = if upper < cues.len() {
                 cues[upper].start_ms
             } else {
                 i64::MAX
             };
-            (latest_start.max(0), earliest_end.min(next_start.saturating_sub(1)))
+            (latest_start, earliest_end.min(next_start.saturating_sub(1)))
         } else {
-            let upper = cues.partition_point(|cue| cue.start_ms <= target_query_ms);
+            let upper = cues.partition_point(|cue| cue.start_ms <= query_ms);
             let next_start = if upper < cues.len() {
                 cues[upper].start_ms
             } else {
@@ -623,11 +770,12 @@ impl SyncverseApp {
                     .iter()
                     .map(|c| c.end_ms)
                     .max()
-                    .unwrap_or(0)
+                    .unwrap_or(i64::MIN)
+                    .saturating_add(1)
             } else {
-                0
+                i64::MIN
             };
-            (prev_end.max(0), next_start.saturating_sub(1))
+            (prev_end, next_start.saturating_sub(1))
         };
 
         if let Ok(mut cache_mut) = self.cached_subtitle.try_borrow_mut() {
@@ -643,7 +791,95 @@ impl SyncverseApp {
         result_text
     }
 
-    /// Loads and opens a media file.
+    /// Applies a track-scoped subtitle event (text cue, bitmap cue, clear sentinel, or auto-select).
+    pub fn apply_track_subtitle_event(&mut self, event: TrackSubtitleEvent, now: Instant) {
+        let _ = now;
+        match event {
+            TrackSubtitleEvent::TextCue { track_index, cue } => {
+                if cue.text.trim().is_empty() {
+                    if let Some(track) = self.subtitle_track_data.get_mut(track_index) {
+                        Self::truncate_active_text_cues(&mut track.cues, cue.start_ms);
+                    }
+                } else if let Some(track) = self.subtitle_track_data.get_mut(track_index) {
+                    Self::insert_dedup_text_cue(&mut track.cues, cue);
+                }
+                if self.subtitle_track_index == Some(track_index) {
+                    self.invalidate_subtitle_cache();
+                }
+            }
+            TrackSubtitleEvent::BitmapCue { track_index, cue } => {
+                let bmps = self.bitmap_subtitle_cues.entry(track_index).or_default();
+                let start = bmps.partition_point(|(_, c)| c.start_ms < cue.start_ms);
+                let end = bmps.partition_point(|(_, c)| c.start_ms <= cue.start_ms);
+                if bmps[start..end].iter().any(|(_, c)| {
+                    c.start_ms == cue.start_ms
+                        && c.end_ms == cue.end_ms
+                        && c.x == cue.x
+                        && c.y == cue.y
+                        && c.width == cue.width
+                        && c.height == cue.height
+                }) {
+                    return;
+                }
+                for (_, prior) in &mut bmps[..end] {
+                    if prior.start_ms < cue.start_ms && prior.end_ms > cue.start_ms {
+                        prior.end_ms = cue.start_ms;
+                    }
+                }
+                self.bitmap_cue_seq = self.bitmap_cue_seq.wrapping_add(1);
+                let seq = self.bitmap_cue_seq;
+                bmps.insert(end, (seq, cue));
+            }
+            TrackSubtitleEvent::ClearActive { track_index, at_ms } => {
+                if let Some(track) = self.subtitle_track_data.get_mut(track_index) {
+                    Self::truncate_active_text_cues(&mut track.cues, at_ms as i64);
+                }
+                if let Some(bmps) = self.bitmap_subtitle_cues.get_mut(&track_index) {
+                    let upper = bmps.partition_point(|(_, c)| c.start_ms < at_ms);
+                    for (_, bmp) in &mut bmps[..upper] {
+                        if bmp.end_ms > at_ms {
+                            bmp.end_ms = at_ms;
+                        }
+                    }
+                }
+                if self.subtitle_track_index == Some(track_index) {
+                    self.invalidate_subtitle_cache();
+                }
+            }
+            TrackSubtitleEvent::AutoSelectTrack { track_index } => {
+                self.subtitle_track_index = track_index;
+                self.controls_state.subtitle_dialog.select_track(track_index);
+                self.active_subtitle_cues.clear();
+                self.invalidate_subtitle_cache();
+            }
+        }
+    }
+
+    /// Returns the currently active RGBA bitmap subtitle cue and monotonic cache key at `pts_ms`.
+    pub fn current_active_bitmap_subtitle(
+        &self,
+        pts_ms: u64,
+    ) -> Option<(u64, &SubtitleBitmapCue)> {
+        let track_idx = self.subtitle_track_index?;
+        let bmps = self.bitmap_subtitle_cues.get(&track_idx)?;
+        let query_ms = (pts_ms as i64).saturating_add(self.subtitle_delay_ms);
+        if query_ms < 0 || bmps.is_empty() {
+            return None;
+        }
+        let query_u64 = query_ms as u64;
+        let upper = bmps.partition_point(|(_, c)| c.start_ms <= query_u64);
+        for (seq, bmp) in bmps[..upper].iter().rev() {
+            if bmp.start_ms <= query_u64 && query_u64 <= bmp.end_ms {
+                return Some((*seq, bmp));
+            }
+            if query_u64.saturating_sub(bmp.start_ms) > 60_000 && bmp.end_ms < query_u64 {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Loads and opens a media file without blocking the UI thread on directory or subtitle scans.
     pub fn load_file(&mut self, path: PathBuf) {
         self.viewport.reset();
         self.recent_files.add_file(&path);
@@ -656,6 +892,9 @@ impl SyncverseApp {
         self.subtitle_tracks.clear();
         self.subtitle_track_data.clear();
         self.active_subtitle_cues.clear();
+        self.bitmap_subtitle_cues.clear();
+        self.controls_state.subtitle_dialog.tracks.clear();
+        self.invalidate_subtitle_cache();
         self.subtitle_delay_ms = 0;
         self.audio_track_index = 0;
         self.audio_tracks.clear();
@@ -666,46 +905,36 @@ impl SyncverseApp {
         self.ab_repeat.clear();
         self.controls_state.ab_repeat.clear();
         if !self.playlist_manager.set_current_file(&path) {
-            self.playlist_manager.scan_folder_of_file(&path);
+            let scan_tx = self.bg_folder_scan_tx.clone();
+            let scan_path = path;
+            let _ = std::thread::Builder::new()
+                .name("syncverse-folder-scan".to_string())
+                .spawn(move || {
+                    let Some(parent) = scan_path.parent() else {
+                        return;
+                    };
+                    let mut discovered = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() {
+                                let ext = p
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                if crate::gui::playlist::SUPPORTED_PLAYLIST_EXTENSIONS
+                                    .contains(&ext.as_str())
+                                {
+                                    discovered.push(p);
+                                }
+                            }
+                        }
+                    }
+                    discovered.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                    let _ = scan_tx.send((scan_path, discovered));
+                });
         }
-
-        let external = syncverse_demux::subtitles::scan_external_subtitles(&path);
-        for ext_track in external {
-            let label = ext_track.display_label();
-            let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = ext_track
-                .cues
-                .into_iter()
-                .map(|c| crate::gui::subtitle_overlay::SubtitleCue {
-                    start_ms: c.start.as_millis() as i64,
-                    end_ms: c.end.as_millis() as i64,
-                    text: c.text,
-                })
-                .collect();
-            let track = crate::gui::subtitle_overlay::SubtitleTrack::with_format_and_origin(
-                ext_track.id,
-                label.clone(),
-                ext_track.language,
-                ui_cues,
-                ext_track.format.to_uppercase(),
-                true,
-            );
-            self.subtitle_tracks.push(label);
-            self.subtitle_track_data.push(track);
-        }
-        let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
-            .subtitle_track_data
-            .iter()
-            .enumerate()
-            .map(|(i, t)| crate::gui::dialogs::SubtitleTrackItem {
-                id: i,
-                title: t.title.clone(),
-                language: t.language.clone(),
-                format: t.format.clone(),
-                is_external: t.is_external,
-                file_path: None,
-            })
-            .collect();
-        self.controls_state.subtitle_dialog.set_tracks(dialog_items);
     }
 
     /// Jumps to the previous media file in the active folder or playlist queue.
@@ -737,9 +966,9 @@ impl SyncverseApp {
         self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
     }
 
-    /// Loads an external subtitle file (.srt, .vtt, .ass) asynchronously in a background thread,
-    /// parses its cues without blocking the UI thread, registers it as active, and dispatches
-    /// `PlayerCommand::LoadExternalSubtitle` to the core playback runtime.
+    /// Loads an external subtitle file (.srt, .vtt, .ass, .ssa, .sub) asynchronously in a background
+    /// thread, parses its cues without blocking the UI thread, registers it as active, and
+    /// dispatches `PlayerCommand::LoadExternalSubtitle` to the core playback runtime.
     pub fn load_external_subtitle_file(&mut self, path: PathBuf, now: Instant) {
         let ext = path
             .extension()
@@ -754,6 +983,13 @@ impl SyncverseApp {
             .to_string();
 
         let track_id = self.subtitle_track_data.len();
+        let fps = self
+            .controls_state
+            .video_dialog
+            .metadata
+            .frame_rate
+            .filter(|&r| r > 1.0)
+            .unwrap_or(23.976);
         let path_clone = path.clone();
         let tx = self.bg_subtitle_tx.clone();
 
@@ -761,12 +997,14 @@ impl SyncverseApp {
             .name("syncverse-sub-loader".to_string())
             .spawn(move || {
                 let res = (|| -> Result<SubtitleTrack, String> {
-                    let raw_content = syncverse_demux::subtitles::read_subtitle_to_string(&path_clone)
+                    let raw_content = syncverse_demux::subtitles::read_subtitle_text_lossy(&path_clone)
                         .map_err(|e| e.to_string())?;
                     let parsed_cues = match ext.as_str() {
                         "srt" => syncverse_demux::subtitles::parse_srt(&raw_content).map_err(|e| e.to_string())?,
                         "vtt" => syncverse_demux::subtitles::parse_vtt(&raw_content).map_err(|e| e.to_string())?,
                         "ass" | "ssa" => syncverse_demux::subtitles::parse_ass(&raw_content).map_err(|e| e.to_string())?,
+                        "sub" => syncverse_demux::subtitles::parse_microdvd(&raw_content, Some(fps))
+                            .map_err(|e| e.to_string())?,
                         other => return Err(format!("Unsupported subtitle format: .{other}")),
                     };
                     let ui_cues: Vec<crate::gui::subtitle_overlay::SubtitleCue> = parsed_cues
@@ -801,17 +1039,27 @@ impl SyncverseApp {
     }
 }
 
-impl eframe::App for SyncverseApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx: Context = ui.ctx().clone();
-        let now = Instant::now();
+impl SyncverseApp {
+    /// Renders one complete application frame into the provided `egui::Ui`.
+    ///
+    /// Exposed publicly so headless layout and interaction tests can drive `SyncverseApp`
+    /// via `egui::Context::run_ui` without requiring a windowing `eframe::Frame`.
+    pub fn render_ui(&mut self, ui: &mut egui::Ui) {
+        self.render_ui_at(ui, Instant::now());
+    }
 
-        // Scan raw events for any Event::Paste to keep cached clipboard text fresh
-        for ev in &ctx.input(|i| i.raw.events.clone()) {
-            if let egui::Event::Paste(ref text) = ev {
-                self.cached_clipboard = Some(text.clone());
+    /// Renders one complete application frame at an explicit monotonic timestamp `now`.
+    pub fn render_ui_at(&mut self, ui: &mut egui::Ui, now: Instant) {
+        let ctx: Context = ui.ctx().clone();
+
+        // Scan raw events for any Event::Paste to keep cached clipboard text fresh without cloning Vec<Event>
+        ctx.input(|i| {
+            for ev in &i.raw.events {
+                if let egui::Event::Paste(text) = ev {
+                    self.cached_clipboard = Some(text.clone());
+                }
             }
-        }
+        });
 
         // 0. Drain events from playback runtime and local UI workers
         let mut events = Vec::new();
@@ -879,7 +1127,14 @@ impl eframe::App for SyncverseApp {
                 }
                 UiEvent::AudioTrackSelected { track_id, name } => {
                     self.controls_state.audio_dialog.select_track(track_id);
-                    if let Some(pos) = self.audio_tracks.iter().position(|t| t == &name) {
+                    if let Some(pos) = self
+                        .controls_state
+                        .audio_dialog
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == track_id)
+                        .or_else(|| self.audio_tracks.iter().position(|t| t == &name))
+                    {
                         self.audio_track_index = pos;
                     }
                     ctx.request_repaint();
@@ -888,13 +1143,7 @@ impl eframe::App for SyncverseApp {
                 UiEvent::SubtitleTrackSelected { track_index, name } => {
                     self.subtitle_track_index = track_index;
                     self.controls_state.subtitle_dialog.select_track(track_index);
-                    if let Some(idx) = track_index {
-                        if idx < self.subtitle_track_data.len() {
-                            self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-                        }
-                    } else {
-                        self.active_subtitle_cues.clear();
-                    }
+                    self.active_subtitle_cues.clear();
                     self.invalidate_subtitle_cache();
                     ctx.request_repaint();
                     let msg = if name == "Off" || track_index.is_none() {
@@ -947,8 +1196,26 @@ impl eframe::App for SyncverseApp {
                     self.controls_state.video_dialog.set_metadata(meta);
                 }
                 UiEvent::SubtitleDataDiscovered(tracks) => {
-                    self.subtitle_track_data = tracks;
-                    self.subtitle_tracks = self.subtitle_track_data.iter().map(|t| t.title.clone()).collect();
+                    let mut merged = tracks;
+                    for existing in self.subtitle_track_data.drain(..) {
+                        if existing.is_external
+                            && !merged.iter().any(|t| t.title == existing.title)
+                        {
+                            merged.push(existing);
+                        }
+                    }
+                    self.subtitle_track_data = merged;
+                    self.subtitle_tracks = self
+                        .subtitle_track_data
+                        .iter()
+                        .map(|t| t.title.clone())
+                        .collect();
+                    if let Some(i) = self.subtitle_track_index {
+                        if i >= self.subtitle_track_data.len() {
+                            self.subtitle_track_index = None;
+                            self.controls_state.subtitle_dialog.select_track(None);
+                        }
+                    }
                     let dialog_items: Vec<crate::gui::dialogs::SubtitleTrackItem> = self
                         .subtitle_track_data
                         .iter()
@@ -967,15 +1234,29 @@ impl eframe::App for SyncverseApp {
                     ctx.request_repaint();
                 }
                 UiEvent::SubtitleCueDemuxed(cue) => {
-                    if let Some(idx) = self.subtitle_track_index {
-                        if idx < self.subtitle_track_data.len() {
-                            self.subtitle_track_data[idx].add_cue(cue.clone());
+                    if cue.text.trim().is_empty() {
+                        // ClearActive sentinel emitted for mov_text empty/clear packets
+                        if let Some(idx) = self.subtitle_track_index {
+                            if idx < self.subtitle_track_data.len() {
+                                Self::truncate_active_text_cues(
+                                    &mut self.subtitle_track_data[idx].cues,
+                                    cue.start_ms,
+                                );
+                            }
                         }
+                        Self::truncate_active_text_cues(&mut self.active_subtitle_cues, cue.start_ms);
+                    } else if let Some(idx) = self.subtitle_track_index {
+                        if idx < self.subtitle_track_data.len() {
+                            Self::insert_dedup_text_cue(
+                                &mut self.subtitle_track_data[idx].cues,
+                                cue,
+                            );
+                        } else {
+                            Self::insert_dedup_text_cue(&mut self.active_subtitle_cues, cue);
+                        }
+                    } else {
+                        Self::insert_dedup_text_cue(&mut self.active_subtitle_cues, cue);
                     }
-                    let insert_idx = self
-                        .active_subtitle_cues
-                        .partition_point(|c| c.start_ms <= cue.start_ms);
-                    self.active_subtitle_cues.insert(insert_idx, cue);
                     self.invalidate_subtitle_cache();
                     ctx.request_repaint();
                 }
@@ -1031,7 +1312,7 @@ impl eframe::App for SyncverseApp {
                     let filename = track.title.clone();
                     let ext = track.format.clone();
                     self.subtitle_tracks.push(filename.clone());
-                    self.active_subtitle_cues = track.cues.clone();
+                    self.active_subtitle_cues.clear();
                     self.subtitle_track_data.push(track);
                     self.subtitle_track_index = Some(new_track_id);
                     self.invalidate_subtitle_cache();
@@ -1062,6 +1343,24 @@ impl eframe::App for SyncverseApp {
                     );
                     ctx.request_repaint();
                 }
+            }
+        }
+
+        // Drain background folder playlist scanner results
+        while let Ok((scanned_file, discovered)) = self.bg_folder_scan_rx.try_recv() {
+            if self.current_file.as_ref() == Some(&scanned_file) {
+                self.playlist_manager.clear();
+                let last = discovered.len().saturating_sub(1);
+                for (idx, p) in discovered.into_iter().enumerate() {
+                    if idx == last {
+                        self.playlist_manager.add_file(p);
+                    } else {
+                        self.playlist_manager
+                            .items
+                            .push(crate::gui::playlist::PlaylistItem::new(p));
+                    }
+                }
+                self.playlist_manager.set_current_file(&scanned_file);
             }
         }
 
@@ -1108,13 +1407,6 @@ impl eframe::App for SyncverseApp {
             }
         }
 
-        // Cache raw clipboard paste events
-        for ev in ctx.input(|i| i.raw.events.clone()) {
-            if let egui::Event::Paste(ref text) = ev {
-                self.cached_clipboard = Some(text.clone());
-            }
-        }
-
         // 3. User activity tracking for fullscreen auto-hide & cursor visibility
         let any_modal = self.is_any_modal_open();
         let is_dragging = self.controls_state.drag_pts_ms.is_some()
@@ -1156,7 +1448,11 @@ impl eframe::App for SyncverseApp {
 
         // Escape hierarchy: closes top-most open modal/dialog first, then exits fullscreen
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.playlist_dialog.is_open {
+            if self.effects_dialog.is_open {
+                self.effects_dialog.close();
+            } else if self.jump_time_dialog.is_open {
+                self.jump_time_dialog.close();
+            } else if self.playlist_dialog.is_open {
                 self.playlist_dialog.close();
             } else if self.media_info_dialog.is_open {
                 self.media_info_dialog.close();
@@ -1189,7 +1485,11 @@ impl eframe::App for SyncverseApp {
         // 4. Global keyboard shortcuts (suppressed if typing in text edit or any modal dialog is open)
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus && !self.is_any_modal_open() {
-            if ctx.input(|i| i.key_pressed(egui::Key::F11) || (i.modifiers.alt && i.key_pressed(egui::Key::Enter))) {
+            if ctx.input(|i| {
+                (!i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::F))
+                    || i.key_pressed(egui::Key::F11)
+                    || (i.modifiers.alt && i.key_pressed(egui::Key::Enter))
+            }) {
                 self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
             }
@@ -1454,13 +1754,11 @@ impl eframe::App for SyncverseApp {
                     };
                     self.subtitle_track_index = next_idx;
                     self.controls_state.subtitle_dialog.select_track(next_idx);
+                    self.active_subtitle_cues.clear();
                     self.invalidate_subtitle_cache();
                     ctx.request_repaint();
                     match next_idx {
                         Some(idx) => {
-                            if idx < self.subtitle_track_data.len() {
-                                self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-                            }
                             format!(
                                 "Subtitles: [{}/{}] {}",
                                 idx + 1,
@@ -1468,10 +1766,7 @@ impl eframe::App for SyncverseApp {
                                 self.subtitle_tracks[idx]
                             )
                         }
-                        None => {
-                            self.active_subtitle_cues.clear();
-                            "Subtitles: Off".to_string()
-                        }
+                        None => "Subtitles: Off".to_string(),
                     }
                 } else {
                     self.active_subtitle_cues.clear();
@@ -1500,33 +1795,33 @@ impl eframe::App for SyncverseApp {
                 let zm = self.viewport.cycle_zoom_mode();
                 self.osd_overlay.show_notification(format!("Zoom: {}", zm.display_name()), now);
             }
-            // Audio delay adjustment (G: -50ms, F: +50ms, Shift+G: Reset 0ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::G)) {
+            // Audio delay adjustment (VLC standard: J: -50ms, K: +50ms, Shift+J: Reset 0ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::J)) {
                 self.audio_delay_ms = 0;
                 let _ = self.command_tx.send(PlayerCommand::SetAudioDelay(0));
                 self.controls_state.audio_dialog.set_delay_ms(0);
                 self.osd_overlay.show_notification("Audio Delay: 0 ms (Synchronized)".to_string(), now);
-            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::G)) {
+            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::J)) {
                 self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::F)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::K)) {
                 self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                 self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                 self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
             }
-            // Subtitle delay adjustment (H: -50ms, J: +50ms, Shift+H: Reset 0ms)
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::H)) {
+            // Subtitle delay adjustment (VLC standard: G: -50ms, H: +50ms, Shift+G: Reset 0ms)
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::G)) {
                 self.subtitle_delay_ms = 0;
                 let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(0));
                 self.controls_state.subtitle_dialog.set_delay_ms(0);
                 self.invalidate_subtitle_cache();
                 ctx.request_repaint();
                 self.osd_overlay.show_notification("Subtitle Delay: 0 ms (Synchronized)".to_string(), now);
-            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::H)) {
+            } else if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::G)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1534,7 +1829,7 @@ impl eframe::App for SyncverseApp {
                 ctx.request_repaint();
                 self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
             }
-            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::J)) {
+            if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::H)) {
                 self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                 let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                 self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -1803,12 +2098,14 @@ impl eframe::App for SyncverseApp {
 
                                 if ui.button(egui::RichText::new("📥 Download").strong().color(egui::Color32::WHITE)).clicked() {
                                     let target = update.download_url.as_deref().unwrap_or(&update.release_url);
-                                    let _ = crate::gui::updater::open_browser_url(target);
-                                    ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+                                    if crate::gui::updater::open_browser_url(target).is_err() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+                                    }
                                 }
 
-                                if ui.button("Release Page").clicked() {
-                                    let _ = crate::gui::updater::open_browser_url(&update.release_url);
+                                if ui.button("Release Page").clicked()
+                                    && crate::gui::updater::open_browser_url(&update.release_url).is_err()
+                                {
                                     ui.ctx().open_url(egui::OpenUrl::new_tab(&update.release_url));
                                 }
 
@@ -1979,7 +2276,9 @@ impl eframe::App for SyncverseApp {
                             self.subtitle_tracks.clear();
                             self.subtitle_track_data.clear();
                             self.active_subtitle_cues.clear();
+                            self.bitmap_subtitle_cues.clear();
                             self.subtitle_track_index = None;
+                            self.invalidate_subtitle_cache();
                             self.controls_state.subtitle_dialog.tracks.clear();
                             self.audio_tracks.clear();
                             self.audio_track_index = 0;
@@ -2234,41 +2533,44 @@ impl eframe::App for SyncverseApp {
                             if self.audio_tracks.is_empty() {
                                 ui.label(egui::RichText::new("Default Track").italics().color(egui::Color32::GRAY));
                             } else {
+                                let mut selected_audio_idx = None;
                                 for (idx, track_name) in self.audio_tracks.iter().enumerate() {
                                     let is_selected = self.audio_track_index == idx;
                                     let display_label = format!("Track {} - {}", idx + 1, track_name);
                                     if ui.selectable_label(is_selected, display_label).clicked() {
                                         ui.close();
-                                        self.audio_track_index = idx;
-                                        if idx < self.controls_state.audio_dialog.tracks.len() {
-                                            let id = self.controls_state.audio_dialog.tracks[idx].id;
-                                            self.controls_state.audio_dialog.select_track(id);
-                                        }
-                                        let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(idx as u64));
-                                        self.osd_overlay.show_notification(
-                                            format!("Audio: Track {}/{} - {}", idx + 1, self.audio_tracks.len(), track_name),
-                                            now,
-                                        );
+                                        selected_audio_idx = Some(idx);
                                     }
+                                }
+                                if let Some(idx) = selected_audio_idx {
+                                    self.audio_track_index = idx;
+                                    let stream_id = self.resolve_audio_stream_id(idx);
+                                    self.controls_state.audio_dialog.select_track(stream_id);
+                                    let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(stream_id));
+                                    let track_name = &self.audio_tracks[idx];
+                                    self.osd_overlay.show_notification(
+                                        format!("Audio: Track {}/{} - {}", idx + 1, self.audio_tracks.len(), track_name),
+                                        now,
+                                    );
                                 }
                             }
                         });
 
                         ui.separator();
 
-                        if ui.button("Audio Delay -50ms (G)").clicked() {
+                        if ui.button("Audio Delay -50ms (J)").clicked() {
                             self.audio_delay_ms = (self.audio_delay_ms - 50).clamp(-5000, 5000);
                             let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(-50));
                             self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                             self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
                         }
-                        if ui.button("Audio Delay +50ms (F)").clicked() {
+                        if ui.button("Audio Delay +50ms (K)").clicked() {
                             self.audio_delay_ms = (self.audio_delay_ms + 50).clamp(-5000, 5000);
                             let _ = self.command_tx.send(PlayerCommand::AdjustAudioDelay(50));
                             self.controls_state.audio_dialog.set_delay_ms(self.audio_delay_ms);
                             self.osd_overlay.show_notification(format!("Audio Delay: {:+} ms", self.audio_delay_ms), now);
                         }
-                        if ui.button("Reset Audio Delay 0ms (Shift+G)").clicked() {
+                        if ui.button("Reset Audio Delay 0ms (Shift+J)").clicked() {
                             self.audio_delay_ms = 0;
                             let _ = self.command_tx.send(PlayerCommand::SetAudioDelay(0));
                             self.controls_state.audio_dialog.set_delay_ms(0);
@@ -2356,7 +2658,7 @@ impl eframe::App for SyncverseApp {
 
                         ui.separator();
 
-                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F11)" } else { "Fullscreen (F11)" };
+                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F / F11)" } else { "Fullscreen (F / F11)" };
                         if ui.button(fs_label).clicked() {
                             ui.close();
                             self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
@@ -2383,39 +2685,41 @@ impl eframe::App for SyncverseApp {
                     // --- SUBTITLE MENU ---
                     ui.menu_button("Subtitle", |ui| {
                         ui.menu_button("Subtitle Track (V / C)", |ui| {
+                            let mut selected_sub: Option<Option<usize>> = None;
                             let is_off = self.subtitle_track_index.is_none();
                             if ui.selectable_label(is_off, "Off / None").clicked() {
                                 ui.close();
-                                self.subtitle_track_index = None;
-                                self.controls_state.subtitle_dialog.select_track(None);
-                                self.active_subtitle_cues.clear();
-                                self.invalidate_subtitle_cache();
-                                ctx.request_repaint();
-                                self.osd_overlay.show_notification("Subtitles: Off".to_string(), now);
+                                selected_sub = Some(None);
                             }
                             for (idx, track_name) in self.subtitle_tracks.iter().enumerate() {
                                 let is_selected = self.subtitle_track_index == Some(idx);
                                 let display_label = format!("Track {} - {}", idx + 1, track_name);
                                 if ui.selectable_label(is_selected, display_label).clicked() {
                                     ui.close();
-                                    self.subtitle_track_index = Some(idx);
-                                    self.controls_state.subtitle_dialog.select_track(Some(idx));
-                                    if idx < self.subtitle_track_data.len() {
-                                        self.active_subtitle_cues = self.subtitle_track_data[idx].cues.clone();
-                                    }
-                                    self.invalidate_subtitle_cache();
-                                    ctx.request_repaint();
-                                    self.osd_overlay.show_notification(
-                                        format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track_name),
-                                        now,
-                                    );
+                                    selected_sub = Some(Some(idx));
                                 }
+                            }
+                            if let Some(target_sub) = selected_sub {
+                                self.select_subtitle_track(target_sub);
+                                ctx.request_repaint();
+                                let msg = match target_sub {
+                                    Some(idx) => {
+                                        let track_name = self
+                                            .subtitle_tracks
+                                            .get(idx)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("Track");
+                                        format!("Subtitles: [{}/{}] {}", idx + 1, self.subtitle_tracks.len(), track_name)
+                                    }
+                                    None => "Subtitles: Off".to_string(),
+                                };
+                                self.osd_overlay.show_notification(msg, now);
                             }
                         });
 
                         ui.separator();
 
-                        if ui.button("Subtitle Delay -50ms (H)").clicked() {
+                        if ui.button("Subtitle Delay -50ms (G)").clicked() {
                             self.subtitle_delay_ms = (self.subtitle_delay_ms - 50).clamp(-5000, 5000);
                             let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(-50));
                             self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -2423,7 +2727,7 @@ impl eframe::App for SyncverseApp {
                             ctx.request_repaint();
                             self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
                         }
-                        if ui.button("Subtitle Delay +50ms (J)").clicked() {
+                        if ui.button("Subtitle Delay +50ms (H)").clicked() {
                             self.subtitle_delay_ms = (self.subtitle_delay_ms + 50).clamp(-5000, 5000);
                             let _ = self.command_tx.send(PlayerCommand::AdjustSubtitleDelay(50));
                             self.controls_state.subtitle_dialog.set_delay_ms(self.subtitle_delay_ms);
@@ -2431,7 +2735,7 @@ impl eframe::App for SyncverseApp {
                             ctx.request_repaint();
                             self.osd_overlay.show_notification(format!("Subtitle Delay: {:+} ms", self.subtitle_delay_ms), now);
                         }
-                        if ui.button("Reset Subtitle Delay 0ms (Shift+H)").clicked() {
+                        if ui.button("Reset Subtitle Delay 0ms (Shift+G)").clicked() {
                             self.subtitle_delay_ms = 0;
                             let _ = self.command_tx.send(PlayerCommand::SetSubtitleDelay(0));
                             self.controls_state.subtitle_dialog.set_delay_ms(0);
@@ -2466,7 +2770,7 @@ impl eframe::App for SyncverseApp {
 
                     // --- VIEW MENU ---
                     ui.menu_button("View", |ui| {
-                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F11)" } else { "Fullscreen (F11)" };
+                        let fs_label = if self.controls_state.is_fullscreen { "Exit Fullscreen (F / F11)" } else { "Fullscreen (F / F11)" };
                         if ui.button(fs_label).clicked() {
                             ui.close();
                             self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
@@ -2562,15 +2866,46 @@ impl eframe::App for SyncverseApp {
                         }
                     });
 
-                    // Top bar media filename HUD
+                    // Top bar media filename HUD (truncated safely so it never overlaps menus on narrow windows)
                     if let Some(ref path) = self.current_file {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                            ui.label(egui::RichText::new(name).small().color(egui::Color32::from_rgb(148, 163, 184)));
-                        });
+                        if ui.available_width() >= 90.0 {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let max_w = (ui.available_width() - 8.0).max(0.0);
+                                ui.set_max_width(max_w);
+                                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(name)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(148, 163, 184)),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        }
                     }
                 });
             });
+        }
+
+        // 10. Watch-Party Sidebar (Registered BEFORE Bottom Controls Bar so right panel spans
+        // full height and bottom controls bar terminates cleanly at the sidebar's left edge)
+        if !self.controls_state.is_fullscreen || self.controls_state.is_visible(now) {
+            self.sidebar_state.suppress_floating_handle =
+                self.is_any_modal_open() || (self.controls_state.is_fullscreen && !self.controls_state.is_visible(now));
+            self.sidebar_state.show(ui, &snapshot, &self.chat_records, &self.command_tx);
+            if let Some(target_ms) = self.sidebar_state.pending_seek_ms.take() {
+                self.controls_state.pending_seek_ms = Some((target_ms, now));
+                self.viewport.clear_pending();
+            }
+            if self.sidebar_state.pending_clear_chat {
+                self.sidebar_state.pending_clear_chat = false;
+                self.chat_records.clear();
+            }
+            if !self.sidebar_state.pending_local_records.is_empty() {
+                self.chat_records.append(&mut self.sidebar_state.pending_local_records);
+                self.sidebar_state.autoscroll = true;
+            }
         }
 
         // 9. Bottom Docked Playback Controls Bar
@@ -2668,24 +3003,13 @@ impl eframe::App for SyncverseApp {
             });
         }
 
-        // 10. Watch-Party Sidebar (Right panel when expanded, floating button when collapsed)
-        // Hidden only when controls are auto-hidden in fullscreen
-        if !self.controls_state.is_fullscreen || self.controls_state.is_visible(now) {
-            self.sidebar_state.show(ui, &snapshot, &self.chat_records, &self.command_tx);
-            if self.sidebar_state.pending_clear_chat {
-                self.sidebar_state.pending_clear_chat = false;
-                self.chat_records.clear();
-            }
-            if !self.sidebar_state.pending_local_records.is_empty() {
-                self.chat_records.append(&mut self.sidebar_state.pending_local_records);
-                self.sidebar_state.autoscroll = true;
-            }
-        }
-
         // 11. Central Viewport (Consumes 100% of remaining space with perfect aspect ratio)
+        let mut central_viewport_rect = ctx.content_rect();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ui, |ui| {
+                let central_rect = ui.max_rect();
+                central_viewport_rect = central_rect;
                 let current_ar = self.viewport.aspect_override();
                 let current_zm = self.viewport.zoom_mode();
                 let current_ab = self.ab_repeat;
@@ -2728,7 +3052,7 @@ impl eframe::App for SyncverseApp {
                         self.file_dialog.open_file_dialog();
                     }
 
-                    let fs_label = if self.controls_state.is_fullscreen { "⛶ Exit Fullscreen (F11 / Esc)" } else { "⛶ Fullscreen (F11 / Alt+Enter)" };
+                    let fs_label = if self.controls_state.is_fullscreen { "⛶ Exit Fullscreen (F / F11 / Esc)" } else { "⛶ Fullscreen (F / F11 / Alt+Enter)" };
                     if ui.button(fs_label).clicked() {
                         ui.close();
                         self.controls_state.is_fullscreen = !self.controls_state.is_fullscreen;
@@ -2931,11 +3255,9 @@ impl eframe::App for SyncverseApp {
                 }
                 if let Some(idx) = request_select_audio_track {
                     self.audio_track_index = idx;
-                    if idx < self.controls_state.audio_dialog.tracks.len() {
-                        let id = self.controls_state.audio_dialog.tracks[idx].id;
-                        self.controls_state.audio_dialog.select_track(id);
-                    }
-                    let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(idx as u64));
+                    let stream_id = self.resolve_audio_stream_id(idx);
+                    self.controls_state.audio_dialog.select_track(stream_id);
+                    let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(stream_id));
                     let track_name = self.audio_tracks.get(idx).cloned().unwrap_or_else(|| format!("Track {}", idx + 1));
                     self.osd_overlay.show_notification(
                         format!("Audio: Track {}/{} - {}", idx + 1, self.audio_tracks.len(), track_name),
@@ -3008,12 +3330,33 @@ impl eframe::App for SyncverseApp {
                 let target_video_rect = self
                     .viewport
                     .last_video_rect()
-                    .or_else(|| self.viewport.compute_video_rect(ui.available_rect_before_wrap()));
+                    .or_else(|| self.viewport.compute_video_rect(central_rect));
                 if let Some(video_rect) = target_video_rect {
-                    if let Some(active_text) =
-                        self.current_active_subtitle(snapshot.media_position_pts)
-                    {
+                    let sub_pts_ms = self
+                        .controls_state
+                        .effective_position_ms(snapshot.media_position_pts / 1_000_000, now);
+                    if let Some(active_text) = self.current_active_subtitle(sub_pts_ms) {
                         self.subtitle_overlay.render(ui, video_rect, &active_text);
+                    }
+                    if let Some((cache_key, bmp)) = self.current_active_bitmap_subtitle(sub_pts_ms) {
+                        let norm_x = (bmp.canvas_width > 0)
+                            .then(|| bmp.x as f32 / bmp.canvas_width as f32);
+                        let norm_y = (bmp.canvas_height > 0)
+                            .then(|| bmp.y as f32 / bmp.canvas_height as f32);
+                        self.subtitle_overlay.render_bitmap(
+                            ui,
+                            video_rect,
+                            SubtitleBitmapView {
+                                rgba: &bmp.rgba,
+                                width: bmp.width,
+                                height: bmp.height,
+                                norm_x,
+                                norm_y,
+                                canvas_width: (bmp.canvas_width > 0).then_some(bmp.canvas_width),
+                                canvas_height: (bmp.canvas_height > 0).then_some(bmp.canvas_height),
+                                cache_key,
+                            },
+                        );
                     }
 
                     // 11b. Floating Emoji Reactions Particle Simulation
@@ -3021,6 +3364,10 @@ impl eframe::App for SyncverseApp {
                     self.reaction_system.update(dt);
                     self.reaction_system.render(ui, video_rect);
                 }
+
+                // 11c. Viewport-bounded OSD HUD notification banner overlay
+                self.osd_overlay
+                    .show_in_viewport(ui, target_video_rect.unwrap_or(central_rect), now);
             });
 
         // 11b. On-screen Unpause Blocked Alert Banner over Viewport
@@ -3032,8 +3379,13 @@ impl eframe::App for SyncverseApp {
                 let is_host = self.sidebar_state.members.iter().any(|m| m.is_local && m.is_host);
 
                 egui::Area::new(egui::Id::unique("unpause_blocked_alert_area"))
-                    .anchor(Align2::CENTER_TOP, [0.0, 48.0])
-                    .order(egui::Order::Foreground)
+                    .pivot(Align2::CENTER_TOP)
+                    .fixed_pos(egui::pos2(
+                        central_viewport_rect.center().x,
+                        central_viewport_rect.top() + 12.0,
+                    ))
+                    .constrain_to(central_viewport_rect)
+                    .order(egui::Order::Middle)
                     .show(&ctx, |ui| {
                         egui::Frame::popup(ui.style())
                             .fill(Color32::from_rgba_premultiplied(30, 20, 10, 240))
@@ -3078,10 +3430,11 @@ impl eframe::App for SyncverseApp {
             }
         }
 
-        // 11c. Floating OSD HUD notification banner overlay
-        self.osd_overlay.show(&ctx, now);
-        if self.osd_overlay.active_notification(now).is_some() || self.reaction_system.has_active_particles() {
-            ctx.request_repaint();
+        // Schedule bounded repaints only while transient animations or OSD fades are active
+        if self.reaction_system.has_active_particles() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.osd_overlay.active_notification(now).is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         // 12. Modal Dialogs
@@ -3134,7 +3487,17 @@ impl eframe::App for SyncverseApp {
         for action in audio_actions {
             match action {
                 crate::gui::AudioConfigAction::SelectTrack(track_id) => {
-                    self.audio_track_index = track_id as usize;
+                    if let Some(pos) = self
+                        .controls_state
+                        .audio_dialog
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == track_id)
+                    {
+                        self.audio_track_index = pos;
+                    } else {
+                        self.audio_track_index = track_id as usize;
+                    }
                     let _ = self.command_tx.send(PlayerCommand::SelectAudioTrack(track_id));
                 }
                 crate::gui::AudioConfigAction::SetVolume(vol) => {
@@ -3251,6 +3614,12 @@ impl eframe::App for SyncverseApp {
 
         // 14. Drag-hover visual overlay
         DragDropHandler::render_hover_overlay(&ctx);
+    }
+}
+
+impl eframe::App for SyncverseApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render_ui(ui);
     }
 }
 
