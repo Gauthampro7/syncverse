@@ -1,0 +1,6 @@
+size_bytes=24336504
+needed_count=10
+ldd_lines=243
+startup_ms_min=88
+startup_ms_median=90
+# idle_rss_kb/idle_cpu_pct: not measurable; headless play exits after a simulated run
