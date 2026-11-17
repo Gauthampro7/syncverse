@@ -192,3 +192,37 @@ fn wp3_party_connection_state_updates_sidebar_badge() {
     out2.textures_delta.clear();
     assert_eq!(app.sidebar_state().party_connection_state, None);
 }
+
+#[test]
+fn wp2_nat_report_and_upnp_status_update_dialogs() {
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, _command_rx) = channel::<PlayerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+
+    let mut app =
+        SyncverseApp::with_headless_subsystems(exchange, video_ring, clock, command_tx, event_rx);
+
+    event_tx
+        .send(UiEvent::NatReport {
+            kind: syncverse_ui::event::NatKind::EndpointIndependent,
+            public_addr: Some("203.0.113.5:18242".to_string()),
+            error: None,
+        })
+        .unwrap();
+    event_tx
+        .send(UiEvent::UpnpStatusUpdated {
+            is_mapped: true,
+            port: 18242,
+            external_ip: Some("203.0.113.5".to_string()),
+            message: "UPnP active".to_string(),
+        })
+        .unwrap();
+
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.render_ui(ui);
+    });
+    out.textures_delta.clear();
+}

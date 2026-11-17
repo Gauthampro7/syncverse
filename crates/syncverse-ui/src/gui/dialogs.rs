@@ -44,6 +44,16 @@ pub struct HostPartyDialog {
     pub enable_upnp: bool,
     /// Transient status message (e.g. "Copied!").
     pub status_message: Option<String>,
+    /// Last STUN NAT classification for the host socket.
+    pub nat_kind: Option<crate::event::NatKind>,
+    /// Discovered public `"ip:port"` endpoint from STUN.
+    pub public_addr: Option<String>,
+    /// Last STUN probe error description, if any.
+    pub nat_error: Option<String>,
+    /// Peer `"ip:port"` input for UDP hole punching.
+    pub peer_punch_addr: String,
+    /// Latest UPnP/NAT-PMP mapping status text.
+    pub upnp_status_text: Option<String>,
 }
 
 impl Default for HostPartyDialog {
@@ -57,6 +67,11 @@ impl Default for HostPartyDialog {
             password: String::new(),
             enable_upnp: true,
             status_message: None,
+            nat_kind: None,
+            public_addr: None,
+            nat_error: None,
+            peer_punch_addr: String::new(),
+            upnp_status_text: None,
         }
     }
 }
@@ -150,6 +165,44 @@ impl HostPartyDialog {
                             .small()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
+
+                    if let Some(ref upnp_txt) = self.upnp_status_text {
+                        ui.label(
+                            RichText::new(format!("Port Mapping: {}", upnp_txt))
+                                .small()
+                                .color(Color32::from_rgb(148, 163, 184)),
+                        );
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.label(RichText::new("WAN / NAT Traversal (STUN & Hole Punch):").strong().color(Color32::from_rgb(56, 189, 248)));
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Detect Public Address").clicked() {
+                            let _ = command_tx.send(PlayerCommand::DetectPublicAddress);
+                        }
+                        if let Some(ref pub_addr) = self.public_addr {
+                            ui.label(pub_addr);
+                            if ui.button("📋 Copy").clicked() {
+                                ui.ctx().copy_text(pub_addr.clone());
+                                self.status_message = Some("Copied public address!".to_string());
+                            }
+                        }
+                    });
+                    if let Some(kind) = self.nat_kind {
+                        ui.label(RichText::new(format!("NAT Type: {:?}", kind)).small());
+                    }
+                    if let Some(ref err) = self.nat_error {
+                        ui.label(RichText::new(format!("STUN: {}", err)).small().color(Color32::from_rgb(248, 113, 113)));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Allow peer (hole punch):");
+                        ui.text_edit_singleline(&mut self.peer_punch_addr);
+                        if ui.button("🔓 Punch").clicked() && !self.peer_punch_addr.trim().is_empty() {
+                            let _ = command_tx.send(PlayerCommand::PunchPeer(self.peer_punch_addr.trim().to_string()));
+                        }
+                    });
                 });
 
                 if let Some(ref msg) = self.status_message {
@@ -213,6 +266,14 @@ pub struct ConnectPartyDialog {
     pub password: String,
     /// Error message on validation failure.
     pub error_msg: Option<String>,
+    /// Last STUN NAT classification for the local socket.
+    pub nat_kind: Option<crate::event::NatKind>,
+    /// Discovered public `"ip:port"` endpoint to share with the host.
+    pub public_addr: Option<String>,
+    /// Last STUN probe error description, if any.
+    pub nat_error: Option<String>,
+    /// Whether to run UDP hole punching before connecting.
+    pub use_hole_punch: bool,
 }
 
 impl Default for ConnectPartyDialog {
@@ -224,6 +285,10 @@ impl Default for ConnectPartyDialog {
             username: std::env::var("USER").unwrap_or_else(|_| "Peer".to_string()),
             password: String::new(),
             error_msg: None,
+            nat_kind: None,
+            public_addr: None,
+            nat_error: None,
+            use_hole_punch: false,
         }
     }
 }
@@ -287,6 +352,32 @@ impl ConnectPartyDialog {
                         ui.end_row();
                     });
 
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Detect My Public Address").clicked() {
+                            let _ = command_tx.send(PlayerCommand::DetectPublicAddress);
+                        }
+                        if let Some(ref pub_addr) = self.public_addr {
+                            ui.label(pub_addr);
+                            if ui.button("📋 Copy").clicked() {
+                                ui.ctx().copy_text(pub_addr.clone());
+                            }
+                        }
+                    });
+                    if let Some(kind) = self.nat_kind {
+                        ui.label(RichText::new(format!("NAT Type: {:?}", kind)).small());
+                    }
+                    if let Some(ref err) = self.nat_error {
+                        ui.label(RichText::new(format!("STUN: {}", err)).small().color(Color32::from_rgb(248, 113, 113)));
+                    }
+                    let punch_allowed = self.nat_kind != Some(crate::event::NatKind::Symmetric);
+                    ui.add_enabled(
+                        punch_allowed,
+                        egui::Checkbox::new(&mut self.use_hole_punch, "Use UDP hole punch"),
+                    );
+                });
+
                 if let Some(ref err) = self.error_msg {
                     ui.add_space(6.0);
                     ui.label(RichText::new(err).color(Color32::from_rgb(239, 68, 68)));
@@ -312,6 +403,9 @@ impl ConnectPartyDialog {
                             } else {
                                 Some(self.password.trim().to_string())
                             };
+                            if self.use_hole_punch {
+                                let _ = command_tx.send(PlayerCommand::PunchPeer(self.host_addr.clone()));
+                            }
                             let _ = command_tx.send(PlayerCommand::ConnectParty {
                                 addr: self.host_addr.clone(),
                                 room: self.room_name.clone(),

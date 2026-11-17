@@ -1512,6 +1512,7 @@ impl SyncverseApp {
                     } else {
                         format!("UPnP: {}", message)
                     };
+                    self.host_dialog.upnp_status_text = Some(toast.clone());
                     self.osd_overlay.show_notification(toast, now);
                 }
                 UiEvent::ChaptersDiscovered(chapters) => {
@@ -1572,8 +1573,19 @@ impl SyncverseApp {
                             Some(state)
                         };
                 }
-                // v0.5.0 scaffold: handled by WP2 (nat).
-                UiEvent::NatReport { .. } => {}
+                UiEvent::NatReport {
+                    kind,
+                    public_addr,
+                    error,
+                } => {
+                    let err_str = error.map(|e| e.to_string());
+                    self.host_dialog.nat_kind = Some(kind);
+                    self.host_dialog.public_addr = public_addr.clone();
+                    self.host_dialog.nat_error = err_str.clone();
+                    self.connect_dialog.nat_kind = Some(kind);
+                    self.connect_dialog.public_addr = public_addr;
+                    self.connect_dialog.nat_error = err_str;
+                }
             }
         }
 

@@ -529,3 +529,56 @@ fn wp3_connect_unreachable_never_emits_connected() {
     running.store(false, Ordering::Relaxed);
     handle.join().unwrap();
 }
+
+#[test]
+fn wp2_punch_peer_validates_address_and_party_state() {
+    let (cmd_tx, cmd_rx) = channel::<PlayerCommand>();
+    let (audio_tx, _audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let worker_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        run_playback_worker_with_dirs(
+            cmd_rx,
+            audio_tx,
+            event_tx,
+            exchange,
+            video_ring,
+            clock,
+            worker_running,
+            None,
+        );
+    });
+
+    cmd_tx
+        .send(PlayerCommand::PunchPeer("not-an-addr".to_string()))
+        .unwrap();
+    cmd_tx
+        .send(PlayerCommand::PunchPeer("127.0.0.1:18242".to_string()))
+        .unwrap();
+
+    let events = drain_events_until(&event_rx, Duration::from_millis(500), |_| false);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::HudNotification { text, .. } if text.contains("Invalid peer address")
+        )),
+        "expected invalid address toast, got {:?}",
+        events
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::HudNotification { text, .. } if text.contains("Host or join a room")
+        )),
+        "expected room-required toast, got {:?}",
+        events
+    );
+
+    running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+}

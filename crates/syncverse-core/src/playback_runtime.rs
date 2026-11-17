@@ -29,11 +29,13 @@ use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack as CommonSubtitl
 use syncverse_common::userdata::{keys, FileKey, Settings, UserDirs};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::client::{ClientConnectionState, ConnectFailReason, ConnectionEvent};
+use syncverse_sync::nat::KeepAlive;
 use syncverse_sync::{
-    spawn_upnp_mapping, ClientNode, HostServer, MediaFingerprint, PeerControlAction,
-    PeerStatusPayload, RoomCryptoSession,
+    probe_failure, spawn_upnp_mapping, ClientNode, HostServer, MediaFingerprint, NatMapping,
+    NatMux, PeerControlAction, PeerStatusPayload, ProbeFailure, PunchConfig, PunchOutcome,
+    RoomCryptoSession, StunConfig, DEFAULT_STUN_SERVERS, KEEPALIVE_INTERVAL,
 };
-use syncverse_ui::event::{PartyConnectionState, PartyFailReason};
+use syncverse_ui::event::{NatKind, NatProbeError, PartyConnectionState, PartyFailReason};
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
     TripleBufferSnapshotExchange, UiEvent, SNAPSHOT_FLAG_FORCE_PLAY, SNAPSHOT_FLAG_GATE_BLOCKED,
@@ -1408,6 +1410,8 @@ pub fn run_playback_worker_with_hw_and_dirs(
     let mut pts_hist = PtsHistory::new();
     let mut client_initial_connected_announced: bool = false;
     let mut client_connect_addr: String = String::new();
+    let mut nat_mux: Option<NatMux> = None;
+    let mut nat_keepalive: Option<KeepAlive> = None;
     let mut local_ready: bool = false;
     let mut force_play: bool = false;
     let mut gate_blocked: bool = false;
@@ -2633,6 +2637,10 @@ pub fn run_playback_worker_with_hw_and_dirs(
                                 .map(Arc::new);
                             server.set_crypto(crypto.clone());
                             server.set_media_state(current_pts, speed, is_paused);
+                            if let Ok(mux) = NatMux::from_socket(server.socket()) {
+                                server.set_datagram_interceptor(Some(Box::new(mux.interceptor())));
+                                nat_mux = Some(mux);
+                            }
 
                             let upnp_rx = if enable_upnp {
                                 Some(spawn_upnp_mapping(port))
@@ -2757,6 +2765,11 @@ pub fn run_playback_worker_with_hw_and_dirs(
                         match ClientNode::bind_for_target(target, client_id) {
                             Ok(mut client) => {
                                 client.set_crypto(crypto.clone());
+                                if let Ok(mux) = NatMux::from_socket(client.socket()) {
+                                    client.set_datagram_interceptor(Some(Box::new(mux.interceptor())));
+                                    nat_keepalive = Some(mux.start_keepalive(target, KEEPALIVE_INTERVAL));
+                                    nat_mux = Some(mux);
+                                }
                                 client.begin_join(&username);
                                 let _ = event_tx.send(UiEvent::PartyConnectionState {
                                     state: PartyConnectionState::Connecting,
@@ -2875,6 +2888,8 @@ pub fn run_playback_worker_with_hw_and_dirs(
                         WatchPartyRole::None => {}
                     }
                     party_role = WatchPartyRole::None;
+                    nat_keepalive = None;
+                    nat_mux = None;
                     resume_tracker.set_in_party(false);
                     gate_blocked = false;
                     let local_name = std::env::var("USER").unwrap_or_else(|_| "You".to_string());
@@ -3044,8 +3059,94 @@ pub fn run_playback_worker_with_hw_and_dirs(
                         hwdec_config.policy = policy;
                     }
                 }
-                // v0.5.0 scaffold: no behaviour yet (nat work package).
-                PlayerCommand::DetectPublicAddress | PlayerCommand::PunchPeer(_) => {}
+                PlayerCommand::DetectPublicAddress => {
+                    let tx = event_tx.clone();
+                    let existing_mux = nat_mux.clone();
+                    thread::spawn(move || {
+                        let temp_sock;
+                        let mux = match existing_mux {
+                            Some(m) => m,
+                            None => {
+                                temp_sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let _ = tx.send(UiEvent::NatReport {
+                                            kind: NatKind::Unknown,
+                                            public_addr: None,
+                                            error: Some(NatProbeError::Socket(e.to_string())),
+                                        });
+                                        return;
+                                    }
+                                };
+                                match NatMux::from_socket(&temp_sock) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        let _ = tx.send(UiEvent::NatReport {
+                                            kind: NatKind::Unknown,
+                                            public_addr: None,
+                                            error: Some(NatProbeError::Socket(e.to_string())),
+                                        });
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        let r = mux.detect_named(&DEFAULT_STUN_SERVERS, &StunConfig::default());
+                        let kind = match r.mapping {
+                            NatMapping::Open => NatKind::Open,
+                            NatMapping::EndpointIndependent => NatKind::EndpointIndependent,
+                            NatMapping::Symmetric => NatKind::Symmetric,
+                            NatMapping::Unknown => NatKind::Unknown,
+                        };
+                        let error = r.error.as_ref().map(|e| match probe_failure(e) {
+                            ProbeFailure::NoResponse => NatProbeError::NoResponse,
+                            ProbeFailure::BadResponse => NatProbeError::BadResponse,
+                            ProbeFailure::Socket => NatProbeError::Socket(e.to_string()),
+                        });
+                        let _ = tx.send(UiEvent::NatReport {
+                            kind,
+                            public_addr: r.public_addr.map(|a| a.to_string()),
+                            error,
+                        });
+                    });
+                }
+                PlayerCommand::PunchPeer(addr_str) => {
+                    let parsed: Result<SocketAddr, _> = addr_str.trim().parse();
+                    match parsed {
+                        Err(_) => {
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Invalid peer address: {addr_str}"),
+                                timestamp: Instant::now(),
+                            });
+                        }
+                        Ok(addr) => {
+                            if let Some(mux) = nat_mux.clone() {
+                                let tx = event_tx.clone();
+                                thread::spawn(move || {
+                                    match mux.punch(addr, &PunchConfig::default()) {
+                                        PunchOutcome::Established(a) => {
+                                            let _ = tx.send(UiEvent::HudNotification {
+                                                text: format!("Hole punch established with {a}"),
+                                                timestamp: Instant::now(),
+                                            });
+                                        }
+                                        PunchOutcome::Timeout => {
+                                            let _ = tx.send(UiEvent::HudNotification {
+                                                text: "Hole punch timed out; NAT may be symmetric. Use UPnP or port-forwarding.".to_string(),
+                                                timestamp: Instant::now(),
+                                            });
+                                        }
+                                    }
+                                });
+                            } else {
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: "Host or join a room before hole punching.".to_string(),
+                                    timestamp: Instant::now(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -3759,6 +3860,8 @@ pub fn run_playback_worker_with_hw_and_dirs(
                 }
                 if reset_party_to_none {
                     party_role = WatchPartyRole::None;
+                    nat_keepalive = None;
+                    nat_mux = None;
                     resume_tracker.set_in_party(false);
                     gate_blocked = false;
                     continue;
@@ -4235,6 +4338,8 @@ pub fn run_playback_worker_with_hw_and_dirs(
         }
         WatchPartyRole::None => {}
     }
+    drop(nat_keepalive);
+    drop(nat_mux);
 
     // Flush resume position and persist global settings on worker exit.
     let exit_pos_ms = clock.current_pts(Instant::now()).max(0.0) as u64;
