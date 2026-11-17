@@ -572,6 +572,12 @@ impl SyncverseApp {
                     }
                 }
             }
+            if let Some(hwdec) = settings.get(keys::HWDEC_MODE) {
+                let norm = hwdec.trim().to_ascii_lowercase();
+                if matches!(norm.as_str(), "off" | "auto" | "vaapi") {
+                    self.controls_state.video_dialog.hwdec_mode = norm;
+                }
+            }
         }
     }
 
@@ -603,6 +609,7 @@ impl SyncverseApp {
                 settings.set(keys::USERNAME, self.connect_dialog.username.trim());
             }
             settings.set(keys::LAST_HOST_PORT, self.host_dialog.port.to_string());
+            settings.set(keys::HWDEC_MODE, &self.controls_state.video_dialog.hwdec_mode);
         }
         let _ = settings.save(&path);
     }
@@ -3809,6 +3816,18 @@ impl SyncverseApp {
                 crate::gui::VideoConfigAction::SetSpeed(spd) => {
                     self.controls_state.speed = spd;
                     let _ = self.command_tx.send(PlayerCommand::SetSpeed(spd));
+                }
+                crate::gui::VideoConfigAction::SetHwdecMode(mode) => {
+                    let _ = self.command_tx.send(PlayerCommand::SetHwdecMode(mode.clone()));
+                    self.osd_overlay.show_notification(
+                        format!("Hardware Decoding: {} (applies on next open)", mode),
+                        now,
+                    );
+                    if self.persist_user_settings {
+                        if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
+                            self.save_settings_to_dirs(&dirs);
+                        }
+                    }
                 }
             }
         }

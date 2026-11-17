@@ -130,3 +130,25 @@ fn wp5_ab_loop_disabled_for_party_client() {
     );
     assert!(app.controls_state().ab_repeat.point_a().is_none());
 }
+
+#[test]
+fn wp1_video_dialog_hwdec_mode_persists_in_settings() {
+    let base = std::env::temp_dir().join(format!("syncverse_ui_wp1_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dirs = UserDirs::under(&base);
+
+    let mut s = Settings::default();
+    s.set(keys::HWDEC_MODE, "auto");
+    s.save(&dirs.settings_path()).unwrap();
+
+    let mut app = SyncverseApp::new();
+    app.load_settings_from_dirs(&dirs);
+    assert_eq!(app.controls_state().video_dialog.hwdec_mode, "auto");
+
+    app.controls_state_mut().video_dialog.hwdec_mode = "vaapi".to_string();
+    app.save_settings_to_dirs(&dirs);
+    let reloaded = Settings::load(&dirs.settings_path());
+    assert_eq!(reloaded.get(keys::HWDEC_MODE), Some("vaapi"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}

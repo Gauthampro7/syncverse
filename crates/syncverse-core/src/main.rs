@@ -53,10 +53,17 @@ fn main() {
             let mut target: Option<String> = None;
             let mut ticks: Option<usize> = None;
             let mut force_terminal = false;
+            let mut hwdec_flag: Option<String> = None;
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--ticks" && i + 1 < args.len() {
                     ticks = args[i + 1].parse().ok();
+                    i += 2;
+                } else if let Some(val) = args[i].strip_prefix("--hwdec=") {
+                    hwdec_flag = Some(val.to_string());
+                    i += 1;
+                } else if args[i] == "--hwdec" && i + 1 < args.len() {
+                    hwdec_flag = Some(args[i + 1].clone());
                     i += 2;
                 } else if args[i] == "--headless" || args[i] == "--demo" {
                     ticks = Some(5);
@@ -75,22 +82,32 @@ fn main() {
                 }
             }
 
+            let hwdec_cfg = match syncverse_codecs::hwaccel::HwdecConfig::from_env(
+                hwdec_flag.as_deref(),
+            ) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("[ERROR] Invalid --hwdec value: {e}");
+                    std::process::exit(2);
+                }
+            };
+
             if let Some(n) = ticks {
                 // Headless automated test / CI simulation
                 let media_target = target.unwrap_or_else(|| "synthetic-mkv".to_string());
-                run_playback_simulation(&media_target, n);
+                run_playback_simulation(&media_target, n, hwdec_cfg);
             } else if force_terminal {
                 // Explicit terminal presentation mode
                 let media_target = target.unwrap_or_else(|| "synthetic-mkv".to_string());
                 if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                     run_interactive_player(&media_target);
                 } else {
-                    run_playback_simulation(&media_target, 5);
+                    run_playback_simulation(&media_target, 5, hwdec_cfg);
                 }
             } else {
                 // DEFAULT PLAY: Launch Desktop Graphical Player
                 let path = target.map(PathBuf::from);
-                launch_desktop_gui(path);
+                launch_desktop_gui_with_hwdec(path, Some(hwdec_cfg));
             }
         }
         "party" => {
@@ -126,9 +143,19 @@ fn main() {
 
 /// Launches the Desktop Graphical Player UI with automatic terminal fallback.
 fn launch_desktop_gui(initial_file: Option<PathBuf>) {
+    launch_desktop_gui_with_hwdec(initial_file, None);
+}
+
+fn launch_desktop_gui_with_hwdec(
+    initial_file: Option<PathBuf>,
+    hwdec: Option<syncverse_codecs::hwaccel::HwdecConfig>,
+) {
     println!("\x1b[1;36m[GUI]\x1b[0m Launching Syncverse Desktop Graphical Player...");
 
-    match syncverse_core::launch_desktop_player_app(initial_file.clone()) {
+    match syncverse_core::playback_runtime::launch_desktop_player_app_with_hwdec(
+        initial_file.clone(),
+        hwdec.clone(),
+    ) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("\x1b[1;33m[WARN] Graphical desktop launch failed: {:?}\x1b[0m", e);
@@ -140,7 +167,7 @@ fn launch_desktop_gui(initial_file: Option<PathBuf>) {
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 run_interactive_player(&target);
             } else {
-                run_playback_simulation(&target, 5);
+                run_playback_simulation(&target, 5, hwdec.unwrap_or_default());
             }
         }
     }
@@ -271,12 +298,20 @@ fn inspect_media(path_str: &str) {
 }
 
 /// Runs a real-time playback loop with the Master Clock and Telemetry Aggregator.
-fn run_playback_simulation(target: &str, num_ticks: usize) {
+fn run_playback_simulation(
+    target: &str,
+    num_ticks: usize,
+    hwdec: syncverse_codecs::hwaccel::HwdecConfig,
+) {
     println!("\x1b[1;34m[PLAYBACK]\x1b[0m Initializing playback runtime for: \x1b[1m{}\x1b[0m", target);
 
     let mut coordinator = PlayerCoordinator::new();
+    coordinator.set_hwdec_config(hwdec);
     match coordinator.run_presentation_pipeline(target, num_ticks) {
         Ok(snapshots) => {
+            if let Some(desc) = coordinator.last_decoder_description() {
+                println!("  Decoder: {}", desc);
+            }
             println!("  State: \x1b[1;32mPLAYING\x1b[0m | Rate: 1.000x | Master Monotonic Clock Active\n");
             println!("  \x1b[1;37mSimulating {} consecutive ticks with live OSD Telemetry:\x1b[0m", snapshots.len().min(num_ticks));
 

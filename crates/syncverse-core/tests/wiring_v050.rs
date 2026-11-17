@@ -371,3 +371,92 @@ fn wp5_step_frame_uses_stream_fps_and_blocks_party_client() {
     handle.join().unwrap();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wp1_hwdec_policy_reaches_session_open_and_fallback_toast() {
+    let base = std::env::temp_dir().join(format!("syncverse_core_wp1_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let clip = base.join("hwdec_probe.mp4");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=25",
+            "-t",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&clip)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        eprintln!("SKIP: ffmpeg not available");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+
+    // Force an invalid VA-API device so fallback to software is deterministic even without GPU.
+    let bad_hw = syncverse_codecs::hwaccel::HwdecConfig::new(
+        syncverse_codecs::hwaccel::HwdecPolicy::Vaapi,
+    )
+    .with_device("/nonexistent/renderD999");
+
+    let (cmd_tx, cmd_rx) = channel::<PlayerCommand>();
+    let (audio_tx, _audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let worker_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        syncverse_core::playback_runtime::run_playback_worker_with_hw_and_dirs(
+            cmd_rx,
+            audio_tx,
+            event_tx,
+            exchange,
+            video_ring,
+            clock,
+            worker_running,
+            None,
+            Some(bad_hw),
+        );
+    });
+
+    cmd_tx.send(PlayerCommand::OpenFile(clip)).unwrap();
+    let events = drain_events_until(&event_rx, Duration::from_secs(3), |ev| {
+        matches!(ev, UiEvent::VideoMetadataDiscovered(_))
+    });
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::HudNotification { text, .. } if text.contains("Hardware decode fallback")
+        )),
+        "expected fallback HUD toast, got {:?}",
+        events
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::VideoMetadataDiscovered(meta) if meta.codec.as_deref().is_some_and(|c| c.to_ascii_lowercase().contains("software"))
+        )),
+        "expected Software backend in VideoMetadataDiscovered, got {:?}",
+        events
+    );
+
+    running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}

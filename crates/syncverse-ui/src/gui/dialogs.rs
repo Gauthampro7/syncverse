@@ -1151,6 +1151,8 @@ pub enum VideoConfigAction {
     SetAspectRatio(AspectRatioOverride),
     /// Set playback speed ratio.
     SetSpeed(f64),
+    /// Set hardware decoding mode (`"off"`, `"auto"`, `"vaapi"`).
+    SetHwdecMode(String),
 }
 
 /// Modal dialog for configuring aspect ratio, playback speed, and viewing video stream metadata.
@@ -1162,6 +1164,8 @@ pub struct VideoConfigDialog {
     pub aspect_ratio: AspectRatioOverride,
     /// Current playback speed multiplier.
     pub speed: f64,
+    /// Selected hardware decoding mode (`"off"`, `"auto"`, `"vaapi"`).
+    pub hwdec_mode: String,
     /// Active video stream metadata.
     pub metadata: VideoStreamMetadata,
 }
@@ -1172,6 +1176,7 @@ impl Default for VideoConfigDialog {
             is_open: false,
             aspect_ratio: AspectRatioOverride::Original,
             speed: 1.0,
+            hwdec_mode: "off".to_string(),
             metadata: VideoStreamMetadata::default(),
         }
     }
@@ -1281,6 +1286,31 @@ impl VideoConfigDialog {
                         actions.push(VideoConfigAction::SetSpeed(1.0));
                     }
                 });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // 2b. Hardware Decoding (VA-API)
+                ui.heading("Hardware Decoding (VA-API)");
+                let hwdec_modes = [
+                    ("off", "Off (Software)"),
+                    ("auto", "Auto (VA-API + fallback)"),
+                    ("vaapi", "VA-API"),
+                ];
+                let mut hwdec_changed = false;
+                ui.horizontal(|ui| {
+                    for (val, label) in hwdec_modes {
+                        if ui
+                            .radio_value(&mut self.hwdec_mode, val.to_string(), label)
+                            .changed()
+                        {
+                            hwdec_changed = true;
+                        }
+                    }
+                });
+                if hwdec_changed {
+                    actions.push(VideoConfigAction::SetHwdecMode(self.hwdec_mode.clone()));
+                }
 
                 ui.add_space(8.0);
                 ui.separator();

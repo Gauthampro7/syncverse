@@ -21,6 +21,7 @@ use syncverse_chat::{
 use syncverse_clock::{MasterClock, PlaybackState, SpscRingBuffer};
 use syncverse_codecs::audio::LinearResampler;
 use syncverse_codecs::frame::RgbaFramePool;
+use syncverse_codecs::hwaccel::{HwdecConfig, HwdecPolicy};
 use syncverse_codecs::{
     apply_gain, UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA,
 };
@@ -408,11 +409,18 @@ struct PlaybackSession {
     video_fps: Option<f64>,
     video_metadata: syncverse_ui::gui::dialogs::VideoStreamMetadata,
     chapters: Vec<syncverse_demux::MediaChapter>,
+    fallback_notice: Option<String>,
 }
 
 impl PlaybackSession {
-    /// Attempts to open a media file and initialize demuxers, decoders, subtitle parsers, and pools.
+    /// Attempts to open a media file with default software decoding.
+    #[allow(dead_code)]
     fn open(path: &PathBuf) -> Result<Self, CoreError> {
+        Self::open_with_hw(path, &HwdecConfig::default())
+    }
+
+    /// Attempts to open a media file and initialize demuxers, decoders (with `hwdec`), subtitle parsers, and pools.
+    fn open_with_hw(path: &PathBuf, hwdec: &HwdecConfig) -> Result<Self, CoreError> {
         if !path.exists() {
             return Err(CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -522,13 +530,14 @@ impl PlaybackSession {
 
         let video_decoder = if let Some(ref track) = vt {
             if let Some(params) = demuxer.stream_parameters(track.track_id as usize) {
-                UniversalVideoDecoder::from_parameters(&params).ok()
+                UniversalVideoDecoder::from_parameters_with_hw(&params, hwdec).ok()
             } else {
-                UniversalVideoDecoder::from_codec_name(
+                UniversalVideoDecoder::from_codec_name_with_hw(
                     &track.codec_id,
                     track.width,
                     track.height,
                     track.codec_private.as_deref(),
+                    hwdec,
                 )
                 .ok()
             }
@@ -553,10 +562,17 @@ impl PlaybackSession {
             None
         };
 
+        let fallback_notice = video_decoder.as_ref().and_then(|d| {
+            d.fallback_reason()
+                .map(|r| format!("Hardware decode fallback to software: {r}"))
+        });
         let video_metadata = syncverse_ui::gui::dialogs::VideoStreamMetadata {
             width: vt.as_ref().and_then(|v| v.width),
             height: vt.as_ref().and_then(|v| v.height),
-            codec: vt.as_ref().map(|v| v.codec_id.clone()),
+            codec: video_decoder
+                .as_ref()
+                .map(|d| d.decoder_description())
+                .or_else(|| vt.as_ref().map(|v| v.codec_id.clone())),
             frame_rate: video_frame_rate,
             bit_depth: Some(8),
             pixel_format: Some("yuv420p".to_string()),
@@ -588,6 +604,7 @@ impl PlaybackSession {
             video_fps: video_frame_rate,
             video_metadata,
             chapters,
+            fallback_notice,
         })
     }
 
@@ -1328,6 +1345,32 @@ pub fn run_playback_worker_with_dirs(
     running: Arc<AtomicBool>,
     user_dirs: Option<UserDirs>,
 ) {
+    run_playback_worker_with_hw_and_dirs(
+        command_rx,
+        audio_tx,
+        event_tx,
+        exchange,
+        video_ring,
+        clock,
+        running,
+        user_dirs,
+        None,
+    );
+}
+
+/// Runs the background playback worker loop with explicit per-user directories and optional hwdec override.
+#[allow(clippy::too_many_arguments)]
+pub fn run_playback_worker_with_hw_and_dirs(
+    command_rx: Receiver<PlayerCommand>,
+    audio_tx: Sender<AudioWorkerCommand>,
+    event_tx: Sender<UiEvent>,
+    exchange: Arc<TripleBufferSnapshotExchange>,
+    video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
+    clock: Arc<MasterClock>,
+    running: Arc<AtomicBool>,
+    user_dirs: Option<UserDirs>,
+    hwdec_override: Option<HwdecConfig>,
+) {
     let worker_start = Instant::now();
     let settings = user_dirs
         .as_ref()
@@ -1339,6 +1382,14 @@ pub fn run_playback_worker_with_dirs(
         .get(keys::RESUME_POLICY)
         .and_then(ResumePolicy::parse)
         .unwrap_or(ResumePolicy::Ask);
+    let mut hwdec_config = hwdec_override.unwrap_or_else(|| {
+        let saved_mode = if remember_settings {
+            settings.get(keys::HWDEC_MODE)
+        } else {
+            None
+        };
+        HwdecConfig::from_env(saved_mode).unwrap_or_default()
+    });
     let mut resume_tracker = ResumeTracker::load(
         user_dirs.as_ref().map(|d| d.resume_path()).as_deref(),
         resume_policy,
@@ -1402,8 +1453,14 @@ pub fn run_playback_worker_with_dirs(
                     let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
                     let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
                     let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
-                    match PlaybackSession::open(&path) {
+                    match PlaybackSession::open_with_hw(&path, &hwdec_config) {
                         Ok(mut new_session) => {
+                            if let Some(notice) = new_session.fallback_notice.take() {
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: notice,
+                                    timestamp: Instant::now(),
+                                });
+                            }
                             let dur_ms = new_session.duration_ms;
                             let now_ms = worker_start.elapsed().as_millis() as u64;
                             let in_party = !matches!(party_role, WatchPartyRole::None);
@@ -2987,6 +3044,11 @@ pub fn run_playback_worker_with_dirs(
                 PlayerCommand::SetRememberSettings(on) => {
                     remember_settings = on;
                 }
+                PlayerCommand::SetHwdecMode(mode) => {
+                    if let Ok(policy) = HwdecPolicy::parse(&mode) {
+                        hwdec_config.policy = policy;
+                    }
+                }
                 // v0.5.0 scaffold: no behaviour yet (nat work package).
                 PlayerCommand::DetectPublicAddress | PlayerCommand::PunchPeer(_) => {}
             }
@@ -4015,6 +4077,7 @@ pub fn run_playback_worker_with_dirs(
         if remember_settings {
             s.set(keys::VOLUME, format!("{volume:.4}"));
             s.set_bool(keys::MUTED, is_muted);
+            s.set(keys::HWDEC_MODE, hwdec_config.policy.as_str());
         }
         let _ = s.save(&dirs.settings_path());
     }
@@ -4023,6 +4086,14 @@ pub fn run_playback_worker_with_dirs(
 /// Launches the full desktop graphical player with integrated background decoding and presentation runtime.
 pub fn launch_desktop_player_app(
     initial_file: Option<PathBuf>,
+) -> Result<(), CoreError> {
+    launch_desktop_player_app_with_hwdec(initial_file, None)
+}
+
+/// Launches the full desktop graphical player with an explicit hardware decoding configuration.
+pub fn launch_desktop_player_app_with_hwdec(
+    initial_file: Option<PathBuf>,
+    hwdec: Option<HwdecConfig>,
 ) -> Result<(), CoreError> {
     let exchange = Arc::new(TripleBufferSnapshotExchange::new());
     let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
@@ -4052,7 +4123,7 @@ pub fn launch_desktop_player_app(
     let worker_handle = thread::Builder::new()
         .name("syncverse-playback-worker".to_string())
         .spawn(move || {
-            run_playback_worker(
+            run_playback_worker_with_hw_and_dirs(
                 command_rx,
                 audio_tx,
                 event_tx,
@@ -4060,6 +4131,8 @@ pub fn launch_desktop_player_app(
                 thread_video_ring,
                 thread_clock,
                 thread_running,
+                UserDirs::from_env().ok(),
+                hwdec,
             );
         })
         .map_err(|e| CoreError::Runtime(format!("Failed to spawn playback worker thread: {e}")))?;

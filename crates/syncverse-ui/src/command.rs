@@ -23,6 +23,8 @@ pub enum PlayerCommand {
     SetRememberPerFile(bool),
     /// Enable/disable remembering global settings across sessions.
     SetRememberSettings(bool),
+    /// Set hardware decoding mode (`"off"`, `"auto"`, `"vaapi"`).
+    SetHwdecMode(String),
     /// Toggle playback between Playing and Paused.
     TogglePause,
     /// Seek presentation to target PTS in milliseconds.

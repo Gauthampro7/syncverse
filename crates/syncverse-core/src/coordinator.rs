@@ -83,6 +83,8 @@ pub struct PlayerCoordinator {
     start_instant: Instant,
     room_sequence: u64,
     duration_ms: Option<u64>,
+    hwdec_config: syncverse_codecs::hwaccel::HwdecConfig,
+    last_decoder_description: Option<String>,
 }
 
 impl Default for PlayerCoordinator {
@@ -104,7 +106,24 @@ impl PlayerCoordinator {
             start_instant: Instant::now(),
             room_sequence: 0,
             duration_ms: None,
+            hwdec_config: syncverse_codecs::hwaccel::HwdecConfig::default(),
+            last_decoder_description: None,
         }
+    }
+
+    /// Configures hardware decoding policy for subsequent media opens.
+    pub fn set_hwdec_config(&mut self, cfg: syncverse_codecs::hwaccel::HwdecConfig) {
+        self.hwdec_config = cfg;
+    }
+
+    /// Returns the active hardware decoding configuration.
+    pub fn hwdec_config(&self) -> &syncverse_codecs::hwaccel::HwdecConfig {
+        &self.hwdec_config
+    }
+
+    /// Returns the human-readable description of the last opened video decoder (e.g. `"h264 (VA-API)"`).
+    pub fn last_decoder_description(&self) -> Option<&str> {
+        self.last_decoder_description.as_deref()
     }
 
     /// Returns current media duration in milliseconds, if known.
@@ -223,7 +242,8 @@ impl PlayerCoordinator {
             | PlayerCommand::SetAspectRatio(_)
             | PlayerCommand::SetResumePolicy(_)
             | PlayerCommand::SetRememberPerFile(_)
-            | PlayerCommand::SetRememberSettings(_) => {
+            | PlayerCommand::SetRememberSettings(_)
+            | PlayerCommand::SetHwdecMode(_) => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }
@@ -409,11 +429,15 @@ impl PlayerCoordinator {
                     let audio_track = info.tracks.iter().find(|t| t.track_type == TrackType::Audio).cloned();
 
                     let mut video_decoder = video_track.as_ref().and_then(|vt| {
-                        if let Some(params) = demuxer.stream_parameters(vt.track_id as usize) {
-                            UniversalVideoDecoder::from_parameters(&params).ok()
+                        let dec = if let Some(params) = demuxer.stream_parameters(vt.track_id as usize) {
+                            UniversalVideoDecoder::from_parameters_with_hw(&params, &self.hwdec_config).ok()
                         } else {
-                            UniversalVideoDecoder::from_codec_name(&vt.codec_id, vt.width, vt.height, vt.codec_private.as_deref()).ok()
+                            UniversalVideoDecoder::from_codec_name_with_hw(&vt.codec_id, vt.width, vt.height, vt.codec_private.as_deref(), &self.hwdec_config).ok()
+                        };
+                        if let Some(ref d) = dec {
+                            self.last_decoder_description = Some(d.decoder_description());
                         }
+                        dec
                     });
                     let mut audio_decoder = audio_track.as_ref().and_then(|at| {
                         if let Some(params) = demuxer.stream_parameters(at.track_id as usize) {
@@ -569,16 +593,19 @@ impl PlayerCoordinator {
         let audio_track = info.tracks.iter().find(|t| t.track_type == TrackType::Audio).cloned();
 
         let mut video_decoder = if let Some(ref vt) = video_track {
-            if let Some(params) = demuxer.stream_parameters(vt.track_id as usize) {
-                Some(UniversalVideoDecoder::from_parameters(&params)?)
+            let dec = if let Some(params) = demuxer.stream_parameters(vt.track_id as usize) {
+                UniversalVideoDecoder::from_parameters_with_hw(&params, &self.hwdec_config)?
             } else {
-                Some(UniversalVideoDecoder::from_codec_name(
+                UniversalVideoDecoder::from_codec_name_with_hw(
                     &vt.codec_id,
                     vt.width,
                     vt.height,
                     vt.codec_private.as_deref(),
-                )?)
-            }
+                    &self.hwdec_config,
+                )?
+            };
+            self.last_decoder_description = Some(dec.decoder_description());
+            Some(dec)
         } else {
             None
         };
