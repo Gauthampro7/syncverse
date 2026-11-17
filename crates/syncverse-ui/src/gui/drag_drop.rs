@@ -98,6 +98,27 @@ impl DragDropHandler {
         actions
     }
 
+    /// Collects every dropped media path (in action order) for multi-file queueing.
+    ///
+    /// A drop of two or more media files should be *queued* (`PlaylistManager::add_to_queue`) and the
+    /// first one played, instead of each `OpenMedia` replacing the previous one.
+    pub fn dropped_media_paths(actions: &[DroppedFileAction]) -> Vec<PathBuf> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                DroppedFileAction::OpenMedia(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns `true` when the drop should be enqueued rather than replace playback:
+    /// more than one media file, or Shift held during the drop.
+    pub fn should_enqueue(actions: &[DroppedFileAction], shift_held: bool) -> bool {
+        let n = actions.iter().filter(|a| matches!(a, DroppedFileAction::OpenMedia(_))).count();
+        n > 1 || (n == 1 && shift_held)
+    }
+
     /// Inspects egui raw input and returns the first dropped media or subtitle file action, if any.
     pub fn handle_dropped_file(ctx: &Context) -> Option<DroppedFileAction> {
         Self::handle_dropped_files(ctx).into_iter().next()

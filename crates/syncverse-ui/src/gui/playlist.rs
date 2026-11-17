@@ -55,9 +55,8 @@ impl PlaylistItem {
     pub fn new(path: PathBuf) -> Self {
         let filename = path
             .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Unknown File")
-            .to_string();
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Unknown File".to_string());
         Self { path, filename }
     }
 
@@ -220,6 +219,222 @@ impl PlaylistManager {
             }
             self.rebuild_shuffle_order();
         }
+    }
+
+    /// Cheap content signature (items + current index) for dirty-checking autosave:
+    /// the UI saves the queue only when this value changes between frames.
+    pub fn queue_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for i in &self.items {
+            i.path.hash(&mut h);
+        }
+        self.current_index.hash(&mut h);
+        h.finish()
+    }
+
+    /// Read-only view of the shuffle permutation (indices into `items`).
+    pub fn shuffle_order(&self) -> &[usize] {
+        &self.shuffled_order
+    }
+
+    /// Drag-and-drop reorder: removes the item at `from` and re-inserts it so it ends at index `to`.
+    ///
+    /// `to` is clamped to the last index. `current_index` keeps pointing at the same *item*, and the
+    /// shuffle permutation is remapped (not reshuffled) so it stays a valid permutation and the
+    /// shuffle position of the playing item is preserved. Returns `false` if `from` is out of range
+    /// or nothing moved.
+    pub fn move_item(&mut self, from: usize, to: usize) -> bool {
+        let len = self.items.len();
+        if from >= len {
+            return false;
+        }
+        let to = to.min(len - 1);
+        if from == to {
+            return false;
+        }
+        let item = self.items.remove(from);
+        self.items.insert(to, item);
+        // Old index -> new index mapping.
+        let map = |i: usize| -> usize {
+            if i == from {
+                to
+            } else if from < to && i > from && i <= to {
+                i - 1
+            } else if to < from && i >= to && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+        self.current_index = self.current_index.map(map);
+        for v in self.shuffled_order.iter_mut() {
+            *v = map(*v);
+        }
+        true
+    }
+
+    /// Appends `paths` to the end of the queue, skipping anything already queued (also within the batch).
+    /// Returns how many items were actually added. Does not change the current track.
+    pub fn add_to_queue<I: IntoIterator<Item = PathBuf>>(&mut self, paths: I) -> usize {
+        let mut added = 0;
+        for p in paths {
+            if !self.contains(&p) {
+                self.items.push(PlaylistItem::new(p));
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.append_shuffle_tail();
+        }
+        added
+    }
+
+    /// "Play next": places `path` directly after the current track (at the front when nothing is
+    /// current). A path already queued is *moved* there instead of duplicated. Returns the index it
+    /// now occupies.
+    pub fn play_next(&mut self, path: PathBuf) -> usize {
+        let insert_at = self.current_index.map(|c| c + 1).unwrap_or(0).min(self.items.len());
+        if let Some(existing) = self.items.iter().position(|i| i.path == path).or_else(|| {
+            let canon = path.canonicalize().ok()?;
+            self.items.iter().position(|i| i.path.canonicalize().ok().as_ref() == Some(&canon))
+        }) {
+            if self.current_index == Some(existing) {
+                return existing; // already playing; nothing to queue
+            }
+            // Target index after removal of `existing`.
+            let dest = if existing < insert_at { insert_at - 1 } else { insert_at };
+            self.move_item(existing, dest);
+            return dest;
+        }
+        self.items.insert(insert_at, PlaylistItem::new(path));
+        if let Some(c) = self.current_index {
+            if insert_at <= c {
+                self.current_index = Some(c + 1);
+            }
+        }
+        for v in self.shuffled_order.iter_mut() {
+            if *v >= insert_at {
+                *v += 1;
+            }
+        }
+        // New item plays right after the current one in shuffle order too.
+        let pos = (self.shuffled_pointer + 1).min(self.shuffled_order.len());
+        self.shuffled_order.insert(pos, insert_at);
+        insert_at
+    }
+
+    /// Multi-file "Play next": the batch plays right after the current track in the given order.
+    /// Returns the index of the first file of the batch.
+    pub fn play_next_many(&mut self, paths: Vec<PathBuf>) -> Option<usize> {
+        let mut first = None;
+        for p in paths.into_iter().rev() {
+            first = Some(self.play_next(p));
+        }
+        first
+    }
+
+    /// Adds newly appended tail indices to the shuffle permutation without disturbing its order.
+    fn append_shuffle_tail(&mut self) {
+        for i in self.shuffled_order.len()..self.items.len() {
+            self.shuffled_order.push(i);
+        }
+    }
+
+    /// Serialises the queue to autosave bytes: an `#EXTM3U` file whose entries are percent-encoded
+    /// `file://` URIs of the raw path bytes, so spaces, `#`, newlines and non-UTF-8 names survive.
+    /// A `#SYNCVERSE-CURRENT:<n>` line records the current index.
+    pub fn queue_to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"#EXTM3U\n#SYNCVERSE-QUEUE:1\n");
+        if let Some(c) = self.current_index {
+            out.extend_from_slice(format!("#SYNCVERSE-CURRENT:{c}\n").as_bytes());
+        }
+        for item in &self.items {
+            let title: String = item
+                .filename
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            out.extend_from_slice(format!("#EXTINF:-1,{title}\n").as_bytes());
+            out.extend_from_slice(b"file://");
+            out.extend_from_slice(percent_encode_path_bytes(&path_to_bytes(&item.path)).as_bytes());
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// Parses autosave bytes into a fresh manager. Never auto-plays: only `current_index` is set.
+    /// Entries whose files no longer exist are dropped. Any structural damage yields
+    /// [`QueueError::Corrupt`] and the caller keeps its existing queue.
+    pub fn queue_from_bytes(bytes: &[u8]) -> Result<PlaylistManager, QueueError> {
+        if bytes.contains(&0) || !bytes.starts_with(b"#EXTM3U") {
+            return Err(QueueError::Corrupt);
+        }
+        let mut mgr = PlaylistManager::new();
+        let mut want_current: Option<usize> = None;
+        let mut current_item_pos: Option<usize> = None;
+        let mut entries_seen = 0usize;
+        let mut saw_marker = false;
+        for raw in bytes.split(|b| *b == b'\n') {
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.is_empty() || line.starts_with(b"#EXTM3U") || line.starts_with(b"#EXTINF:") {
+                continue;
+            }
+            if line.starts_with(b"#SYNCVERSE-QUEUE:") {
+                saw_marker = true;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix(b"#SYNCVERSE-CURRENT:") {
+                want_current = std::str::from_utf8(rest).ok().and_then(|t| t.trim().parse().ok());
+                continue;
+            }
+            if line.starts_with(b"#") {
+                continue;
+            }
+            let Some(enc) = line.strip_prefix(b"file://") else {
+                return Err(QueueError::Corrupt);
+            };
+            let path = bytes_to_path(percent_decode_bytes(enc)?);
+            let entry_no = entries_seen;
+            entries_seen += 1;
+            if path.exists() {
+                if want_current == Some(entry_no) {
+                    current_item_pos = Some(mgr.items.len());
+                }
+                mgr.items.push(PlaylistItem::new(path));
+            }
+        }
+        if !saw_marker {
+            return Err(QueueError::Corrupt);
+        }
+        mgr.current_index = current_item_pos.filter(|i| *i < mgr.items.len());
+        mgr.rebuild_shuffle_order();
+        Ok(mgr)
+    }
+
+    /// Writes the queue autosave to `path` atomically (temp file in the same directory, fsync, rename).
+    pub fn save_queue(&self, path: &Path) -> Result<(), QueueError> {
+        atomic_write_bytes(path, &self.queue_to_bytes())
+    }
+
+    /// Restores the queue from `path` into `self` without starting playback.
+    ///
+    /// Returns the number of restored items. A missing file restores nothing (`Ok(0)`); a corrupt or
+    /// unreadable file is ignored and `self` is left untouched (`Err`).
+    pub fn restore_queue(&mut self, path: &Path) -> Result<usize, QueueError> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(QueueError::Io(e)),
+        };
+        let restored = Self::queue_from_bytes(&bytes)?;
+        let n = restored.items.len();
+        self.items = restored.items;
+        self.current_index = restored.current_index;
+        self.shuffled_order = restored.shuffled_order;
+        self.shuffled_pointer = restored.shuffled_pointer;
+        Ok(n)
     }
 
     /// Saves the current playlist queue to an M3U file at `path`.
@@ -459,6 +674,102 @@ impl PlaylistManager {
     }
 }
 
+/// Errors from queue autosave / restore.
+#[derive(thiserror::Error, Debug)]
+pub enum QueueError {
+    /// Filesystem failure.
+    #[error("queue file I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The file is not a valid Syncverse queue autosave and was ignored.
+    #[error("queue file is corrupt")]
+    Corrupt,
+}
+
+/// Default queue autosave location: `$XDG_STATE_HOME/syncverse/queue.m3u`
+/// (falling back to `~/.local/state/syncverse/queue.m3u`), or `None` without a home directory.
+pub fn default_queue_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
+        _ => PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?)
+            .join(".local")
+            .join("state"),
+    };
+    Some(base.join("syncverse").join("queue.m3u"))
+}
+
+#[cfg(unix)]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+#[cfg(not(unix))]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    p.to_string_lossy().into_owned().into_bytes()
+}
+#[cfg(unix)]
+fn bytes_to_path(b: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(b))
+}
+#[cfg(not(unix))]
+fn bytes_to_path(b: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Percent-encodes everything except unreserved characters and `/`.
+fn percent_encode_path_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len());
+    for &c in b {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~' | b'/') {
+            s.push(c as char);
+        } else {
+            s.push_str(&format!("%{c:02X}"));
+        }
+    }
+    s
+}
+
+/// Decodes `%XX` escapes to raw bytes; a malformed escape is corruption.
+fn percent_decode_bytes(b: &[u8]) -> Result<Vec<u8>, QueueError> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = b.get(i + 1..i + 3).ok_or(QueueError::Corrupt)?;
+            let v = std::str::from_utf8(hex)
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or(QueueError::Corrupt)?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Atomic file write: temp sibling + fsync + rename (parents created).
+///
+/// NOTE: replace the body with the userdata worker's atomic-write helper once it is on main.
+fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), QueueError> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".queue.m3u.tmp.{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// User interaction action emitted by the playlist queue dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaylistAction {
@@ -589,6 +900,7 @@ impl PlaylistDialog {
                         let mut move_up_idx = None;
                         let mut move_down_idx = None;
                         let mut remove_idx = None;
+                        let mut reorder: Option<(usize, usize)> = None;
 
                         for (idx, item) in manager.items.iter().enumerate() {
                             let is_current = manager.current_index == Some(idx);
@@ -603,7 +915,12 @@ impl PlaylistDialog {
                                     .color(Color32::WHITE)
                             };
 
-                            ui.horizontal(|ui| {
+                            let row = ui.horizontal(|ui| {
+                                ui.dnd_drag_source(ui.make_persistent_id(("queue_drag", idx)), idx, |ui| {
+                                    ui.label(RichText::new("⠿").color(Color32::from_rgb(156, 163, 175)));
+                                })
+                                .response
+                                .on_hover_text("Drag to reorder");
                                 let up_enabled = idx > 0;
                                 if ui.add_enabled(up_enabled, egui::Button::new("▲").small()).on_hover_text("Move track up").clicked() {
                                     move_up_idx = Some(idx);
@@ -627,6 +944,26 @@ impl PlaylistDialog {
                                     selected_to_play = Some(idx);
                                 }
                             });
+                            let drop_zone = ui.interact(
+                                row.response.rect,
+                                ui.make_persistent_id(("queue_drop", idx)),
+                                egui::Sense::hover(),
+                            );
+                            if let Some(from) = drop_zone.dnd_hover_payload::<usize>() {
+                                let y = if *from <= idx { drop_zone.rect.bottom() } else { drop_zone.rect.top() };
+                                ui.painter().hline(
+                                    drop_zone.rect.x_range(),
+                                    y,
+                                    egui::Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
+                                );
+                            }
+                            if let Some(from) = drop_zone.dnd_release_payload::<usize>() {
+                                reorder = Some((*from, idx));
+                            }
+                        }
+
+                        if let Some((from, to)) = reorder {
+                            manager.move_item(from, to);
                         }
 
                         if let Some(idx) = move_up_idx {

@@ -180,9 +180,70 @@ impl AbRepeatState {
     }
 }
 
+/// Role of the local peer with respect to a watch-party room (for A-B loop gating).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopRoomRole {
+    /// Not in a room.
+    Solo,
+    /// Hosting a room.
+    Host,
+    /// Connected to a host.
+    Client,
+}
+
+/// What the A-B loop is allowed to do in the current room role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbLoopPolicy {
+    /// Loop seeks are purely local.
+    Local,
+    /// Loop seeks become room-wide broadcast seeks (everyone loops with the host).
+    HostBroadcast,
+    /// Loop is suppressed: a client seek is forwarded to the host (`PeerControlAction::Seek`) and
+    /// would yank the whole room, while the PLL fights any purely local jump.
+    Disabled,
+}
+
+/// HUD text shown when a non-host tries to start or run an A-B loop inside a room.
+pub const AB_LOOP_CLIENT_DISABLED_HUD: &str = "A-B repeat is host-only while in a watch party";
+
+/// Decides the A-B loop policy for `role`.
+///
+/// Behaviour recorded from `playback_runtime.rs` (`PlayerCommand::Seek` arm): the loop seek is a
+/// normal `Seek`. As Host it calls `set_media_state` + `broadcast_room_state` (the whole room
+/// follows, so the loop works but re-broadcasts on every iteration); as Client it sends
+/// `PeerControlAction::Seek` to the host, so one viewer's loop would move everybody. Hence
+/// clients are gated.
+pub fn ab_loop_policy(role: LoopRoomRole) -> AbLoopPolicy {
+    match role {
+        LoopRoomRole::Solo => AbLoopPolicy::Local,
+        LoopRoomRole::Host => AbLoopPolicy::HostBroadcast,
+        LoopRoomRole::Client => AbLoopPolicy::Disabled,
+    }
+}
+
+impl AbRepeatState {
+    /// Role-aware loop evaluation: like [`AbRepeatState::evaluate_loop`] but returns `None`
+    /// whenever `role` is gated by [`ab_loop_policy`].
+    pub fn evaluate_loop_for_role(&self, current_pts_ms: u64, role: LoopRoomRole) -> Option<u64> {
+        if ab_loop_policy(role) == AbLoopPolicy::Disabled {
+            return None;
+        }
+        self.evaluate_loop(current_pts_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ab_loop_room_policy_decision() {
+        let a = AbRepeatState::Active { a_ms: 1000, b_ms: 2000 };
+        assert_eq!(a.evaluate_loop_for_role(2500, LoopRoomRole::Solo), Some(1000));
+        assert_eq!(a.evaluate_loop_for_role(2500, LoopRoomRole::Host), Some(1000));
+        assert_eq!(a.evaluate_loop_for_role(2500, LoopRoomRole::Client), None);
+        assert_eq!(ab_loop_policy(LoopRoomRole::Client), AbLoopPolicy::Disabled);
+    }
 
     #[test]
     fn test_ab_repeat_lifecycle_and_cycling() {
