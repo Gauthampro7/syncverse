@@ -290,3 +290,84 @@ fn wp4_in_party_suppresses_resume_offer() {
     handle.join().unwrap();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wp5_step_frame_uses_stream_fps_and_blocks_party_client() {
+    let base = std::env::temp_dir().join(format!("syncverse_core_wp5_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let clip = base.join("step_25fps.mp4");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=25",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&clip)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        eprintln!("SKIP: ffmpeg not available");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+
+    let (cmd_tx, cmd_rx) = channel::<PlayerCommand>();
+    let (audio_tx, _audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let worker_exchange = Arc::clone(&exchange);
+    let worker_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        run_playback_worker_with_dirs(
+            cmd_rx,
+            audio_tx,
+            event_tx,
+            worker_exchange,
+            video_ring,
+            clock,
+            worker_running,
+            None,
+        );
+    });
+
+    cmd_tx.send(PlayerCommand::OpenFile(clip)).unwrap();
+    let _ = drain_events_until(&event_rx, Duration::from_secs(3), |ev| {
+        matches!(ev, UiEvent::VideoMetadataDiscovered(_))
+    });
+    // Pause at 0 so we can step cleanly.
+    cmd_tx.send(PlayerCommand::TogglePause).unwrap();
+    cmd_tx.send(PlayerCommand::Seek(0)).unwrap();
+    thread::sleep(Duration::from_millis(80));
+
+    // 5 forward steps at 25fps => ~200ms (each frame = 40ms).
+    for _ in 0..5 {
+        cmd_tx.send(PlayerCommand::StepFrame { forward: true }).unwrap();
+        thread::sleep(Duration::from_millis(40));
+    }
+    let pos_ms = exchange.poll_latest_snapshot().media_position_pts / 1_000_000;
+    assert!(
+        (160..=240).contains(&pos_ms),
+        "expected 5 steps at 25fps to land near 200ms, got {pos_ms}ms"
+    );
+
+    running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}

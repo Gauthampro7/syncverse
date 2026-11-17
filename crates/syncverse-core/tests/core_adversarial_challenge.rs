@@ -255,10 +255,24 @@ fn test_watch_party_udp_corrupted_packet_injection() {
 
     for payload in &garbage_payloads {
         rogue_sender.send_to(payload, host_addr).expect("send garbage failed");
-        // Host must return strongly-typed SyncError or ignore, without panicking
+        // Host must tolerate undecodable/garbage datagrams as Ok(None) while recording decode error & drop count
         let result = host.poll_and_process();
-        assert!(result.is_err(), "Corrupted packet must be flagged with SyncError");
+        assert!(
+            matches!(result, Ok(None)),
+            "Corrupted packet must return Ok(None) without stalling drain, got {:?}",
+            result
+        );
+        assert!(
+            host.take_last_decode_error().is_some(),
+            "Corrupted packet must record last decode error"
+        );
     }
+    assert!(
+        host.dropped_datagrams() >= garbage_payloads.len() as u64,
+        "Expected dropped_datagrams >= {}, got {}",
+        garbage_payloads.len(),
+        host.dropped_datagrams()
+    );
 
     // Verify host and client remain fully operational after rogue attack
     let probe_id2 = client.send_ntp_probe().expect("second probe failed");

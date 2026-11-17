@@ -40,6 +40,9 @@ use syncverse_ui::{
 
 use crate::audio_sink::{create_default_audio_sink, AudioSink};
 use crate::error::CoreError;
+use crate::frame_step::{
+    plan_step_for_role, PtsHistory, StepError, StepPlan, StepRole, CLIENT_STEP_DISABLED_HUD,
+};
 use crate::resume::{FileMemory, ResumeDecision, ResumePolicy, ResumeTracker};
 use crate::subtitle_runtime::{
     build_embedded_subtitle_decoders, choose_initial_subtitle_track,
@@ -1349,6 +1352,7 @@ pub fn run_playback_worker_with_dirs(
     let mut current_file_key: Option<FileKey> = None;
     let mut pending_resume_pos_ms: Option<u64> = None;
     let mut current_aspect: String = "auto".to_string();
+    let mut pts_hist = PtsHistory::new();
     let mut local_ready: bool = false;
     let mut force_play: bool = false;
     let mut gate_blocked: bool = false;
@@ -1405,6 +1409,7 @@ pub fn run_playback_worker_with_dirs(
                             let in_party = !matches!(party_role, WatchPartyRole::None);
                             current_aspect = "auto".to_string();
                             pending_resume_pos_ms = None;
+                            pts_hist.clear();
 
                             let open_decision = if let Ok(key) = FileKey::from_path(&path) {
                                 current_file_key = Some(key);
@@ -1983,6 +1988,8 @@ pub fn run_playback_worker_with_dirs(
                         target_ms
                     };
                     let resume_now = Instant::now();
+                    pts_hist.clear();
+                    pts_hist.push(landed_pts);
 
                     match &mut party_role {
                         WatchPartyRole::Host { server, .. } => {
@@ -2313,6 +2320,8 @@ pub fn run_playback_worker_with_dirs(
                             };
 
                             let resume_now = Instant::now();
+                    pts_hist.clear();
+                    pts_hist.push(landed_pts);
                             match &mut party_role {
                                 WatchPartyRole::Host { server, .. } => {
                                     server.set_media_state(landed_pts, speed, !was_playing);
@@ -2843,30 +2852,55 @@ pub fn run_playback_worker_with_dirs(
                 }
                 PlayerCommand::StepFrame { forward } => {
                     let now = Instant::now();
-                    let current_pts = clock.current_pts(now).max(0.0) as u64;
-                    let step_ms = 42; // ~24fps single frame
-                    let target = if forward {
-                        current_pts.saturating_add(step_ms)
-                    } else {
-                        current_pts.saturating_sub(step_ms)
-                    };
-                    let was_playing = clock.is_playing();
                     if let Some(ref mut sess) = session {
-                        perform_session_seek(
-                            sess,
-                            target,
-                            was_playing,
-                            &clock,
-                            &video_ring,
-                            &mut overflow_frame,
-                            &audio_tx,
-                            &mut current_audio_generation,
-                            audio_delay_ms,
-                            subtitle_delay_ms,
-                            &event_tx,
-                        );
-                    } else {
-                        clock.seek_to(target as f64, now);
+                        let role = match &party_role {
+                            WatchPartyRole::Host { .. } => StepRole::Host,
+                            WatchPartyRole::Client { .. } => StepRole::Client,
+                            WatchPartyRole::None => StepRole::Solo,
+                        };
+                        let fps = sess.video_fps.unwrap_or(0.0);
+                        match plan_step_for_role(
+                            role,
+                            pts_hist.as_slice(),
+                            fps,
+                            forward,
+                            Some(sess.duration_ms),
+                        ) {
+                            Err(StepError::DisabledInPartyClient) => {
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: CLIENT_STEP_DISABLED_HUD.to_string(),
+                                    timestamp: now,
+                                });
+                            }
+                            Ok(StepPlan::NoOp) => {}
+                            Ok(StepPlan::PresentNextDecoded {
+                                fallback_target_ms: target_ms,
+                            })
+                            | Ok(StepPlan::SeekExact { target_ms }) => {
+                                let landed = perform_session_seek(
+                                    sess,
+                                    target_ms,
+                                    false,
+                                    &clock,
+                                    &video_ring,
+                                    &mut overflow_frame,
+                                    &audio_tx,
+                                    &mut current_audio_generation,
+                                    audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
+                                );
+                                pts_hist.push(landed);
+                                if let WatchPartyRole::Host { server, .. } = &mut party_role {
+                                    server.set_media_state(landed, speed, true);
+                                    let _ = server.broadcast_room_state();
+                                }
+                                let _ = event_tx.send(UiEvent::HudNotification {
+                                    text: format!("Frame @ {} ms", landed),
+                                    timestamp: Instant::now(),
+                                });
+                            }
+                        }
                     }
                 }
                 PlayerCommand::ToggleLoop => {
@@ -2966,7 +3000,9 @@ pub fn run_playback_worker_with_dirs(
 
                 // First push any pending overflow frame if ring has space
                 if let Some(frame) = overflow_frame.take() {
+                    let frame_pts_ms = frame.pts_ms;
                     if push_video_frame_stamped(frame, current_gen, &video_ring, &mut overflow_frame) {
+                        pts_hist.push(frame_pts_ms);
                         did_work = true;
                     }
                 }

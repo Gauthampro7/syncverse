@@ -97,3 +97,36 @@ fn settings_load_and_save_roundtrip_preserves_unknown_keys() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wp5_ab_loop_disabled_for_party_client() {
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, _command_rx) = channel::<PlayerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+
+    let mut app =
+        SyncverseApp::with_headless_subsystems(exchange, video_ring, clock, command_tx, event_rx);
+
+    // Simulate being a non-host client in a 2-member room.
+    event_tx
+        .send(UiEvent::RoomMembersUpdated(vec![
+            syncverse_ui::RoomMember::new("Host".to_string(), false, true, 10.0),
+            syncverse_ui::RoomMember::new("Client".to_string(), true, false, 15.0),
+        ]))
+        .unwrap();
+
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.render_ui(ui);
+    });
+    out.textures_delta.clear();
+
+    app.cycle_ab_repeat(5_000, Instant::now());
+    assert!(
+        !app.controls_state().ab_repeat.is_active(),
+        "A-B repeat must stay disabled for a party client"
+    );
+    assert!(app.controls_state().ab_repeat.point_a().is_none());
+}

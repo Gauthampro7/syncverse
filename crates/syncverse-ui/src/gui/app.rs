@@ -140,6 +140,8 @@ pub struct SyncverseApp {
     preferences_dialog: crate::gui::PreferencesDialog,
     resume_banner: Option<ResumeBannerState>,
     persist_user_settings: bool,
+    pending_queue_play_next: bool,
+    last_queue_sig: u64,
 }
 
 /// Backwards-compatible type alias for [`SyncverseApp`].
@@ -215,6 +217,8 @@ impl Default for SyncverseApp {
             preferences_dialog: crate::gui::PreferencesDialog::default(),
             resume_banner: None,
             persist_user_settings: false,
+            pending_queue_play_next: false,
+            last_queue_sig: 0,
         };
         app.controls_state
             .subtitle_dialog
@@ -330,6 +334,8 @@ impl SyncverseApp {
             preferences_dialog: crate::gui::PreferencesDialog::default(),
             resume_banner: None,
             persist_user_settings: true,
+            pending_queue_play_next: false,
+            last_queue_sig: 0,
         };
         app.controls_state
             .subtitle_dialog
@@ -337,6 +343,10 @@ impl SyncverseApp {
         if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
             app.load_settings_from_dirs(&dirs);
         }
+        if let Some(qpath) = crate::gui::playlist::default_queue_path() {
+            let _ = app.playlist_manager.restore_queue(&qpath);
+        }
+        app.last_queue_sig = app.playlist_manager.queue_signature();
 
         if let Some(path) = initial_file {
             app.load_file(path);
@@ -417,6 +427,8 @@ impl SyncverseApp {
             preferences_dialog: crate::gui::PreferencesDialog::default(),
             resume_banner: None,
             persist_user_settings: false,
+            pending_queue_play_next: false,
+            last_queue_sig: 0,
         };
         app.controls_state
             .subtitle_dialog
@@ -1172,7 +1184,30 @@ impl SyncverseApp {
     }
 
     /// Advances the A-B repeat playback looping state machine at current presentation timestamp.
+    fn loop_room_role(&self) -> crate::gui::ab_loop::LoopRoomRole {
+        if self.sidebar_state.members.len() <= 1 {
+            return crate::gui::ab_loop::LoopRoomRole::Solo;
+        }
+        if let Some(local) = self.sidebar_state.members.iter().find(|m| m.is_local) {
+            if local.is_host {
+                crate::gui::ab_loop::LoopRoomRole::Host
+            } else {
+                crate::gui::ab_loop::LoopRoomRole::Client
+            }
+        } else {
+            crate::gui::ab_loop::LoopRoomRole::Solo
+        }
+    }
+
+    /// Cycles the A-B repeat loop state (disabled when acting as a watch-party client).
     pub fn cycle_ab_repeat(&mut self, current_pts_ms: u64, now: Instant) {
+        let role = self.loop_room_role();
+        if crate::gui::ab_loop::ab_loop_policy(role) == crate::gui::ab_loop::AbLoopPolicy::Disabled
+        {
+            self.osd_overlay
+                .show_notification(crate::gui::ab_loop::AB_LOOP_CLIENT_DISABLED_HUD, now);
+            return;
+        }
         self.ab_repeat = self.ab_repeat.cycle(current_pts_ms);
         self.controls_state.ab_repeat = self.ab_repeat;
         self.osd_overlay.show_notification(self.ab_repeat.status_text(), now);
@@ -1605,7 +1640,8 @@ impl SyncverseApp {
         if self.ab_repeat.is_active() && snapshot.is_playing() {
             let current_ms = self.controls_state.effective_position_ms(snapshot.media_position_pts / 1_000_000, now);
             if self.controls_state.pending_seek_ms.is_none() {
-                if let Some(loop_target_ms) = self.ab_repeat.evaluate_loop(current_ms) {
+                let role = self.loop_room_role();
+                if let Some(loop_target_ms) = self.ab_repeat.evaluate_loop_for_role(current_ms, role) {
                     self.seek_to(loop_target_ms, now, None);
                 }
             }
@@ -2136,21 +2172,18 @@ impl SyncverseApp {
                     }
                 }
                 crate::gui::file_dialog::FileDialogPurpose::AddToPlaylist => {
-                    let had_items = !self.playlist_manager.items.is_empty();
                     let count = res.paths.len();
-                    for p in res.paths {
-                        self.playlist_manager.add_file(p);
-                    }
-                    if !had_items && self.current_file.is_none() {
-                        if let Some(first) = self.playlist_manager.select_index(0) {
-                            self.load_file(first);
-                        }
+                    let play_next = std::mem::take(&mut self.pending_queue_play_next);
+                    if play_next {
+                        self.playlist_manager.play_next_many(res.paths);
                     } else {
-                        self.osd_overlay.show_notification(
-                            format!("Playlist: Queued {} file(s)", count),
-                            now,
-                        );
+                        self.playlist_manager.add_to_queue(res.paths);
                     }
+                    let label = if play_next { "Play next" } else { "Queued" };
+                    self.osd_overlay.show_notification(
+                        format!("Playlist: {} {} file(s)", label, count),
+                        now,
+                    );
                 }
                 crate::gui::file_dialog::FileDialogPurpose::LoadM3u => {
                     if let Some(m3u_path) = res.paths.into_iter().next() {
@@ -2202,17 +2235,16 @@ impl SyncverseApp {
         }
 
         let dropped_actions = DragDropHandler::handle_dropped_files(&ctx);
-        let mut dropped_media = Vec::new();
-        for action in dropped_actions {
+        let shift_held = ctx.input(|i| i.modifiers.shift);
+        let media = DragDropHandler::dropped_media_paths(&dropped_actions);
+        for action in &dropped_actions {
             match action {
-                DroppedFileAction::OpenMedia(path) => {
-                    dropped_media.push(path);
-                }
+                DroppedFileAction::OpenMedia(_) => {}
                 DroppedFileAction::LoadSubtitle(path) => {
-                    self.load_external_subtitle_file(path, now);
+                    self.load_external_subtitle_file(path.clone(), now);
                 }
                 DroppedFileAction::LoadPlaylist(path) => {
-                    match self.playlist_manager.load_from_m3u(&path) {
+                    match self.playlist_manager.load_from_m3u(path) {
                         Ok(count) => {
                             self.osd_overlay.show_notification(
                                 format!("Playlist: Loaded {} tracks from {}", count, path.file_name().and_then(|f| f.to_str()).unwrap_or("M3U")),
@@ -2235,16 +2267,12 @@ impl SyncverseApp {
             }
         }
 
-        if !dropped_media.is_empty() {
-            if dropped_media.len() == 1 {
-                self.load_file(dropped_media.remove(0));
-            } else {
-                let count = dropped_media.len();
-                let had_items = !self.playlist_manager.items.is_empty();
-                for p in dropped_media {
-                    self.playlist_manager.add_file(p);
-                }
-                if !had_items && self.current_file.is_none() {
+        if !media.is_empty() {
+            if DragDropHandler::should_enqueue(&dropped_actions, shift_held) {
+                let count = media.len();
+                let had_file = self.current_file.is_some();
+                self.playlist_manager.add_to_queue(media);
+                if !had_file {
                     if let Some(first) = self.playlist_manager.select_index(0) {
                         self.load_file(first);
                     }
@@ -2254,6 +2282,8 @@ impl SyncverseApp {
                         now,
                     );
                 }
+            } else {
+                self.load_file(media.into_iter().next().unwrap());
             }
         }
 
@@ -2418,8 +2448,14 @@ impl SyncverseApp {
                             ui.close();
                             self.file_dialog.open_file_dialog();
                         }
-                        if ui.button("Add Files to Playlist... (Ctrl+Shift+O)").clicked() {
+                        if ui.button("Add to Queue... (Ctrl+Shift+O)").clicked() {
                             ui.close();
+                            self.pending_queue_play_next = false;
+                            self.file_dialog.open_add_to_playlist_dialog();
+                        }
+                        if ui.button("Play Next...").clicked() {
+                            ui.close();
+                            self.pending_queue_play_next = true;
                             self.file_dialog.open_add_to_playlist_dialog();
                         }
                         if ui.button("Load M3U Playlist...").clicked() {
@@ -3882,6 +3918,17 @@ impl SyncverseApp {
 
         // 14. Drag-hover visual overlay
         DragDropHandler::render_hover_overlay(&ctx);
+
+        // 15. Queue autosave on change
+        let sig = self.playlist_manager.queue_signature();
+        if sig != self.last_queue_sig {
+            self.last_queue_sig = sig;
+            if self.persist_user_settings {
+                if let Some(qpath) = crate::gui::playlist::default_queue_path() {
+                    let _ = self.playlist_manager.save_queue(&qpath);
+                }
+            }
+        }
     }
 }
 
@@ -3890,6 +3937,9 @@ impl Drop for SyncverseApp {
         if self.persist_user_settings {
             if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
                 self.save_settings_to_dirs(&dirs);
+            }
+            if let Some(qpath) = crate::gui::playlist::default_queue_path() {
+                let _ = self.playlist_manager.save_queue(&qpath);
             }
         }
     }
