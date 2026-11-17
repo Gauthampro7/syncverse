@@ -874,7 +874,7 @@ fn http_request(
         .map_err(io_err("setting router timeouts"))?;
 
     let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Syncverse/0.4.0\r\n");
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Syncverse/0.5.0\r\n");
     if let Some(b) = body {
         req.push_str(&format!(
             "Content-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\n",

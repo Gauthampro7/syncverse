@@ -135,13 +135,18 @@ impl RoomAnnouncement {
 ---
 
 ## Code Layout
-- `crates/syncverse-sync/src/wire.rs`: Wire packet definitions, `PeerStatusPayload`, (de)serialization.
-- `crates/syncverse-sync/src/transport.rs`: `ClientSession` state, `HostServer` and `ClientNode` peer status handling.
-- `crates/syncverse-sync/tests/`: Integration tests, updated negative opcode assertions.
+- `crates/syncverse-common/src/userdata.rs`: XDG/Windows user directories (`settings.conf`, `resume.tsv`, `queue.m3u`), atomic file writes, settings store, and resume store.
+- `crates/syncverse-codecs/src/hwaccel.rs` & `universal_video.rs`: Opt-in VA-API hardware decode (`off`/`auto`/`vaapi`) with CPU readback and software fallback.
+- `crates/syncverse-sync/src/stun.rs` & `nat.rs`: Opt-in RFC 8489 STUN discovery, `NatMux` socket multiplexer, UDP hole punching, and NAT-PMP/UPnP support.
+- `crates/syncverse-sync/src/wire.rs`: Wire packet definitions (`PeerStatusPayload` `0x09`, `Hello`/`HelloAck`/`Bye`/`Heartbeat` `0x10`–`0x13`), (de)serialization.
+- `crates/syncverse-sync/src/transport.rs`: `ClientSession` state, `HostServer` and `ClientNode` peer status, datagram interceptor, and room resilience.
+- `crates/syncverse-sync/tests/`: Integration tests, STUN/NAT loopback, fake IGD UPnP/NAT-PMP, and room resilience tests.
 - `crates/syncverse-ui/src/gui/updater.rs`: Asynchronous GitHub releases checker, semver comparison, browser launcher.
-- `crates/syncverse-ui/src/gui/sidebar.rs`: Room members rendering, media info, match badges, readiness checkbox.
-- `crates/syncverse-ui/src/gui/app.rs`: Top update banner, Help menu item, event draining.
+- `crates/syncverse-ui/src/gui/sidebar.rs`: Room members rendering, media info, match badges, readiness checkbox, connection state badge.
+- `crates/syncverse-ui/src/gui/playlist.rs`: Drag-reorder queue UI, "Add to queue" / "Play next", percent-encoded M3U queue persistence.
+- `crates/syncverse-ui/src/gui/app.rs`: Top update & resume banners, Preferences dialog, NAT/host/connect dialogs, event draining.
 - `crates/syncverse-ui/src/snapshot.rs`: 72-byte `PlayerUiSnapshot` layout and bitflag helpers.
 - `crates/syncverse-chat/src/announcements.rs`: Standardized announcement formatting.
-- `crates/syncverse-core/src/playback_runtime.rs`: Unpause gate logic, force play bypass, room event hooks.
+- `crates/syncverse-core/src/resume.rs` & `frame_step.rs`: Resume-last-position / per-file memory tracker and role-aware frame-stepping planner.
+- `crates/syncverse-core/src/playback_runtime.rs`: Unpause gate logic, force play bypass, hwdec selection, frame stepping, NAT wiring, and room event hooks.
 - `tests/e2e_phase5/`: Tier tests. Many of them check the contract models defined inside the test files (`contract_models.rs`), not only the product code, so a pass here does not by itself prove the product behaves that way. See `tests/e2e_phase5/README.md`.

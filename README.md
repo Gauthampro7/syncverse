@@ -32,6 +32,11 @@ syncverse
 syncverse play ~/Videos/movie.mkv
 # Supports .mkv, .mp4, .webm, .avi, .mov, .ts, etc.
 
+# Enable VA-API hardware video decoding on Linux (opt-in; default is off):
+syncverse play ~/Videos/movie.mkv --hwdec=auto
+# Or force VA-API / disable explicitly: --hwdec=vaapi | --hwdec=off
+# Environment overrides: SYNCVERSE_HWDEC=auto|vaapi|off and SYNCVERSE_HWDEC_DEVICE=/dev/dri/renderD128
+
 # Open in terminal presentation mode (TUI):
 syncverse play ~/Videos/movie.mkv --terminal
 ```
@@ -47,7 +52,7 @@ syncverse play ~/Videos/movie.mkv --terminal
 | **Seek** | Drag or click seekbar | <kbd>←</kbd> / <kbd>→</kbd> (5 s); <kbd>Shift</kbd> (30 s); <kbd>Ctrl</kbd> (60 s); <kbd>Alt</kbd> (5 min) |
 | **Jump to start / end** | — | <kbd>Home</kbd> / <kbd>End</kbd> (End goes to 1 s before the end) |
 | **Jump to a given time** | — | <kbd>Ctrl</kbd> + <kbd>T</kbd> |
-| **Step one frame forward / back** | — | <kbd>.</kbd> / <kbd>,</kbd> (pauses playback if it is running) |
+| **Step one frame forward / back** | — | <kbd>.</kbd> / <kbd>,</kbd> (pauses playback; solo and host only, disabled for watch-party clients) |
 | **Previous / next chapter** | — | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> |
 | **Previous / next file in queue or folder** | — | <kbd>P</kbd> / <kbd>N</kbd> |
 | **Volume** | Drag volume slider or scroll wheel over the video (5% per step) | <kbd>↑</kbd> / <kbd>↓</kbd> (5%); <kbd>Ctrl</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd> (1%). Maximum is 200% |
@@ -59,7 +64,7 @@ syncverse play ~/Videos/movie.mkv --terminal
 | **Subtitle delay** | Subtitle dialog | <kbd>G</kbd> (−50 ms) / <kbd>H</kbd> (+50 ms); <kbd>Shift</kbd> + <kbd>G</kbd> resets to 0 |
 | **Cycle aspect ratio** | Video dialog | <kbd>A</kbd> |
 | **Cycle zoom mode / reset to Fit** | Video dialog | <kbd>Z</kbd> / <kbd>Shift</kbd> + <kbd>Z</kbd> |
-| **A-B repeat** | A-B button | <kbd>R</kbd> or <kbd>Shift</kbd> + <kbd>L</kbd> cycles (set A, set B, off); <kbd>Shift</kbd> + <kbd>R</kbd> clears; <kbd>Alt</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point A by 100 ms; <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point B |
+| **A-B repeat** | A-B button | <kbd>R</kbd> or <kbd>Shift</kbd> + <kbd>L</kbd> cycles (set A, set B, off); <kbd>Shift</kbd> + <kbd>R</kbd> clears; <kbd>Alt</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point A by 100 ms; <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point B (solo and host only) |
 | **Loop current file** | — | <kbd>L</kbd> |
 | **Fullscreen Toggle** | Double-click viewport | <kbd>F</kbd>, <kbd>F11</kbd> or <kbd>Alt</kbd> + <kbd>Enter</kbd>; <kbd>Esc</kbd> leaves fullscreen |
 | **Open File Dialog** | `File -> Open File` | <kbd>Ctrl</kbd> + <kbd>O</kbd> |
@@ -102,6 +107,34 @@ In the sidebar and OSD status bar, a real-time badge reports sync health:
 - 🟢 **`● SYNCED`** (Green): Phase error $< 15\text{ms}$. Playback is in the deadband; speed multiplier is exactly $1.000\times$.
 - 🟡 **`● DRIFT`** (Amber): Phase error between $15\text{ms}$ and $1500\text{ms}$. PI PLL micro-speed steering is actively nudging playback speed ($0.96\times \dots 1.04\times$) smoothly without pitch changes or stutter.
 - 🔴 **`● SEEK`** (Red): Phase error $> 1500\text{ms}$. Automatic hard seek triggered to re-align immediately with the room reference timeline.
+
+### NAT Traversal & Room Resilience
+Syncverse runs watch parties directly peer-to-peer over UDP without a central relay server:
+1. **UPnP / NAT-PMP Port Mapping**: When hosting a room, Syncverse can ask your router via UPnP IGD or NAT-PMP to forward the room UDP port automatically. If your router does not support UPnP/NAT-PMP, forward the UDP port manually on your router.
+2. **STUN Public Address Discovery (Opt-in)**: In the Host/Connect dialogs, click **Detect public address** to query STUN (`stun.l.google.com:19302` and `stun.cloudflare.com:3478`). No third-party STUN server is contacted unless you click that button. It reports your public `ip:port` and NAT type (`Open`, `EndpointIndependent`, or `Symmetric`).
+3. **UDP Hole Punching**: When both peers share their public `ip:port`, either side can trigger a punch packet on the same room UDP socket to open the NAT mapping so normal watch-party traffic flows through.
+4. **Symmetric NAT Limitation**: If **both** the host and the client sit behind Symmetric NAT (or carrier-grade NAT that randomises ports per destination), direct UDP hole punching cannot succeed without a relay server, and Syncverse does not ship a relay. In that case, use manual port forwarding on at least one side or a VPN/overlay network.
+5. **Room Resilience**: Connections use an explicit `Hello` / `HelloAck` handshake, periodic heartbeats, host-loss detection, automatic reconnect with backoff, and clean `Bye` on exit. The sidebar shows live connection status (`Connecting`, `Connected`, `Reconnecting`, `Failed`, `Closed`).
+
+---
+
+## ⚙️ Hardware Decoding, Resume & Config Paths
+
+### VA-API Hardware Video Decoding (Linux, Opt-in)
+- Pass `--hwdec=auto` or `--hwdec=vaapi` (or set `SYNCVERSE_HWDEC`, or change it in Preferences). Default is `off` (software decode).
+- If VA-API initialisation fails or the codec/profile is unsupported, Syncverse falls back to software decoding and shows an OSD notice.
+- **Architecture note**: This is **hardware decode with CPU readback** (frames are downloaded from the VA surface and converted to RGBA on the CPU), not GPU zero-copy rendering.
+- **Fedora Linux note**: VA-API requires a working driver for your GPU (for example, `intel-media-driver` on newer Intel GPUs; AMD and Intel H.264/HEVC VA-API support on Fedora may require RPM Fusion `*-freeworld` Mesa/VA packages).
+
+### Resume, Per-File Memory & Queue Persistence
+- **Resume Last Position**: Controlled by `resume_policy` (`ask`, `always`, `never` — default `ask`). When reopening a file past the start and before the end, an 8-second banner lets you resume or start from 0. In a watch-party room, local resume is suppressed so the room timeline stays in control.
+- **Per-File Track & Delay Memory**: When enabled (`remember_per_file`), Syncverse remembers your chosen audio track, subtitle track, audio/subtitle delays, and aspect ratio per file.
+- **Queue Autosave**: Your playlist queue is saved automatically on changes and on exit, and restored on startup (without auto-playing). You can drag-reorder items in the queue dialog and use **Add to queue** or **Play next** without interrupting the current video.
+
+### Config & State File Locations
+- **Settings**: `$XDG_CONFIG_HOME/syncverse/settings.conf` (fallback `~/.config/syncverse/settings.conf`; `%APPDATA%\syncverse\settings.conf` on Windows)
+- **Resume & Per-File State**: `$XDG_STATE_HOME/syncverse/resume.tsv` (fallback `~/.local/state/syncverse/resume.tsv`)
+- **Saved Queue**: `$XDG_STATE_HOME/syncverse/queue.m3u` (fallback `~/.local/state/syncverse/queue.m3u`)
 
 ---
 
