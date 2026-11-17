@@ -47,7 +47,21 @@ pub enum PacketType {
     Reaction = 0x0A,
     /// 0x0D: Bidirectional Peer Playback Control / Sync Snapshot Request (17 bytes big-endian)
     PeerControl = 0x0D,
+    /// 0x10: Join handshake request (`version`, `nonce`, `requested_client_id`, `username`)
+    Hello = 0x10,
+    /// 0x11: Join handshake reply (`version`, `nonce`, `status`, `client_id`, `host_epoch`)
+    HelloAck = 0x11,
+    /// 0x12: Explicit session termination (`reason`, `client_id`)
+    Bye = 0x12,
+    /// 0x13: Liveness heartbeat / echo (`seq`, `is_reply`)
+    Heartbeat = 0x13,
 }
+
+/// Wire protocol version spoken by this build (carried inside `Hello` / `HelloAck`).
+///
+/// Version `0` is the implicit v0.4 protocol that has no handshake at all; version `1`
+/// introduces `Hello`/`HelloAck`/`Bye`/`Heartbeat`.
+pub const PROTOCOL_VERSION: u8 = 1;
 
 impl TryFrom<u8> for PacketType {
     type Error = SyncError;
@@ -64,6 +78,10 @@ impl TryFrom<u8> for PacketType {
             0x09 => Ok(Self::PeerStatus),
             0x0A => Ok(Self::Reaction),
             0x0D => Ok(Self::PeerControl),
+            0x10 => Ok(Self::Hello),
+            0x11 => Ok(Self::HelloAck),
+            0x12 => Ok(Self::Bye),
+            0x13 => Ok(Self::Heartbeat),
             other => Err(SyncError::UnknownPacketType(other)),
         }
     }
@@ -101,6 +119,114 @@ impl TryFrom<u8> for PeerControlAction {
             ))),
         }
     }
+}
+
+/// Outcome carried by a `HelloAck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HelloStatus {
+    /// The join was accepted; `client_id` is valid.
+    Accepted = 0,
+    /// The datagram failed encryption/authentication validation (wrong room password).
+    AuthFailed = 1,
+    /// The host refuses further peers.
+    HostFull = 2,
+    /// The host does not speak a compatible protocol version.
+    VersionUnsupported = 3,
+}
+
+impl TryFrom<u8> for HelloStatus {
+    type Error = SyncError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(Self::Accepted),
+            1 => Ok(Self::AuthFailed),
+            2 => Ok(Self::HostFull),
+            3 => Ok(Self::VersionUnsupported),
+            value => Err(SyncError::UnknownEnumValue {
+                field: "HelloStatus",
+                value,
+            }),
+        }
+    }
+}
+
+/// Reason carried by a `Bye`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ByeReason {
+    /// The sender left voluntarily.
+    Leave = 0,
+    /// The host closed the room.
+    HostClosed = 1,
+    /// The host does not know this peer (restart or prune); the peer should rejoin.
+    NotJoined = 2,
+    /// The host dropped the peer after prolonged silence.
+    Timeout = 3,
+}
+
+impl TryFrom<u8> for ByeReason {
+    type Error = SyncError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(Self::Leave),
+            1 => Ok(Self::HostClosed),
+            2 => Ok(Self::NotJoined),
+            3 => Ok(Self::Timeout),
+            value => Err(SyncError::UnknownEnumValue {
+                field: "ByeReason",
+                value,
+            }),
+        }
+    }
+}
+
+/// Payload for `0x10` Hello: `[version:1][nonce:4][requested_client_id:4][username_len:2][username]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloPayload {
+    /// Protocol version the sender speaks ([`PROTOCOL_VERSION`]).
+    pub version: u8,
+    /// Random join attempt identifier echoed in the `HelloAck`.
+    pub nonce: u32,
+    /// Previously assigned client id to resume (`0` = none).
+    pub requested_client_id: u32,
+    /// Display name of the joining peer.
+    pub username: String,
+}
+
+/// Payload for `0x11` HelloAck: `[version:1][nonce:4][status:1][client_id:4][host_epoch:4]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloAckPayload {
+    /// Protocol version the host speaks.
+    pub version: u8,
+    /// Echo of the `Hello` nonce.
+    pub nonce: u32,
+    /// Join outcome.
+    pub status: HelloStatus,
+    /// Client id assigned by the host (valid when `status == Accepted`).
+    pub client_id: u32,
+    /// Random identifier of this host run; changes whenever the host restarts.
+    pub host_epoch: u32,
+}
+
+/// Payload for `0x12` Bye: `[reason:1][client_id:4]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByePayload {
+    /// Why the session ended.
+    pub reason: ByeReason,
+    /// Client id the message concerns (`0` if unknown).
+    pub client_id: u32,
+}
+
+/// Payload for `0x13` Heartbeat: `[seq:4][is_reply:1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatPayload {
+    /// Sender-chosen sequence number, echoed in replies.
+    pub seq: u32,
+    /// `true` when this heartbeat answers a received one (never answered again).
+    pub is_reply: bool,
 }
 
 /// Payload for `0x0D` Bidirectional Peer Playback Control (17 bytes, big-endian).
@@ -348,6 +474,14 @@ pub enum PacketPayload {
     Reaction(ReactionPayload),
     /// Bidirectional Peer Control
     PeerControl(PeerControlPayload),
+    /// Join handshake request
+    Hello(HelloPayload),
+    /// Join handshake reply
+    HelloAck(HelloAckPayload),
+    /// Explicit session termination
+    Bye(ByePayload),
+    /// Liveness heartbeat
+    Heartbeat(HeartbeatPayload),
 }
 
 impl PacketPayload {
@@ -447,6 +581,38 @@ impl PacketPayload {
                 buf.extend_from_slice(&p.rate_q16.to_be_bytes());
                 buf
             }
+            Self::Hello(p) => {
+                let name = p.username.as_bytes();
+                let name_len = name.len().min(256);
+                let mut buf = Vec::with_capacity(11 + name_len);
+                buf.push(p.version);
+                buf.extend_from_slice(&p.nonce.to_le_bytes());
+                buf.extend_from_slice(&p.requested_client_id.to_le_bytes());
+                buf.extend_from_slice(&(name_len as u16).to_le_bytes());
+                buf.extend_from_slice(&name[..name_len]);
+                buf
+            }
+            Self::HelloAck(p) => {
+                let mut buf = Vec::with_capacity(14);
+                buf.push(p.version);
+                buf.extend_from_slice(&p.nonce.to_le_bytes());
+                buf.push(p.status as u8);
+                buf.extend_from_slice(&p.client_id.to_le_bytes());
+                buf.extend_from_slice(&p.host_epoch.to_le_bytes());
+                buf
+            }
+            Self::Bye(p) => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(p.reason as u8);
+                buf.extend_from_slice(&p.client_id.to_le_bytes());
+                buf
+            }
+            Self::Heartbeat(p) => {
+                let mut buf = Vec::with_capacity(5);
+                buf.extend_from_slice(&p.seq.to_le_bytes());
+                buf.push(u8::from(p.is_reply));
+                buf
+            }
         }
     }
 
@@ -463,6 +629,10 @@ impl PacketPayload {
             Self::PeerStatus(_) => PacketType::PeerStatus,
             Self::Reaction(_) => PacketType::Reaction,
             Self::PeerControl(_) => PacketType::PeerControl,
+            Self::Hello(_) => PacketType::Hello,
+            Self::HelloAck(_) => PacketType::HelloAck,
+            Self::Bye(_) => PacketType::Bye,
+            Self::Heartbeat(_) => PacketType::Heartbeat,
         }
     }
 }
@@ -694,6 +864,59 @@ impl WirePacket {
                 rate_q16,
             }),
         }
+    }
+
+    /// Wraps a typed payload in a packet with no flags set.
+    fn plain(payload: PacketPayload) -> Self {
+        Self {
+            packet_type: payload.packet_type(),
+            flags: FLAG_NONE,
+            payload,
+        }
+    }
+
+    /// Constructs a join handshake request (`0x10`).
+    pub fn hello(
+        nonce: u32,
+        requested_client_id: u32,
+        username: impl Into<String>,
+    ) -> Self {
+        Self::plain(PacketPayload::Hello(HelloPayload {
+            version: PROTOCOL_VERSION,
+            nonce,
+            requested_client_id,
+            username: username.into(),
+        }))
+    }
+
+    /// Constructs a join handshake reply (`0x11`).
+    pub fn hello_ack(nonce: u32, status: HelloStatus, client_id: u32, host_epoch: u32) -> Self {
+        Self::plain(PacketPayload::HelloAck(HelloAckPayload {
+            version: PROTOCOL_VERSION,
+            nonce,
+            status,
+            client_id,
+            host_epoch,
+        }))
+    }
+
+    /// Constructs a session termination notice (`0x12`).
+    pub fn bye(reason: ByeReason, client_id: u32) -> Self {
+        Self::plain(PacketPayload::Bye(ByePayload { reason, client_id }))
+    }
+
+    /// Constructs a liveness heartbeat (`0x13`).
+    pub fn heartbeat(seq: u32, is_reply: bool) -> Self {
+        Self::plain(PacketPayload::Heartbeat(HeartbeatPayload { seq, is_reply }))
+    }
+
+    /// Returns `true` for a `HelloAck` whose status is a refusal.
+    ///
+    /// Such packets are the only plaintext datagrams an encrypted client accepts, since a
+    /// host that cannot authenticate a `Hello` has no shared key to answer with.
+    pub fn is_hello_rejection(&self) -> bool {
+        matches!(&self.payload, PacketPayload::HelloAck(a) if a.status != HelloStatus::Accepted)
+            && (self.flags & FLAG_ENCRYPTED) == 0
     }
 
     /// Serializes this packet into a binary byte vector with header framing and CRC32.
@@ -1117,6 +1340,75 @@ impl PacketPayload {
                     action,
                     media_pts_ms,
                     rate_q16,
+                })
+            }
+            PacketType::Hello => {
+                if payload_slice.len() < 11 {
+                    return Err(SyncError::PayloadTruncated {
+                        expected: 11,
+                        actual: payload_slice.len(),
+                    });
+                }
+                let name_len =
+                    u16::from_le_bytes(payload_slice[9..11].try_into().unwrap()) as usize;
+                if payload_slice.len() != 11 + name_len {
+                    return Err(SyncError::PayloadTruncated {
+                        expected: 11 + name_len,
+                        actual: payload_slice.len(),
+                    });
+                }
+                let username = std::str::from_utf8(&payload_slice[11..])
+                    .map_err(|e| SyncError::InvalidUtf8 {
+                        field: "Hello.username",
+                        valid_up_to: e.valid_up_to(),
+                    })?
+                    .to_string();
+                PacketPayload::Hello(HelloPayload {
+                    version: payload_slice[0],
+                    nonce: u32::from_le_bytes(payload_slice[1..5].try_into().unwrap()),
+                    requested_client_id: u32::from_le_bytes(
+                        payload_slice[5..9].try_into().unwrap(),
+                    ),
+                    username,
+                })
+            }
+            PacketType::HelloAck => {
+                if payload_slice.len() != 14 {
+                    return Err(SyncError::PayloadTruncated {
+                        expected: 14,
+                        actual: payload_slice.len(),
+                    });
+                }
+                PacketPayload::HelloAck(HelloAckPayload {
+                    version: payload_slice[0],
+                    nonce: u32::from_le_bytes(payload_slice[1..5].try_into().unwrap()),
+                    status: HelloStatus::try_from(payload_slice[5])?,
+                    client_id: u32::from_le_bytes(payload_slice[6..10].try_into().unwrap()),
+                    host_epoch: u32::from_le_bytes(payload_slice[10..14].try_into().unwrap()),
+                })
+            }
+            PacketType::Bye => {
+                if payload_slice.len() != 5 {
+                    return Err(SyncError::PayloadTruncated {
+                        expected: 5,
+                        actual: payload_slice.len(),
+                    });
+                }
+                PacketPayload::Bye(ByePayload {
+                    reason: ByeReason::try_from(payload_slice[0])?,
+                    client_id: u32::from_le_bytes(payload_slice[1..5].try_into().unwrap()),
+                })
+            }
+            PacketType::Heartbeat => {
+                if payload_slice.len() != 5 {
+                    return Err(SyncError::PayloadTruncated {
+                        expected: 5,
+                        actual: payload_slice.len(),
+                    });
+                }
+                PacketPayload::Heartbeat(HeartbeatPayload {
+                    seq: u32::from_le_bytes(payload_slice[0..4].try_into().unwrap()),
+                    is_reply: payload_slice[4] != 0,
                 })
             }
         };

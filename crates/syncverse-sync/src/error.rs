@@ -55,6 +55,24 @@ pub enum SyncError {
     #[error("malformed packet payload: {0}")]
     MalformedPayload(String),
 
+    /// An enumerated wire field carried a value outside its defined range.
+    #[error("unknown value {value} for wire field {field}")]
+    UnknownEnumValue {
+        /// Name of the offending field.
+        field: &'static str,
+        /// Raw value found on the wire.
+        value: u8,
+    },
+
+    /// A wire string field was not valid UTF-8.
+    #[error("invalid UTF-8 in wire field {field} after {valid_up_to} valid bytes")]
+    InvalidUtf8 {
+        /// Name of the offending field.
+        field: &'static str,
+        /// Length of the valid UTF-8 prefix.
+        valid_up_to: usize,
+    },
+
     /// Underlying socket or I/O error.
     #[error("network I/O error: {0}")]
     Io(String),

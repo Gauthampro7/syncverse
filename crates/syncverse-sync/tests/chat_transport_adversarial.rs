@@ -262,6 +262,20 @@ fn test_concurrent_chat_flooding_high_throughput_and_anti_echo() {
     }
 }
 
+/// Polls the host once; an undecodable datagram is skipped by the transport and surfaces
+/// here as its typed decode error (diagnostics only; the host keeps draining).
+fn poll_err(
+    host: &mut HostServer,
+) -> Result<Option<(syncverse_sync::WirePacket, std::net::SocketAddr)>, SyncError> {
+    match host.poll_and_process()? {
+        Some(v) => Ok(Some(v)),
+        None => match host.take_last_decode_error() {
+            Some(e) => Err(e),
+            None => Ok(None),
+        },
+    }
+}
+
 /// Corrupted datagram fuzzing and resilience test.
 ///
 /// Sends corrupted headers, unknown opcodes, truncated payloads, bit-flipped CRC32,
@@ -277,7 +291,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
     let mut client = ClientNode::bind("127.0.0.1:0", host_addr, 99).expect("client bind");
     let _ = client.send_ntp_probe().expect("probe");
     for _ in 0..10 {
-        let _ = host.poll_and_process();
+        let _ = poll_err(&mut host);
         let _ = client.poll_and_process();
         thread::sleep(Duration::from_millis(1));
     }
@@ -290,7 +304,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
     for len in 0..12 {
         raw_sock.send_to(&valid_bytes[..len], host_addr).unwrap();
         thread::sleep(Duration::from_millis(1));
-        let res = host.poll_and_process();
+        let res = poll_err(&mut host);
         assert!(
             matches!(res, Err(SyncError::PacketTooShort(_))),
             "Header len {} must yield PacketTooShort, got {:?}",
@@ -305,7 +319,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
         pkt[4] = bad_op;
         raw_sock.send_to(&pkt, host_addr).unwrap();
         thread::sleep(Duration::from_millis(1));
-        let res = host.poll_and_process();
+        let res = poll_err(&mut host);
         assert!(
             matches!(res, Err(SyncError::UnknownPacketType(op)) if op == bad_op),
             "Bad opcode 0x{:02X} must yield UnknownPacketType, got {:?}",
@@ -320,7 +334,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
     truncated_buf.truncate(valid_bytes.len() - 5);
     raw_sock.send_to(&truncated_buf, host_addr).unwrap();
     thread::sleep(Duration::from_millis(1));
-    let res = host.poll_and_process();
+    let res = poll_err(&mut host);
     assert!(
         matches!(res, Err(SyncError::PayloadTruncated { .. })),
         "Truncated payload buffer must yield PayloadTruncated, got {:?}",
@@ -341,7 +355,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
 
         raw_sock.send_to(&malformed_chat, host_addr).unwrap();
         thread::sleep(Duration::from_millis(1));
-        let res = host.poll_and_process();
+        let res = poll_err(&mut host);
         assert!(
             matches!(res, Err(SyncError::MalformedPayload(_))),
             "Sub-20B chat payload length {} must yield MalformedPayload, got {:?}",
@@ -356,7 +370,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
     bad_crc_pkt[8] ^= 0x55;
     raw_sock.send_to(&bad_crc_pkt, host_addr).unwrap();
     thread::sleep(Duration::from_millis(1));
-    let res = host.poll_and_process();
+    let res = poll_err(&mut host);
     assert!(
         matches!(res, Err(SyncError::CrcMismatch { .. })),
         "Tampered CRC field must yield CrcMismatch, got {:?}",
@@ -369,7 +383,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
         flipped_payload[byte_offset] ^= 0x01;
         raw_sock.send_to(&flipped_payload, host_addr).unwrap();
         thread::sleep(Duration::from_millis(1));
-        let res = host.poll_and_process();
+        let res = poll_err(&mut host);
         assert!(
             matches!(res, Err(SyncError::CrcMismatch { .. })),
             "Bit flip at offset {} must yield CrcMismatch, got {:?}",
@@ -386,7 +400,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
     oversized_hdr.extend_from_slice(&[0x42; 88]); // 100 bytes total
     raw_sock.send_to(&oversized_hdr, host_addr).unwrap();
     thread::sleep(Duration::from_millis(1));
-    let res = host.poll_and_process();
+    let res = poll_err(&mut host);
     assert!(
         matches!(res, Err(SyncError::PayloadTruncated { .. })),
         "Oversized declared length must yield PayloadTruncated, got {:?}",
@@ -408,7 +422,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
         thread::sleep(Duration::from_micros(200));
 
         // Poll host: must never panic or crash
-        let _ = host.poll_and_process();
+        let _ = poll_err(&mut host);
     }
 
     // --- CRITICAL LIVENESS RECOVERY VERIFICATION ---
@@ -420,7 +434,7 @@ fn test_corrupted_datagram_fuzzing_and_host_recovery() {
 
     let mut liveness_received = false;
     for _ in 0..30 {
-        if let Ok(Some((pkt, _))) = host.poll_and_process() {
+        if let Ok(Some((pkt, _))) = poll_err(&mut host) {
             if matches!(pkt.payload, PacketPayload::ChatMessage(_)) {
                 liveness_received = true;
                 break;
@@ -457,7 +471,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     let _ = client2.send_ntp_probe().unwrap();
 
     for _ in 0..10 {
-        let _ = host.poll_and_process();
+        let _ = poll_err(&mut host);
         let _ = client1.poll_and_process();
         let _ = client2.poll_and_process();
         thread::sleep(Duration::from_millis(1));
@@ -471,7 +485,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     }
 
     for _ in 0..15 {
-        while let Ok(Some(_)) = host.poll_and_process() {}
+        while let Ok(Some(_)) = poll_err(&mut host) {}
         while let Ok(Some(_)) = client1.poll_and_process() {}
         while let Ok(Some(_)) = client2.poll_and_process() {}
         thread::sleep(Duration::from_millis(1));
@@ -485,7 +499,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     let _ = client3.send_ntp_probe().unwrap();
 
     for _ in 0..10 {
-        let _ = host.poll_and_process();
+        let _ = poll_err(&mut host);
         let _ = client3.poll_and_process();
         thread::sleep(Duration::from_millis(1));
     }
@@ -496,7 +510,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     client3.send_chat_message(&c3_msg).unwrap();
 
     for _ in 0..15 {
-        while let Ok(Some(_)) = host.poll_and_process() {}
+        while let Ok(Some(_)) = poll_err(&mut host) {}
         while let Ok(Some(_)) = client1.poll_and_process() {}
         while let Ok(Some(_)) = client2.poll_and_process() {}
         while let Ok(Some(_)) = client3.poll_and_process() {}
@@ -518,7 +532,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
 
     // Host relays to C3 and attempts relay to C2's defunct socket; must not fail or panic
     for _ in 0..20 {
-        while let Ok(Some(_)) = host.poll_and_process() {}
+        while let Ok(Some(_)) = poll_err(&mut host) {}
         while let Ok(Some(_)) = client1.poll_and_process() {}
         while let Ok(Some(_)) = client3.poll_and_process() {}
         thread::sleep(Duration::from_millis(1));
@@ -537,7 +551,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     let _ = client4.send_ntp_probe().unwrap();
 
     for _ in 0..10 {
-        let _ = host.poll_and_process();
+        let _ = poll_err(&mut host);
         let _ = client4.poll_and_process();
         thread::sleep(Duration::from_millis(1));
     }
@@ -547,7 +561,7 @@ fn test_dynamic_peer_joins_and_leaves_during_active_chat() {
     client4.send_chat_message(&c4_msg).unwrap();
 
     for _ in 0..15 {
-        while let Ok(Some(_)) = host.poll_and_process() {}
+        while let Ok(Some(_)) = poll_err(&mut host) {}
         while let Ok(Some(_)) = client1.poll_and_process() {}
         while let Ok(Some(_)) = client3.poll_and_process() {}
         while let Ok(Some(_)) = client4.poll_and_process() {}

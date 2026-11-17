@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::barrier::{compute_target_unpause_server, BarrierPhase, BarrierStateMachine};
@@ -15,26 +16,53 @@ use crate::ntp::{ProbeSample, Rfc5905Filter};
 use crate::pll::{PllCorrection, PllSpeedController, PllZone};
 use crate::timeline::RoomState;
 use crate::wire::{
-    ChatMessagePayload, PacketPayload, PeerControlAction, PeerControlPayload, PeerStatusPayload,
+    ChatMessagePayload, PacketPayload, PacketType, PeerControlAction, PeerControlPayload, PeerStatusPayload,
     ReactionPayload, WirePacket, FLAG_BARRIER_COMMIT,
 };
+
+fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Callback invoked for every raw inbound datagram *before* wire parsing.
+///
+/// Returning `true` means the datagram was consumed (for example a STUN response or a
+/// hole-punch probe) and must not be parsed as a Syncverse packet.
+pub type DatagramInterceptor = Box<dyn FnMut(&[u8], SocketAddr) -> bool + Send>;
+
+/// Upper bound of datagrams drained by a single [`UdpSyncTransport::poll_packet`] call, so a
+/// garbage flood cannot monopolise the caller's tick.
+const MAX_DATAGRAMS_PER_POLL: usize = 4096;
+
+/// Upper bound of remembered auth-failed Hello senders awaiting a reject reply.
+const MAX_PENDING_REJECTS: usize = 64;
 
 /// Non-blocking UDP transport wrapper for watch-party synchronization.
 pub struct UdpSyncTransport {
     socket: UdpSocket,
     crypto: Option<Arc<RoomCryptoSession>>,
+    interceptor: Mutex<Option<DatagramInterceptor>>,
+    dropped_datagrams: AtomicU64,
+    intercepted_datagrams: AtomicU64,
+    auth_failed_datagrams: AtomicU64,
+    pending_auth_rejects: Mutex<Vec<SocketAddr>>,
+    last_decode_error: Mutex<Option<SyncError>>,
 }
 
 impl UdpSyncTransport {
     /// Binds a UDP socket to the specified address in non-blocking mode.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, SyncError> {
-        let socket = UdpSocket::bind(addr).map_err(|e| SyncError::Io(e.to_string()))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| SyncError::Io(e.to_string()))?;
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
         Ok(Self {
             socket,
             crypto: None,
+            interceptor: Mutex::new(None),
+            dropped_datagrams: AtomicU64::new(0),
+            intercepted_datagrams: AtomicU64::new(0),
+            auth_failed_datagrams: AtomicU64::new(0),
+            pending_auth_rejects: Mutex::new(Vec::new()),
+            last_decode_error: Mutex::new(None),
         })
     }
 
@@ -54,11 +82,36 @@ impl UdpSyncTransport {
         self.crypto.is_some()
     }
 
+    /// Installs (or clears with `None`) the pre-parse datagram interceptor.
+    ///
+    /// The interceptor sees every inbound datagram first; `true` = consumed.
+    pub fn set_datagram_interceptor(&self, interceptor: Option<DatagramInterceptor>) {
+        *lock_ignore_poison(&self.interceptor) = interceptor;
+    }
+
+    /// Number of inbound datagrams discarded because they were not decodable Syncverse packets.
+    pub fn dropped_datagrams(&self) -> u64 {
+        self.dropped_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Number of inbound datagrams consumed by the datagram interceptor.
+    pub fn intercepted_datagrams(&self) -> u64 {
+        self.intercepted_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Number of inbound datagrams that failed AEAD/encryption-mode validation.
+    pub fn auth_failed_datagrams(&self) -> u64 {
+        self.auth_failed_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Drains the senders of `Hello` packets that failed encryption validation.
+    pub fn take_pending_auth_rejects(&self) -> Vec<SocketAddr> {
+        std::mem::take(&mut *lock_ignore_poison(&self.pending_auth_rejects))
+    }
+
     /// Returns the local socket address.
     pub fn local_addr(&self) -> Result<SocketAddr, SyncError> {
-        self.socket
-            .local_addr()
-            .map_err(|e| SyncError::Io(e.to_string()))
+        Ok(self.socket.local_addr()?)
     }
 
     /// Sends a wire packet to the specified remote target address.
@@ -67,27 +120,103 @@ impl UdpSyncTransport {
             Some(crypto) => packet.to_encrypted_bytes(crypto)?,
             None => packet.to_bytes(),
         };
-        self.socket
-            .send_to(&bytes, target)
-            .map_err(|e| SyncError::Io(e.to_string()))
+        Ok(self.socket.send_to(&bytes, target)?)
+    }
+
+    /// Sends a wire packet in plaintext even on an encrypted transport.
+    ///
+    /// Reserved for unauthenticated rejection notices (`HelloAck` with a failure status).
+    pub fn send_packet_plain(
+        &self,
+        packet: &WirePacket,
+        target: SocketAddr,
+    ) -> Result<usize, SyncError> {
+        Ok(self.socket.send_to(&packet.to_bytes(), target)?)
+    }
+
+    fn intercept(&self, data: &[u8], addr: SocketAddr) -> bool {
+        let mut guard = lock_ignore_poison(&self.interceptor);
+        match guard.as_mut() {
+            Some(f) => f(data, addr),
+            None => false,
+        }
+    }
+
+    /// Takes the typed decode error of the most recently discarded datagram, if any.
+    ///
+    /// Undecodable datagrams no longer abort `poll_packet`; this keeps their diagnostics.
+    pub fn take_last_decode_error(&self) -> Option<SyncError> {
+        lock_ignore_poison(&self.last_decode_error).take()
+    }
+
+    fn note_undecodable(&self, data: &[u8], addr: SocketAddr, err: &SyncError) {
+        self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+        *lock_ignore_poison(&self.last_decode_error) = Some(err.clone());
+        if matches!(err, SyncError::Crypto(_)) {
+            self.auth_failed_datagrams.fetch_add(1, Ordering::Relaxed);
+            // The packet type byte is visible in the clear header; remember failed Hellos so
+            // the host can send a plaintext rejection.
+            if data.len() > 4
+                && data[..4] == crate::wire::WIRE_MAGIC
+                && data[4] == PacketType::Hello as u8
+            {
+                let mut pending = lock_ignore_poison(&self.pending_auth_rejects);
+                if pending.len() < MAX_PENDING_REJECTS && !pending.contains(&addr) {
+                    pending.push(addr);
+                }
+            }
+        }
     }
 
     /// Polls for an incoming wire packet without blocking.
     ///
-    /// Returns `Ok(Some((packet, addr)))` if a valid packet arrived,
-    /// `Ok(None)` if no datagrams are currently available (`WouldBlock`),
-    /// or `Err(...)` if a network or deserialization error occurred.
+    /// Datagrams that are consumed by the interceptor, or that are not decodable Syncverse
+    /// packets (garbage, STUN, wrong password), are skipped and counted while the receive
+    /// queue keeps draining, so one stray datagram never ends a caller's drain loop.
+    ///
+    /// Returns `Ok(Some((packet, addr)))` if a valid packet arrived, `Ok(None)` if the queue
+    /// is empty, or `Err(...)` on a genuine socket failure.
     pub fn poll_packet(&self) -> Result<Option<(WirePacket, SocketAddr)>, SyncError> {
         let mut buf = [0u8; 2048];
-        match self.socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                let packet =
-                    WirePacket::from_encrypted_bytes(&buf[..n], self.crypto.as_deref())?;
-                Ok(Some((packet, addr)))
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    let data = &buf[..n];
+                    if self.intercept(data, addr) {
+                        self.intercepted_datagrams.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    match WirePacket::from_encrypted_bytes(data, self.crypto.as_deref()) {
+                        Ok(packet) => return Ok(Some((packet, addr))),
+                        Err(err) => {
+                            // A plaintext rejection (HelloAck with failure status) is the only
+                            // unauthenticated packet accepted on an encrypted transport.
+                            if self.crypto.is_some() {
+                                if let Ok(plain) = WirePacket::from_bytes(data) {
+                                    if plain.is_hello_rejection() {
+                                        return Ok(Some((plain, addr)));
+                                    }
+                                }
+                            }
+                            self.note_undecodable(data, addr, &err);
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(SyncError::from(e)),
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(SyncError::Io(e.to_string())),
         }
+        Ok(None)
     }
 
     /// Returns an immutable reference to the underlying `UdpSocket`.
@@ -194,6 +323,35 @@ impl HostServer {
     /// Returns the local bound socket address.
     pub fn local_addr(&self) -> Result<SocketAddr, SyncError> {
         self.transport.local_addr()
+    }
+
+    /// Returns the underlying room UDP socket (non-blocking), so NAT traversal can share the
+    /// exact same local port and therefore the same NAT mapping as the room traffic.
+    pub fn socket(&self) -> &UdpSocket {
+        self.transport.socket()
+    }
+
+    /// Installs (or clears with `None`) a pre-parse datagram interceptor.
+    ///
+    /// The callback sees every inbound datagram before wire decoding; returning `true`
+    /// consumes it (STUN responses, hole-punch probes). It is never called re-entrantly.
+    pub fn set_datagram_interceptor(&self, interceptor: Option<DatagramInterceptor>) {
+        self.transport.set_datagram_interceptor(interceptor);
+    }
+
+    /// Number of inbound datagrams discarded as undecodable (garbage, wrong key, stray protocols).
+    pub fn dropped_datagrams(&self) -> u64 {
+        self.transport.dropped_datagrams()
+    }
+
+    /// Number of inbound datagrams consumed by the interceptor.
+    pub fn intercepted_datagrams(&self) -> u64 {
+        self.transport.intercepted_datagrams()
+    }
+
+    /// Takes the typed decode error of the most recently discarded datagram, if any.
+    pub fn take_last_decode_error(&self) -> Option<SyncError> {
+        self.transport.take_last_decode_error()
     }
 
     /// Returns the current monotonic server time in nanoseconds.
@@ -868,6 +1026,35 @@ impl ClientNode {
         self.transport.local_addr()
     }
 
+    /// Returns the underlying room UDP socket (non-blocking), so NAT traversal can share the
+    /// exact same local port and therefore the same NAT mapping as the room traffic.
+    pub fn socket(&self) -> &UdpSocket {
+        self.transport.socket()
+    }
+
+    /// Installs (or clears with `None`) a pre-parse datagram interceptor.
+    ///
+    /// The callback sees every inbound datagram before wire decoding; returning `true`
+    /// consumes it (STUN responses, hole-punch probes). It is never called re-entrantly.
+    pub fn set_datagram_interceptor(&self, interceptor: Option<DatagramInterceptor>) {
+        self.transport.set_datagram_interceptor(interceptor);
+    }
+
+    /// Number of inbound datagrams discarded as undecodable (garbage, wrong key, stray protocols).
+    pub fn dropped_datagrams(&self) -> u64 {
+        self.transport.dropped_datagrams()
+    }
+
+    /// Number of inbound datagrams consumed by the interceptor.
+    pub fn intercepted_datagrams(&self) -> u64 {
+        self.transport.intercepted_datagrams()
+    }
+
+    /// Takes the typed decode error of the most recently discarded datagram, if any.
+    pub fn take_last_decode_error(&self) -> Option<SyncError> {
+        self.transport.take_last_decode_error()
+    }
+
     /// Returns the configured host server address.
     pub fn host_addr(&self) -> SocketAddr {
         self.host_addr
@@ -1278,6 +1465,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn seam_exposes_room_socket_and_interceptor_consumes_datagrams() {
+        let host = HostServer::bind("127.0.0.1:0").unwrap();
+        let host_addr = host.local_addr().unwrap();
+        assert_eq!(host.socket().local_addr().unwrap(), host_addr);
+        let seen = Arc::new(AtomicU64::new(0));
+        let seen2 = Arc::clone(&seen);
+        host.set_datagram_interceptor(Some(Box::new(move |data, _| {
+            if data.starts_with(b"SVPUNCH1") {
+                seen2.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        })));
+        let mut host = host;
+        let rogue = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rogue.send_to(b"SVPUNCH1xxxx", host_addr).unwrap();
+        rogue.send_to(&[0xFFu8; 40], host_addr).unwrap();
+        rogue.send_to(b"X", host_addr).unwrap();
+        let client = ClientNode::bind("127.0.0.1:0", host_addr, 1).unwrap();
+        let mut client = client;
+        client.send_ntp_probe().unwrap();
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(r) = host.poll_and_process().unwrap() {
+                got = Some(r);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Garbage and consumed datagrams were skipped within the same poll call.
+        assert!(got.is_some(), "valid probe must survive preceding garbage");
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        assert_eq!(host.intercepted_datagrams(), 1);
+        assert_eq!(host.dropped_datagrams(), 2);
+        assert!(host.clients().len() == 1, "only the real client registers");
+    }
+
+    #[test]
     fn test_udp_transport_loopback() {
         let t1 = UdpSyncTransport::bind("127.0.0.1:0").expect("bind t1");
         let t2 = UdpSyncTransport::bind("127.0.0.1:0").expect("bind t2");
@@ -1469,12 +1695,12 @@ mod tests {
         let spoof = WirePacket::peer_control(1, 99, PeerControlAction::Pause, 0, 1.0);
         rogue.send_packet(&spoof, host_addr).unwrap();
         std::thread::sleep(Duration::from_millis(5));
-        let err = host.poll_and_process();
-        assert!(
-            matches!(err, Err(SyncError::Crypto(_))),
-            "expected SyncError::Crypto on plaintext spoof, got {:?}",
-            err
-        );
+        let before = host.clients().len();
+        let res = host.poll_and_process().unwrap();
+        assert!(res.is_none(), "plaintext spoof must be ignored, got {:?}", res);
+        assert_eq!(host.dropped_datagrams(), 1);
+        assert_eq!(host.transport.auth_failed_datagrams(), 1);
+        assert_eq!(host.clients().len(), before, "spoof must not register a peer");
     }
 
     #[test]
