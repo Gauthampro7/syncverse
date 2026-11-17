@@ -415,7 +415,8 @@ impl PlaylistManager {
 
     /// Writes the queue autosave to `path` atomically (temp file in the same directory, fsync, rename).
     pub fn save_queue(&self, path: &Path) -> Result<(), QueueError> {
-        atomic_write_bytes(path, &self.queue_to_bytes())
+        syncverse_common::atomic_write(path, &self.queue_to_bytes())?;
+        Ok(())
     }
 
     /// Restores the queue from `path` into `self` without starting playback.
@@ -680,21 +681,18 @@ pub enum QueueError {
     /// Filesystem failure.
     #[error("queue file I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Atomic write through the user-data layer failed.
+    #[error("queue autosave write failed: {0}")]
+    Write(#[from] syncverse_common::UserDataError),
     /// The file is not a valid Syncverse queue autosave and was ignored.
     #[error("queue file is corrupt")]
     Corrupt,
 }
 
 /// Default queue autosave location: `$XDG_STATE_HOME/syncverse/queue.m3u`
-/// (falling back to `~/.local/state/syncverse/queue.m3u`), or `None` without a home directory.
+/// (via the shared [`syncverse_common::UserDirs`] resolver), or `None` if no home can be resolved.
 pub fn default_queue_path() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
-        _ => PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?)
-            .join(".local")
-            .join("state"),
-    };
-    Some(base.join("syncverse").join("queue.m3u"))
+    syncverse_common::UserDirs::from_env().ok().map(|d| d.queue_path())
 }
 
 #[cfg(unix)]
@@ -748,26 +746,6 @@ fn percent_decode_bytes(b: &[u8]) -> Result<Vec<u8>, QueueError> {
         }
     }
     Ok(out)
-}
-
-/// Atomic file write: temp sibling + fsync + rename (parents created).
-///
-/// NOTE: replace the body with the userdata worker's atomic-write helper once it is on main.
-fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), QueueError> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".queue.m3u.tmp.{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
 }
 
 /// User interaction action emitted by the playlist queue dialog.
