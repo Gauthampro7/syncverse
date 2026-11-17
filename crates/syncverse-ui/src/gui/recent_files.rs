@@ -51,33 +51,29 @@ impl RecentFilesManager {
         self.save();
     }
 
-    /// Saves recent files list line-by-line to config file.
+    /// Serialises the list: one path per line, `\n` terminated (format unchanged since v0.4).
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for p in &self.recent_paths {
+            out.push_str(&p.to_string_lossy());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Saves recent files list line-by-line to config file (atomic tmp+fsync+rename).
     fn save(&self) {
         if let Some(config_path) = Self::config_path() {
-            if let Some(parent) = config_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let mut out = String::new();
-            for p in &self.recent_paths {
-                out.push_str(&p.to_string_lossy());
-                out.push('\n');
-            }
-            let _ = std::fs::write(config_path, out);
+            let _ = syncverse_common::userdata::atomic_write(&config_path, self.to_text().as_bytes());
         }
     }
 
     /// Resolves `$XDG_CONFIG_HOME/syncverse/recent_files.txt` on Linux,
     /// or `%APPDATA%/syncverse/recent_files.txt` / `%USERPROFILE%/AppData/Roaming/syncverse/recent_files.txt` on Windows.
     fn config_path() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .map(|up| PathBuf::from(up).join("AppData").join("Roaming"))
-            })
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("syncverse").join("recent_files.txt"))
+        syncverse_common::userdata::UserDirs::from_env()
+            .ok()
+            .map(|d| d.recent_files_path())
     }
 }
 
@@ -96,6 +92,15 @@ mod tests {
         manager.add_file(PathBuf::from("/movie_99.mkv"));
         assert_eq!(manager.recent_paths.len(), RecentFilesManager::MAX_ENTRIES);
         assert_eq!(manager.recent_paths[0], PathBuf::from("/movie_99.mkv"));
+    }
+
+    #[test]
+    fn golden_file_format_is_one_path_per_line() {
+        let m = RecentFilesManager {
+            recent_paths: vec![PathBuf::from("/a/one.mkv"), PathBuf::from("/b/two words.mp4")],
+        };
+        assert_eq!(m.to_text(), "/a/one.mkv\n/b/two words.mp4\n");
+        assert_eq!(RecentFilesManager::default().to_text(), "");
     }
 
     #[test]
