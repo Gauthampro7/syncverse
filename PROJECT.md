@@ -144,4 +144,4 @@ impl RoomAnnouncement {
 - `crates/syncverse-ui/src/snapshot.rs`: 72-byte `PlayerUiSnapshot` layout and bitflag helpers.
 - `crates/syncverse-chat/src/announcements.rs`: Standardized announcement formatting.
 - `crates/syncverse-core/src/playback_runtime.rs`: Unpause gate logic, force play bypass, room event hooks.
-- `tests/e2e_phase5/`: Opaque-box E2E test suite.
+- `tests/e2e_phase5/`: Tier tests. Many of them check the contract models defined inside the test files (`contract_models.rs`), not only the product code, so a pass here does not by itself prove the product behaves that way. See `tests/e2e_phase5/README.md`.

@@ -43,15 +43,38 @@ syncverse play ~/Videos/movie.mkv --terminal
 | Action | Mouse | Keyboard Shortcut |
 | :--- | :--- | :--- |
 | **Play / Pause** | Click viewport or bottom play button | <kbd>Space</kbd> |
-| **Seek Relative** | Drag or click seekbar | <kbd>←</kbd> / <kbd>→</kbd> ($\pm 5\text{s}$) |
-| **Fine Seek** | — | <kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd> ($\pm 1\text{s}$) |
-| **Volume Up / Down** | Drag volume slider | <kbd>↑</kbd> / <kbd>↓</kbd> ($\pm 5\%$) |
-| **Mute / Unmute** | Click speaker icon | <kbd>M</kbd> |
-| **Fullscreen Toggle** | Double-click viewport | <kbd>F11</kbd> |
-| **Open File Dialog** | Click `File -> Open File` | <kbd>Ctrl</kbd> + <kbd>O</kbd> |
-| **Toggle Watch-Party Sidebar** | Click chat icon or `View -> Sidebar` | <kbd>Tab</kbd> or <kbd>T</kbd> |
-| **Adjust Speed** | Speed dropdown ($0.5\times \dots 2.0\times$) | <kbd>[</kbd> / <kbd>]</kbd> ($\pm 0.1\times$) |
+| **Stop** | Stop button | <kbd>S</kbd> |
+| **Seek** | Drag or click seekbar | <kbd>←</kbd> / <kbd>→</kbd> (5 s); <kbd>Shift</kbd> (30 s); <kbd>Ctrl</kbd> (60 s); <kbd>Alt</kbd> (5 min) |
+| **Jump to start / end** | — | <kbd>Home</kbd> / <kbd>End</kbd> (End goes to 1 s before the end) |
+| **Jump to a given time** | — | <kbd>Ctrl</kbd> + <kbd>T</kbd> |
+| **Step one frame forward / back** | — | <kbd>.</kbd> / <kbd>,</kbd> (pauses playback if it is running) |
+| **Previous / next chapter** | — | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> |
+| **Previous / next file in queue or folder** | — | <kbd>P</kbd> / <kbd>N</kbd> |
+| **Volume** | Drag volume slider or scroll wheel over the video (5% per step) | <kbd>↑</kbd> / <kbd>↓</kbd> (5%); <kbd>Ctrl</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd> (1%). Maximum is 200% |
+| **Mute / Unmute** | Click speaker icon or middle-click the video | <kbd>M</kbd> |
+| **Playback speed** | Speed dropdown | <kbd>[</kbd> or <kbd>-</kbd> slower, <kbd>]</kbd> or <kbd>+</kbd> faster (0.1× steps, range 0.25× to 4.0×); <kbd>=</kbd> or <kbd>Backspace</kbd> resets to 1.0× |
+| **Cycle audio track** | Audio menu | <kbd>B</kbd> |
+| **Cycle subtitle track** | Subtitle menu | <kbd>V</kbd> or <kbd>C</kbd> |
+| **Audio delay** | Audio dialog | <kbd>J</kbd> (−50 ms) / <kbd>K</kbd> (+50 ms); <kbd>Shift</kbd> + <kbd>J</kbd> resets to 0 |
+| **Subtitle delay** | Subtitle dialog | <kbd>G</kbd> (−50 ms) / <kbd>H</kbd> (+50 ms); <kbd>Shift</kbd> + <kbd>G</kbd> resets to 0 |
+| **Cycle aspect ratio** | Video dialog | <kbd>A</kbd> |
+| **Cycle zoom mode / reset to Fit** | Video dialog | <kbd>Z</kbd> / <kbd>Shift</kbd> + <kbd>Z</kbd> |
+| **A-B repeat** | A-B button | <kbd>R</kbd> or <kbd>Shift</kbd> + <kbd>L</kbd> cycles (set A, set B, off); <kbd>Shift</kbd> + <kbd>R</kbd> clears; <kbd>Alt</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point A by 100 ms; <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>[</kbd> / <kbd>]</kbd> nudge point B |
+| **Loop current file** | — | <kbd>L</kbd> |
+| **Fullscreen Toggle** | Double-click viewport | <kbd>F</kbd>, <kbd>F11</kbd> or <kbd>Alt</kbd> + <kbd>Enter</kbd>; <kbd>Esc</kbd> leaves fullscreen |
+| **Open File Dialog** | `File -> Open File` | <kbd>Ctrl</kbd> + <kbd>O</kbd> |
+| **Add files to queue** | `File -> Add Files to Playlist` | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> |
+| **Open path from clipboard** | `File -> Open Path from Clipboard` | <kbd>Ctrl</kbd> + <kbd>V</kbd> |
+| **Queue dialog** | — | <kbd>Ctrl</kbd> + <kbd>L</kbd> |
+| **Media info and codec statistics** | — | <kbd>Ctrl</kbd> + <kbd>I</kbd> or <kbd>Ctrl</kbd> + <kbd>J</kbd> |
+| **Effects (equalizer, video adjustments)** | — | <kbd>Ctrl</kbd> + <kbd>E</kbd> |
+| **Screenshot** | — | <kbd>F8</kbd> or <kbd>Ctrl</kbd> + <kbd>S</kbd> |
+| **Toggle Watch-Party Sidebar** | Chat icon or `View -> Sidebar` | <kbd>Tab</kbd> |
+| **Send emoji reaction** | — | <kbd>1</kbd> to <kbd>6</kbd> (❤️ 😂 🔥 👏 🍿 🎉) |
+| **Shortcuts help** | `Help -> Keyboard Shortcuts & Controls` | <kbd>F1</kbd> |
 | **Quit Application** | Window close button | <kbd>Ctrl</kbd> + <kbd>Q</kbd> |
+
+Single-letter keys are ignored while a text box has focus or a dialog is open. This table was written from the key handling in `crates/syncverse-ui/src/gui/app.rs`.
 
 ---
 
@@ -103,7 +126,7 @@ Type these commands into the chat bar during playback:
 | **Containers** | Matroska (`.mkv`, `.webm`), ISOBMFF (`.mp4`, `.mov`, `.m4v`), AVI (`.avi`), MPEG-TS (`.ts`), Flash Video (`.flv`), OGG (`.ogg`, `.ogv`) |
 | **Video Codecs** | H.264 (AVC Baseline/Main/High), H.265 (HEVC 8-bit & 10-bit), VP8, VP9 (Profile 0/2), AV1, MPEG-2, MPEG-4 Part 2, VC-1 |
 | **Audio Codecs** | AAC (LC/HE), MP3, Opus, Vorbis, FLAC (16/24-bit), AC3, E-AC3, DTS / DTS-HD Master Audio, uncompressed PCM (8/16/24/32-bit integer & float) |
-| **Audio Output** | Native PipeWire streaming via `/usr/bin/pw-cat` (48kHz stereo float), ALSA (`/usr/bin/aplay`), and Null sink fallback |
+| **Audio Output** | In-process output through `cpal` (48 kHz stereo float, resampled to the device rate if needed). If `cpal` cannot open a device, it falls back to a PipeWire or ALSA command-line player run as a subprocess, and then to a silent null sink. Headless mode always uses the null sink |
 
 ---
 
@@ -154,7 +177,7 @@ Verify the workspace locally:
 cargo check --workspace --all-targets # Zero compiler warnings
 cargo test --workspace                # Full unit & integration test suite
 python3 scripts/intent_harness.py     # 100% Intent Compliance Harness
-./scripts/verify_phase4.sh            # Complete 8-stage automated verification
+./scripts/verify_phase1.sh            # Complete 8-stage automated verification
 ```
 
 ---
