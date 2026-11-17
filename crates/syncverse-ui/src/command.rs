@@ -15,6 +15,14 @@ pub enum PlayerCommand {
     ResumeAccept,
     /// Decline the resume offer and start from the beginning (the saved position is discarded).
     ResumeDecline,
+    /// Inform core of the active UI aspect ratio label for per-file persistence.
+    SetAspectRatio(String),
+    /// Update the resume policy (`"ask"`, `"always"`, `"never"`) from Preferences.
+    SetResumePolicy(String),
+    /// Enable/disable remembering per-file audio/subtitle/delay/aspect choices.
+    SetRememberPerFile(bool),
+    /// Enable/disable remembering global settings across sessions.
+    SetRememberSettings(bool),
     /// Toggle playback between Playing and Paused.
     TogglePause,
     /// Seek presentation to target PTS in milliseconds.

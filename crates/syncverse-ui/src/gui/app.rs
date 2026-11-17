@@ -70,6 +70,17 @@ pub struct UnpauseBlockedBanner {
     pub timestamp: Instant,
 }
 
+/// Active resume-playback prompt banner state (auto-hides after 8 seconds).
+#[derive(Debug, Clone)]
+pub struct ResumeBannerState {
+    /// Offered resume position in milliseconds.
+    pub pos_ms: u64,
+    /// Media duration in milliseconds (`0` if unknown).
+    pub duration_ms: u64,
+    /// Instant when the banner was shown.
+    pub shown_at: Instant,
+}
+
 /// Canonical desktop player graphical application state implementing `eframe::App`.
 pub struct SyncverseApp {
     viewport: VideoViewport,
@@ -126,6 +137,9 @@ pub struct SyncverseApp {
     media_info_dialog: crate::gui::media_info::MediaInfoDialog,
     effects_dialog: crate::gui::effects_dialog::EffectsDialog,
     jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog,
+    preferences_dialog: crate::gui::PreferencesDialog,
+    resume_banner: Option<ResumeBannerState>,
+    persist_user_settings: bool,
 }
 
 /// Backwards-compatible type alias for [`SyncverseApp`].
@@ -198,6 +212,9 @@ impl Default for SyncverseApp {
             media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
             effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
             jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
+            preferences_dialog: crate::gui::PreferencesDialog::default(),
+            resume_banner: None,
+            persist_user_settings: false,
         };
         app.controls_state
             .subtitle_dialog
@@ -310,10 +327,16 @@ impl SyncverseApp {
             media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
             effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
             jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
+            preferences_dialog: crate::gui::PreferencesDialog::default(),
+            resume_banner: None,
+            persist_user_settings: true,
         };
         app.controls_state
             .subtitle_dialog
             .set_overlay_config(app.subtitle_overlay.config().clone());
+        if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
+            app.load_settings_from_dirs(&dirs);
+        }
 
         if let Some(path) = initial_file {
             app.load_file(path);
@@ -391,6 +414,9 @@ impl SyncverseApp {
             media_info_dialog: crate::gui::media_info::MediaInfoDialog::new(),
             effects_dialog: crate::gui::effects_dialog::EffectsDialog::new(),
             jump_time_dialog: crate::gui::jump_time::JumpToTimeDialog::new(),
+            preferences_dialog: crate::gui::PreferencesDialog::default(),
+            resume_banner: None,
+            persist_user_settings: false,
         };
         app.controls_state
             .subtitle_dialog
@@ -411,6 +437,7 @@ impl SyncverseApp {
             || self.media_info_dialog.is_open
             || self.effects_dialog.is_open
             || self.jump_time_dialog.is_open
+            || self.preferences_dialog.is_open
     }
 
     /// Returns a reference to the active OSD HUD overlay.
@@ -476,6 +503,131 @@ impl SyncverseApp {
     /// Returns the active unpause blocked banner if displayed.
     pub fn unpause_blocked_banner(&self) -> Option<&UnpauseBlockedBanner> {
         self.unpause_blocked_banner.as_ref()
+    }
+
+    /// Returns a reference to the active resume-playback banner, if any.
+    pub fn resume_banner(&self) -> Option<&ResumeBannerState> {
+        self.resume_banner.as_ref()
+    }
+
+    /// Returns a mutable reference to the preferences dialog.
+    pub fn preferences_dialog_mut(&mut self) -> &mut crate::gui::PreferencesDialog {
+        &mut self.preferences_dialog
+    }
+
+    /// Loads persisted UI settings from `dirs`.
+    pub fn load_settings_from_dirs(&mut self, dirs: &syncverse_common::userdata::UserDirs) {
+        use syncverse_common::userdata::{keys, Settings};
+        let settings = Settings::load(&dirs.settings_path());
+        let remember_settings = settings.get_bool(keys::REMEMBER_SETTINGS).unwrap_or(true);
+        let remember_per_file = settings.get_bool(keys::REMEMBER_PER_FILE).unwrap_or(true);
+        let resume_policy = settings
+            .get(keys::RESUME_POLICY)
+            .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "always" => "always",
+                "never" => "never",
+                _ => "ask",
+            })
+            .unwrap_or("ask")
+            .to_string();
+
+        self.preferences_dialog.remember_settings = remember_settings;
+        self.preferences_dialog.remember_per_file = remember_per_file;
+        self.preferences_dialog.resume_policy = resume_policy;
+
+        if remember_settings {
+            if let Some(vol) = settings.get_f32(keys::VOLUME) {
+                self.controls_state.volume.set_volume(vol);
+            }
+            if let Some(muted) = settings.get_bool(keys::MUTED) {
+                self.controls_state.volume.is_muted = muted;
+            }
+            if let Some(sidebar_open) = settings.get_bool(keys::SIDEBAR_OPEN) {
+                self.sidebar_state.is_expanded = sidebar_open;
+            }
+            if let Some(username) = settings.get(keys::USERNAME) {
+                let u = username.trim();
+                if !u.is_empty() {
+                    self.host_dialog.username = u.to_string();
+                    self.connect_dialog.username = u.to_string();
+                    self.sidebar_state.local_username = u.to_string();
+                }
+            }
+            if let Some(port) = settings.get_u64(keys::LAST_HOST_PORT) {
+                if let Ok(p) = u16::try_from(port) {
+                    if p > 0 {
+                        self.host_dialog.port = p;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Saves UI settings to `dirs` using load-modify-save so unknown keys survive.
+    pub fn save_settings_to_dirs(&self, dirs: &syncverse_common::userdata::UserDirs) {
+        use syncverse_common::userdata::{keys, Settings};
+        let path = dirs.settings_path();
+        let mut settings = Settings::load(&path);
+        settings.set_bool(
+            keys::REMEMBER_SETTINGS,
+            self.preferences_dialog.remember_settings,
+        );
+        settings.set_bool(
+            keys::REMEMBER_PER_FILE,
+            self.preferences_dialog.remember_per_file,
+        );
+        settings.set(keys::RESUME_POLICY, &self.preferences_dialog.resume_policy);
+
+        if self.preferences_dialog.remember_settings {
+            settings.set(
+                keys::VOLUME,
+                format!("{:.4}", self.controls_state.volume.volume),
+            );
+            settings.set_bool(keys::MUTED, self.controls_state.volume.is_muted);
+            settings.set_bool(keys::SIDEBAR_OPEN, self.sidebar_state.is_expanded);
+            if !self.host_dialog.username.trim().is_empty() {
+                settings.set(keys::USERNAME, self.host_dialog.username.trim());
+            } else if !self.connect_dialog.username.trim().is_empty() {
+                settings.set(keys::USERNAME, self.connect_dialog.username.trim());
+            }
+            settings.set(keys::LAST_HOST_PORT, self.host_dialog.port.to_string());
+        }
+        let _ = settings.save(&path);
+    }
+
+    fn apply_aspect_ratio(
+        &mut self,
+        ar: crate::gui::aspect_ratio::AspectRatioOverride,
+        notify_core: bool,
+    ) {
+        self.viewport.set_aspect_override(ar);
+        self.controls_state.aspect_ratio = ar;
+        self.controls_state.video_dialog.set_aspect_ratio(ar);
+        if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL
+            .iter()
+            .position(|&r| r == ar)
+        {
+            self.aspect_ratio_index = pos;
+        }
+        if notify_core {
+            let label = if ar == crate::gui::aspect_ratio::AspectRatioOverride::Original {
+                "auto".to_string()
+            } else {
+                ar.display_name().to_string()
+            };
+            let _ = self.command_tx.send(PlayerCommand::SetAspectRatio(label));
+        }
+    }
+
+    fn parse_aspect_ratio(label: &str) -> Option<crate::gui::aspect_ratio::AspectRatioOverride> {
+        let trimmed = label.trim();
+        if trimmed.eq_ignore_ascii_case("auto") || trimmed.eq_ignore_ascii_case("original") {
+            return Some(crate::gui::aspect_ratio::AspectRatioOverride::Original);
+        }
+        crate::gui::aspect_ratio::AspectRatioOverride::ALL
+            .iter()
+            .copied()
+            .find(|ar| ar.display_name().eq_ignore_ascii_case(trimmed))
     }
 
     /// Sets the currently displayed media file path without triggering background demuxer commands.
@@ -913,6 +1065,7 @@ impl SyncverseApp {
     /// when a playback worker is connected; falls back to synchronous discovery for standalone callers.
     pub fn load_file(&mut self, path: PathBuf) {
         self.viewport.reset();
+        self.resume_banner = None;
         self.recent_files.add_file(&path);
         let worker_connected = self.command_tx.send(PlayerCommand::OpenFile(path.clone())).is_ok();
         self.current_file = Some(path.clone());
@@ -1335,10 +1488,23 @@ impl SyncverseApp {
                         self.play_next_file(now);
                     }
                 }
-                // v0.5.0 scaffold: handled by later work packages (nat, party state, resume).
-                UiEvent::NatReport { .. }
-                | UiEvent::PartyConnectionState { .. }
-                | UiEvent::ResumeAvailable { .. } => {}
+                UiEvent::ResumeAvailable {
+                    pos_ms,
+                    duration_ms,
+                } => {
+                    self.resume_banner = Some(ResumeBannerState {
+                        pos_ms,
+                        duration_ms,
+                        shown_at: now,
+                    });
+                }
+                UiEvent::AspectRatioRestored(label) => {
+                    if let Some(ar) = Self::parse_aspect_ratio(&label) {
+                        self.apply_aspect_ratio(ar, false);
+                    }
+                }
+                // v0.5.0 scaffold: handled by later work packages (nat, party state).
+                UiEvent::NatReport { .. } | UiEvent::PartyConnectionState { .. } => {}
             }
         }
 
@@ -1817,11 +1983,7 @@ impl SyncverseApp {
             // Aspect ratio cycling (A)
             if ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(egui::Key::A)) {
                 let new_ar = self.viewport.cycle_aspect_override();
-                self.controls_state.aspect_ratio = new_ar;
-                self.controls_state.video_dialog.set_aspect_ratio(new_ar);
-                if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == new_ar) {
-                    self.aspect_ratio_index = pos;
-                }
+                self.apply_aspect_ratio(new_ar, true);
                 self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
             }
             // Video Zoom mode cycling (Z) & Zoom Reset (Shift+Z)
@@ -2180,6 +2342,68 @@ impl SyncverseApp {
                     if dismiss_toast {
                         self.update_status_toast = None;
                     }
+                }
+            }
+        }
+
+        // 8b. Resume Playback Banner (auto-hides after 8 seconds; hiding = implicit decline)
+        if let Some(banner) = self.resume_banner.clone() {
+            if now.duration_since(banner.shown_at) >= Duration::from_secs(8) {
+                self.resume_banner = None;
+            } else {
+                let mut clear_banner = false;
+                let pos_text = ControlsBarState::format_timestamp(banner.pos_ms);
+                let prompt_text = if banner.duration_ms > 0 {
+                    format!(
+                        "⏯ Resume from {} / {}?",
+                        pos_text,
+                        ControlsBarState::format_timestamp(banner.duration_ms)
+                    )
+                } else {
+                    format!("⏯ Resume from {}?", pos_text)
+                };
+                egui::Panel::top("resume_playback_banner")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(15, 23, 42))
+                            .inner_margin(egui::Margin::symmetric(14, 8))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 41, 59))),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(prompt_text)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(56, 189, 248)),
+                            );
+                            ui.add_space(8.0);
+                            if ui
+                                .button(
+                                    egui::RichText::new("Resume")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .clicked()
+                            {
+                                let _ = self.command_tx.send(PlayerCommand::ResumeAccept);
+                                clear_banner = true;
+                            }
+                            if ui.button("Start over").clicked() {
+                                let _ = self.command_tx.send(PlayerCommand::ResumeDecline);
+                                clear_banner = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("✖").clicked() {
+                                        clear_banner = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+                if clear_banner {
+                    self.resume_banner = None;
                 }
             }
         }
@@ -2665,12 +2889,7 @@ impl SyncverseApp {
                                 let is_selected = self.viewport.aspect_override() == ar;
                                 if ui.selectable_label(is_selected, ar.display_name()).clicked() {
                                     ui.close();
-                                    self.viewport.set_aspect_override(ar);
-                                    self.controls_state.aspect_ratio = ar;
-                                    self.controls_state.video_dialog.set_aspect_ratio(ar);
-                                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
-                                        self.aspect_ratio_index = pos;
-                                    }
+                                    self.apply_aspect_ratio(ar, true);
                                     self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                                 }
                             }
@@ -2803,6 +3022,11 @@ impl SyncverseApp {
                         if ui.button("ℹ Media Information & Codec Statistics (Ctrl+I)").clicked() {
                             ui.close();
                             self.media_info_dialog.toggle();
+                        }
+                        ui.separator();
+                        if ui.button("⚙ Preferences...").clicked() {
+                            ui.close();
+                            self.preferences_dialog.open();
                         }
                     });
 
@@ -2978,21 +3202,12 @@ impl SyncverseApp {
                             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.controls_state.is_fullscreen));
                         }
                         ControlsBarAction::SetAspectRatio(ar) => {
-                            self.viewport.set_aspect_override(ar);
-                            self.controls_state.aspect_ratio = ar;
-                            self.controls_state.video_dialog.set_aspect_ratio(ar);
-                            if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
-                                self.aspect_ratio_index = pos;
-                            }
+                            self.apply_aspect_ratio(ar, true);
                             self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                         }
                         ControlsBarAction::CycleAspectRatio => {
                             let new_ar = self.viewport.cycle_aspect_override();
-                            self.controls_state.aspect_ratio = new_ar;
-                            self.controls_state.video_dialog.set_aspect_ratio(new_ar);
-                            if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == new_ar) {
-                                self.aspect_ratio_index = pos;
-                            }
+                            self.apply_aspect_ratio(new_ar, true);
                             self.osd_overlay.show_notification(format!("Aspect Ratio: {}", new_ar.display_name()), now);
                         }
                         ControlsBarAction::OpenAudioSettings => {
@@ -3317,12 +3532,7 @@ impl SyncverseApp {
                 }
 
                 if let Some(ar) = menu_aspect_ratio {
-                    self.viewport.set_aspect_override(ar);
-                    self.controls_state.aspect_ratio = ar;
-                    self.controls_state.video_dialog.set_aspect_ratio(ar);
-                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
-                        self.aspect_ratio_index = pos;
-                    }
+                    self.apply_aspect_ratio(ar, true);
                     self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                 }
 
@@ -3557,11 +3767,7 @@ impl SyncverseApp {
         for action in video_actions {
             match action {
                 crate::gui::VideoConfigAction::SetAspectRatio(ar) => {
-                    self.viewport.set_aspect_override(ar);
-                    self.controls_state.aspect_ratio = ar;
-                    if let Some(pos) = crate::gui::aspect_ratio::AspectRatioOverride::ALL.iter().position(|&r| r == ar) {
-                        self.aspect_ratio_index = pos;
-                    }
+                    self.apply_aspect_ratio(ar, true);
                     self.osd_overlay.show_notification(format!("Aspect Ratio: {}", ar.display_name()), now);
                 }
                 crate::gui::VideoConfigAction::SetSpeed(spd) => {
@@ -3631,6 +3837,28 @@ impl SyncverseApp {
             }
         }
 
+        let pref_actions = self.preferences_dialog.show(&ctx);
+        if !pref_actions.is_empty() {
+            for action in pref_actions {
+                match action {
+                    crate::gui::PreferencesAction::SetResumePolicy(p) => {
+                        let _ = self.command_tx.send(PlayerCommand::SetResumePolicy(p));
+                    }
+                    crate::gui::PreferencesAction::SetRememberPerFile(on) => {
+                        let _ = self.command_tx.send(PlayerCommand::SetRememberPerFile(on));
+                    }
+                    crate::gui::PreferencesAction::SetRememberSettings(on) => {
+                        let _ = self.command_tx.send(PlayerCommand::SetRememberSettings(on));
+                    }
+                }
+            }
+            if self.persist_user_settings {
+                if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
+                    self.save_settings_to_dirs(&dirs);
+                }
+            }
+        }
+
         // 13. Update Linux Wayland/X11 idle inhibitor and MPRIS v2 D-Bus service
         if snapshot.is_playing() {
             self.idle_inhibitor.inhibit();
@@ -3654,6 +3882,16 @@ impl SyncverseApp {
 
         // 14. Drag-hover visual overlay
         DragDropHandler::render_hover_overlay(&ctx);
+    }
+}
+
+impl Drop for SyncverseApp {
+    fn drop(&mut self) {
+        if self.persist_user_settings {
+            if let Ok(dirs) = syncverse_common::userdata::UserDirs::from_env() {
+                self.save_settings_to_dirs(&dirs);
+            }
+        }
     }
 }
 

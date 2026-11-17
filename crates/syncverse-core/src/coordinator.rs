@@ -219,7 +219,11 @@ impl PlayerCoordinator {
             | PlayerCommand::DetectPublicAddress
             | PlayerCommand::PunchPeer(_)
             | PlayerCommand::ResumeAccept
-            | PlayerCommand::ResumeDecline => {
+            | PlayerCommand::ResumeDecline
+            | PlayerCommand::SetAspectRatio(_)
+            | PlayerCommand::SetResumePolicy(_)
+            | PlayerCommand::SetRememberPerFile(_)
+            | PlayerCommand::SetRememberSettings(_) => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }

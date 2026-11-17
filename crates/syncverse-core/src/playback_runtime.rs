@@ -25,6 +25,7 @@ use syncverse_codecs::{
     apply_gain, UniversalAudioDecoder, UniversalVideoDecoder, VideoFrameRGBA,
 };
 use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack as CommonSubtitleTrack};
+use syncverse_common::userdata::{keys, FileKey, Settings, UserDirs};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
 use syncverse_sync::{
     spawn_upnp_mapping, ClientNode, HostServer, MediaFingerprint, PeerControlAction,
@@ -39,6 +40,7 @@ use syncverse_ui::{
 
 use crate::audio_sink::{create_default_audio_sink, AudioSink};
 use crate::error::CoreError;
+use crate::resume::{FileMemory, ResumeDecision, ResumePolicy, ResumeTracker};
 use crate::subtitle_runtime::{
     build_embedded_subtitle_decoders, choose_initial_subtitle_track,
     composite_active_bitmap_subtitle, find_exact_stem_sidecar_languages,
@@ -1262,6 +1264,33 @@ fn perform_session_seek(
     landed_pts
 }
 
+fn current_file_memory(
+    session: &Option<PlaybackSession>,
+    audio_delay_ms: i64,
+    subtitle_delay_ms: i64,
+    aspect: &str,
+) -> FileMemory {
+    let audio = session
+        .as_ref()
+        .and_then(|s| s.audio_track_id)
+        .map(|id| id as i32)
+        .unwrap_or(-1);
+    let sub = session
+        .as_ref()
+        .map(|s| match s.selected_subtitle_track_index {
+            Some(idx) => idx as i32,
+            None => -2,
+        })
+        .unwrap_or(-1);
+    FileMemory {
+        audio,
+        sub,
+        audio_delay_ms,
+        sub_delay_ms: subtitle_delay_ms,
+        aspect: aspect.to_string(),
+    }
+}
+
 /// Runs the background playback worker loop in a dedicated OS thread.
 pub fn run_playback_worker(
     command_rx: Receiver<PlayerCommand>,
@@ -1272,15 +1301,72 @@ pub fn run_playback_worker(
     clock: Arc<MasterClock>,
     running: Arc<AtomicBool>,
 ) {
+    run_playback_worker_with_dirs(
+        command_rx,
+        audio_tx,
+        event_tx,
+        exchange,
+        video_ring,
+        clock,
+        running,
+        UserDirs::from_env().ok(),
+    );
+}
+
+/// Runs the background playback worker loop using explicit per-user directories (or in-memory if `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_playback_worker_with_dirs(
+    command_rx: Receiver<PlayerCommand>,
+    audio_tx: Sender<AudioWorkerCommand>,
+    event_tx: Sender<UiEvent>,
+    exchange: Arc<TripleBufferSnapshotExchange>,
+    video_ring: Arc<SpscRingBuffer<VideoFrameRGBA, 32>>,
+    clock: Arc<MasterClock>,
+    running: Arc<AtomicBool>,
+    user_dirs: Option<UserDirs>,
+) {
+    let worker_start = Instant::now();
+    let settings = user_dirs
+        .as_ref()
+        .map(|d| Settings::load(&d.settings_path()))
+        .unwrap_or_default();
+    let mut remember_settings = settings.get_bool(keys::REMEMBER_SETTINGS).unwrap_or(true);
+    let mut remember_per_file = settings.get_bool(keys::REMEMBER_PER_FILE).unwrap_or(true);
+    let mut resume_policy = settings
+        .get(keys::RESUME_POLICY)
+        .and_then(ResumePolicy::parse)
+        .unwrap_or(ResumePolicy::Ask);
+    let mut resume_tracker = ResumeTracker::load(
+        user_dirs.as_ref().map(|d| d.resume_path()).as_deref(),
+        resume_policy,
+    );
+    resume_tracker.set_remember_per_file(remember_per_file);
+
     let mut session: Option<PlaybackSession> = None;
     let mut current_file_name: Option<String> = None;
     let mut current_file_size: u64 = 0;
     let mut current_media_hash: [u8; 32] = [0u8; 32];
+    let mut current_file_key: Option<FileKey> = None;
+    let mut pending_resume_pos_ms: Option<u64> = None;
+    let mut current_aspect: String = "auto".to_string();
     let mut local_ready: bool = false;
     let mut force_play: bool = false;
     let mut gate_blocked: bool = false;
-    let mut volume: f32 = 1.0;
-    let mut is_muted: bool = false;
+    let mut volume: f32 = if remember_settings {
+        settings
+            .get_f32(keys::VOLUME)
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    let mut is_muted: bool = if remember_settings {
+        settings.get_bool(keys::MUTED).unwrap_or(false)
+    } else {
+        false
+    };
+    let _ = audio_tx.send(AudioWorkerCommand::SetVolume(volume));
+    let _ = audio_tx.send(AudioWorkerCommand::SetMuted(is_muted));
     let mut is_loop_enabled: bool = false;
     let mut audio_delay_ms: i64 = 0;
     let mut subtitle_delay_ms: i64 = 0;
@@ -1313,8 +1399,48 @@ pub fn run_playback_worker(
                     let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(speed));
                     let _ = audio_tx.send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
                     match PlaybackSession::open(&path) {
-                        Ok(new_session) => {
+                        Ok(mut new_session) => {
                             let dur_ms = new_session.duration_ms;
+                            let now_ms = worker_start.elapsed().as_millis() as u64;
+                            let in_party = !matches!(party_role, WatchPartyRole::None);
+                            current_aspect = "auto".to_string();
+                            pending_resume_pos_ms = None;
+
+                            let open_decision = if let Ok(key) = FileKey::from_path(&path) {
+                                current_file_key = Some(key);
+                                let outcome = resume_tracker.on_open(key, dur_ms, in_party, now_ms);
+                                if let Some(mem) = outcome.memory {
+                                    if mem.audio >= 0 {
+                                        let _ = new_session.select_audio_track(mem.audio as u64);
+                                    }
+                                    if mem.sub == -2 {
+                                        new_session.select_subtitle_track(None);
+                                    } else if mem.sub >= 0
+                                        && (mem.sub as usize)
+                                            < new_session.available_subtitle_tracks.len()
+                                    {
+                                        new_session.select_subtitle_track(Some(mem.sub as usize));
+                                    }
+                                    audio_delay_ms = mem.audio_delay_ms.clamp(-5000, 5000);
+                                    let _ = audio_tx
+                                        .send(AudioWorkerCommand::SetAudioDelay(audio_delay_ms));
+                                    let _ =
+                                        event_tx.send(UiEvent::AudioDelayChanged(audio_delay_ms));
+                                    subtitle_delay_ms = mem.sub_delay_ms.clamp(-5000, 5000);
+                                    let _ = event_tx
+                                        .send(UiEvent::SubtitleDelayChanged(subtitle_delay_ms));
+                                    if !mem.aspect.is_empty() && mem.aspect != "auto" {
+                                        current_aspect = mem.aspect.clone();
+                                        let _ = event_tx.send(UiEvent::AspectRatioRestored(
+                                            current_aspect.clone(),
+                                        ));
+                                    }
+                                }
+                                outcome.decision
+                            } else {
+                                current_file_key = None;
+                                ResumeDecision::None
+                            };
                             let filename = path
                                 .file_name()
                                 .and_then(|n| n.to_str())
@@ -1371,7 +1497,16 @@ pub fn run_playback_worker(
                                 });
                             }
                             let _ = event_tx.send(UiEvent::ChaptersDiscovered(new_session.chapters.clone()));
-                            if let Some(at) = new_session.available_audio_tracks.first() {
+                            let active_audio_track = new_session
+                                .audio_track_id
+                                .and_then(|id| {
+                                    new_session
+                                        .available_audio_tracks
+                                        .iter()
+                                        .find(|t| t.track_id == id)
+                                })
+                                .or_else(|| new_session.available_audio_tracks.first());
+                            if let Some(at) = active_audio_track {
                                 let _ = event_tx.send(UiEvent::AudioTrackSelected {
                                     track_id: at.track_id,
                                     name: format_track_info(at),
@@ -1387,6 +1522,34 @@ pub fn run_playback_worker(
                             clock.seek_to(0.0, now);
                             clock.set_state(now, PlaybackState::Playing);
                             let _ = audio_tx.send(AudioWorkerCommand::Resume);
+
+                            match open_decision {
+                                ResumeDecision::Offer { pos_ms } => {
+                                    pending_resume_pos_ms = Some(pos_ms);
+                                    let _ = event_tx.send(UiEvent::ResumeAvailable {
+                                        pos_ms,
+                                        duration_ms: dur_ms,
+                                    });
+                                }
+                                ResumeDecision::AutoResume { pos_ms } => {
+                                    if let Some(ref mut sess) = session {
+                                        perform_session_seek(
+                                            sess,
+                                            pos_ms,
+                                            true,
+                                            &clock,
+                                            &video_ring,
+                                            &mut overflow_frame,
+                                            &audio_tx,
+                                            &mut current_audio_generation,
+                                            audio_delay_ms,
+                                            subtitle_delay_ms,
+                                            &event_tx,
+                                        );
+                                    }
+                                }
+                                ResumeDecision::None => {}
+                            }
 
                             if let WatchPartyRole::Host { server, .. } = &mut party_role {
                                 server.set_media_state(0, speed, false);
@@ -1433,6 +1596,17 @@ pub fn run_playback_worker(
                         Err(err) => {
                             eprintln!("[ERROR] PlaybackSession failed to open {:?}: {}", path, err);
                             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("media");
+                            let now_ms = worker_start.elapsed().as_millis() as u64;
+                            let prev_pos_ms = clock.current_pts(Instant::now()).max(0.0) as u64;
+                            let prev_mem = current_file_memory(
+                                &session,
+                                audio_delay_ms,
+                                subtitle_delay_ms,
+                                &current_aspect,
+                            );
+                            resume_tracker.on_stop(prev_pos_ms, &prev_mem, false, now_ms);
+                            current_file_key = None;
+                            pending_resume_pos_ms = None;
                             session = None;
                             current_file_name = None;
                             current_file_size = 0;
@@ -1715,10 +1889,31 @@ pub fn run_playback_worker(
 
                         let msg = RoomAnnouncement::paused(&sender);
                         broadcast_chat_announcement(&msg, now, &clock, &mut party_role, &event_tx);
+                        let now_ms = worker_start.elapsed().as_millis() as u64;
+                        let mem = current_file_memory(
+                            &session,
+                            audio_delay_ms,
+                            subtitle_delay_ms,
+                            &current_aspect,
+                        );
+                        resume_tracker.on_pause(current_pts, &mem, now_ms);
                     }
                 }
                 PlayerCommand::Stop => {
                     let now = Instant::now();
+                    let stop_pos_ms = clock.current_pts(now).max(0.0) as u64;
+                    let stop_mem = current_file_memory(
+                        &session,
+                        audio_delay_ms,
+                        subtitle_delay_ms,
+                        &current_aspect,
+                    );
+                    resume_tracker.on_stop(
+                        stop_pos_ms,
+                        &stop_mem,
+                        false,
+                        worker_start.elapsed().as_millis() as u64,
+                    );
                     gate_blocked = false;
                     if let Some(ref mut sess) = session {
                         perform_session_seek(
@@ -2445,6 +2640,8 @@ pub fn run_playback_worker(
                                 current_media_hash,
                                 &mut party_role,
                             );
+                            resume_tracker.set_in_party(true);
+                            pending_resume_pos_ms = None;
                         }
                         Err(e) => {
                             eprintln!("[ERROR] Failed to bind HostServer on port {}: {}", port, e);
@@ -2554,6 +2751,8 @@ pub fn run_playback_worker(
                                     initial_sync_locked: false,
                                     last_pll_update: now,
                                 };
+                                resume_tracker.set_in_party(true);
+                                pending_resume_pos_ms = None;
                             }
                             Err(e) => {
                                 eprintln!("[ERROR] Failed to bind ClientNode to {}: {}", addr, e);
@@ -2615,6 +2814,7 @@ pub fn run_playback_worker(
                 }
                 PlayerCommand::DisconnectParty => {
                     party_role = WatchPartyRole::None;
+                    resume_tracker.set_in_party(false);
                     gate_blocked = false;
                     let local_name = std::env::var("USER").unwrap_or_else(|_| "You".to_string());
                     let dur_ms = session.as_ref().map(|s| s.duration_ms);
@@ -2709,11 +2909,52 @@ pub fn run_playback_worker(
                 PlayerCommand::SetAudioStereoPan(pan) => {
                     let _ = audio_tx.send(AudioWorkerCommand::SetStereoPan(pan));
                 }
-                // v0.5.0 scaffold: no behaviour yet (nat / resume work packages).
-                PlayerCommand::DetectPublicAddress
-                | PlayerCommand::PunchPeer(_)
-                | PlayerCommand::ResumeAccept
-                | PlayerCommand::ResumeDecline => {}
+                PlayerCommand::ResumeAccept => {
+                    if let Some(target_ms) = pending_resume_pos_ms.take() {
+                        if matches!(party_role, WatchPartyRole::None) {
+                            if let Some(ref mut sess) = session {
+                                perform_session_seek(
+                                    sess,
+                                    target_ms,
+                                    clock.is_playing(),
+                                    &clock,
+                                    &video_ring,
+                                    &mut overflow_frame,
+                                    &audio_tx,
+                                    &mut current_audio_generation,
+                                    audio_delay_ms,
+                                    subtitle_delay_ms,
+                                    &event_tx,
+                                );
+                            }
+                        }
+                    }
+                }
+                PlayerCommand::ResumeDecline => {
+                    pending_resume_pos_ms = None;
+                    if let Some(key) = current_file_key {
+                        let now_ms = worker_start.elapsed().as_millis() as u64;
+                        resume_tracker.decline(&key, now_ms);
+                    }
+                }
+                PlayerCommand::SetAspectRatio(aspect) => {
+                    current_aspect = aspect;
+                }
+                PlayerCommand::SetResumePolicy(policy_str) => {
+                    if let Some(pol) = ResumePolicy::parse(&policy_str) {
+                        resume_policy = pol;
+                        resume_tracker.set_policy(pol);
+                    }
+                }
+                PlayerCommand::SetRememberPerFile(on) => {
+                    remember_per_file = on;
+                    resume_tracker.set_remember_per_file(on);
+                }
+                PlayerCommand::SetRememberSettings(on) => {
+                    remember_settings = on;
+                }
+                // v0.5.0 scaffold: no behaviour yet (nat work package).
+                PlayerCommand::DetectPublicAddress | PlayerCommand::PunchPeer(_) => {}
             }
         }
 
@@ -3524,6 +3765,18 @@ pub fn run_playback_worker(
                         clock.set_state(now, PlaybackState::Paused);
                         let _ = audio_tx.send(AudioWorkerCommand::Pause);
                         is_playing = false;
+                        let eof_mem = current_file_memory(
+                            &session,
+                            audio_delay_ms,
+                            subtitle_delay_ms,
+                            &current_aspect,
+                        );
+                        resume_tracker.on_stop(
+                            dur_ms,
+                            &eof_mem,
+                            true,
+                            worker_start.elapsed().as_millis() as u64,
+                        );
                         let _ = event_tx.send(UiEvent::PlaybackEofReached);
                         if let WatchPartyRole::Host { server, .. } = &mut party_role {
                             server.set_media_state(dur_ms, 1.0, true);
@@ -3678,6 +3931,23 @@ pub fn run_playback_worker(
                 room_sequence: 1,
             };
             exchange.publish(snap);
+
+            if session.is_some() {
+                let tick_mem = current_file_memory(
+                    &session,
+                    audio_delay_ms,
+                    subtitle_delay_ms,
+                    &current_aspect,
+                );
+                let now_ms = worker_start.elapsed().as_millis() as u64;
+                resume_tracker.on_tick(current_pts_ms.max(0.0) as u64, is_playing, &tick_mem, now_ms);
+                if let Some(err) = resume_tracker.take_error() {
+                    let _ = event_tx.send(UiEvent::HudNotification {
+                        text: format!("Resume save failed: {err}"),
+                        timestamp: Instant::now(),
+                    });
+                }
+            }
         }
 
         // 5. Sleep only when idle so decode/network bursts run with minimum jitter
@@ -3685,6 +3955,32 @@ pub fn run_playback_worker(
             let sleep_ms = if clock.is_playing() { 1 } else { 4 };
             thread::sleep(Duration::from_millis(sleep_ms));
         }
+    }
+
+    // Flush resume position and persist global settings on worker exit.
+    let exit_pos_ms = clock.current_pts(Instant::now()).max(0.0) as u64;
+    let exit_mem = current_file_memory(
+        &session,
+        audio_delay_ms,
+        subtitle_delay_ms,
+        &current_aspect,
+    );
+    resume_tracker.on_stop(
+        exit_pos_ms,
+        &exit_mem,
+        false,
+        worker_start.elapsed().as_millis() as u64,
+    );
+    if let Some(ref dirs) = user_dirs {
+        let mut s = Settings::load(&dirs.settings_path());
+        s.set_bool(keys::REMEMBER_SETTINGS, remember_settings);
+        s.set_bool(keys::REMEMBER_PER_FILE, remember_per_file);
+        s.set(keys::RESUME_POLICY, resume_policy.as_str());
+        if remember_settings {
+            s.set(keys::VOLUME, format!("{volume:.4}"));
+            s.set_bool(keys::MUTED, is_muted);
+        }
+        let _ = s.save(&dirs.settings_path());
     }
 }
 

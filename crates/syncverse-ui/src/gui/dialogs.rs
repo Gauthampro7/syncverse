@@ -1818,6 +1818,135 @@ impl SubtitleConfigDialog {
     }
 }
 
+/// Actions emitted by [`PreferencesDialog`] when user preferences are modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreferencesAction {
+    /// Resume policy changed (`"ask"`, `"always"`, `"never"`).
+    SetResumePolicy(String),
+    /// Per-file audio/subtitle/delay/aspect memory toggled.
+    SetRememberPerFile(bool),
+    /// Global settings persistence toggled.
+    SetRememberSettings(bool),
+}
+
+/// Preferences dialog for persistence, resume-playback policy, and general settings.
+#[derive(Debug, Clone)]
+pub struct PreferencesDialog {
+    /// Whether the preferences dialog window is currently open.
+    pub is_open: bool,
+    /// Selected resume policy (`"ask"`, `"always"`, or `"never"`).
+    pub resume_policy: String,
+    /// Whether per-file audio/subtitle track, delay, and aspect are remembered.
+    pub remember_per_file: bool,
+    /// Whether global settings (volume, sidebar, username, port) are remembered.
+    pub remember_settings: bool,
+}
+
+impl Default for PreferencesDialog {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            resume_policy: "ask".to_string(),
+            remember_per_file: true,
+            remember_settings: true,
+        }
+    }
+}
+
+impl PreferencesDialog {
+    /// Opens the preferences dialog.
+    pub fn open(&mut self) {
+        self.is_open = true;
+    }
+
+    /// Toggles the preferences dialog visibility.
+    pub fn toggle(&mut self) {
+        self.is_open = !self.is_open;
+    }
+
+    /// Renders the preferences dialog and returns any emitted [`PreferencesAction`] items.
+    pub fn show(&mut self, ctx: &egui::Context) -> Vec<PreferencesAction> {
+        let mut actions = Vec::new();
+        if !self.is_open {
+            return actions;
+        }
+
+        let mut is_open = self.is_open;
+        let mut close_clicked = false;
+
+        egui::Window::new("⚙ Preferences")
+            .open(&mut is_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("Playback & Persistence");
+                ui.add_space(6.0);
+
+                ui.label("Resume playback position:");
+                let policies = [
+                    ("ask", "Ask (show banner)"),
+                    ("always", "Always resume"),
+                    ("never", "Never resume"),
+                ];
+                let mut policy_changed = false;
+                ui.horizontal(|ui| {
+                    for (val, label) in policies {
+                        if ui
+                            .radio_value(&mut self.resume_policy, val.to_string(), label)
+                            .changed()
+                        {
+                            policy_changed = true;
+                        }
+                    }
+                });
+                if policy_changed {
+                    actions.push(PreferencesAction::SetResumePolicy(
+                        self.resume_policy.clone(),
+                    ));
+                }
+
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(
+                        &mut self.remember_per_file,
+                        "Remember audio/subtitle track, delay & aspect per file",
+                    )
+                    .changed()
+                {
+                    actions.push(PreferencesAction::SetRememberPerFile(
+                        self.remember_per_file,
+                    ));
+                }
+
+                if ui
+                    .checkbox(
+                        &mut self.remember_settings,
+                        "Remember global settings (volume, sidebar, username, port)",
+                    )
+                    .changed()
+                {
+                    actions.push(PreferencesAction::SetRememberSettings(
+                        self.remember_settings,
+                    ));
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+
+        self.is_open = is_open && !close_clicked;
+        actions
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

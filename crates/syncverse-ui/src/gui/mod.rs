@@ -32,8 +32,9 @@ pub use controls::{
 };
 pub use dialogs::{
     AboutDialog, AudioConfigAction, AudioConfigDialog, AudioTrackItem, ConnectPartyDialog,
-    HostPartyDialog, ShortcutsDialog, SubtitleConfigAction, SubtitleConfigDialog,
-    SubtitleTrackItem, VideoConfigAction, VideoConfigDialog, VideoStreamMetadata,
+    HostPartyDialog, PreferencesAction, PreferencesDialog, ShortcutsDialog, SubtitleConfigAction,
+    SubtitleConfigDialog, SubtitleTrackItem, VideoConfigAction, VideoConfigDialog,
+    VideoStreamMetadata,
 };
 pub use drag_drop::{is_supported_media, DragDropHandler, SUPPORTED_EXTENSIONS};
 pub use effects_dialog::{EffectsAction, EffectsDialog, EffectsTab};

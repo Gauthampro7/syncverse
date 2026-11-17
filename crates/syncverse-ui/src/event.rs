@@ -150,6 +150,8 @@ pub enum UiEvent {
         /// Media duration in milliseconds (`0` if unknown).
         duration_ms: u64,
     },
+    /// Per-file aspect ratio restored by core when opening a file.
+    AspectRatioRestored(String),
     /// New chat message to append to the sidebar chat history.
     NewChatRecord(ChatRecord),
     /// Updated list of watch-party room members.
