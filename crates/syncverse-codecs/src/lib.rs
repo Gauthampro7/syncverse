@@ -31,5 +31,9 @@ pub use h264::{
     NalHeader, NalUnitType, Pps, SliceHeader, SliceType, Sps,
 };
 pub use subtitle_decoder::{DecodedSubtitleEvent, UniversalSubtitleDecoder};
+pub use hwaccel::{
+    DecoderBackend, HwDeviceContext, HwFallbackReason, HwdecConfig, HwdecPolicy, HwdecPolicyError,
+    ENV_HWDEC, ENV_HWDEC_DEVICE, MAX_CONSECUTIVE_HW_ERRORS,
+};
 pub use universal_video::UniversalVideoDecoder;
 
