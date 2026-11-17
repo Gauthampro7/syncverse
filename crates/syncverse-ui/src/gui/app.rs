@@ -1545,8 +1545,35 @@ impl SyncverseApp {
                         self.apply_aspect_ratio(ar, false);
                     }
                 }
-                // v0.5.0 scaffold: handled by later work packages (nat, party state).
-                UiEvent::NatReport { .. } | UiEvent::PartyConnectionState { .. } => {}
+                UiEvent::PartyConnectionState { state } => {
+                    match &state {
+                        crate::event::PartyConnectionState::Reconnecting { attempt } => {
+                            self.osd_overlay.show_notification(
+                                format!("Reconnecting to host... (attempt {})", attempt),
+                                now,
+                            );
+                        }
+                        crate::event::PartyConnectionState::Failed { reason } => {
+                            self.osd_overlay.show_notification(
+                                format!("Watch party failed: {}", reason),
+                                now,
+                            );
+                        }
+                        crate::event::PartyConnectionState::Closed => {
+                            self.osd_overlay
+                                .show_notification("Watch party closed", now);
+                        }
+                        _ => {}
+                    }
+                    self.sidebar_state.party_connection_state =
+                        if matches!(state, crate::event::PartyConnectionState::Closed) {
+                            None
+                        } else {
+                            Some(state)
+                        };
+                }
+                // v0.5.0 scaffold: handled by WP2 (nat).
+                UiEvent::NatReport { .. } => {}
             }
         }
 

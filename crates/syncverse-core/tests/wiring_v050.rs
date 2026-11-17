@@ -460,3 +460,72 @@ fn wp1_hwdec_policy_reaches_session_open_and_fallback_toast() {
     handle.join().unwrap();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wp3_connect_unreachable_never_emits_connected() {
+    let probe_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_port = probe_sock.local_addr().unwrap().port();
+    drop(probe_sock);
+
+    let (cmd_tx, cmd_rx) = channel::<PlayerCommand>();
+    let (audio_tx, _audio_rx) = channel::<AudioWorkerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let worker_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        run_playback_worker_with_dirs(
+            cmd_rx,
+            audio_tx,
+            event_tx,
+            exchange,
+            video_ring,
+            clock,
+            worker_running,
+            None,
+        );
+    });
+
+    cmd_tx
+        .send(PlayerCommand::ConnectParty {
+            addr: format!("127.0.0.1:{dead_port}"),
+            room: "nowhere".to_string(),
+            username: "Guest".to_string(),
+            password: None,
+        })
+        .unwrap();
+
+    let events = drain_events_until(&event_rx, Duration::from_millis(600), |_| false);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::PartyConnectionState {
+                state: syncverse_ui::event::PartyConnectionState::Connecting
+            }
+        )),
+        "expected Connecting state, got {:?}",
+        events
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            UiEvent::PartyConnectionState {
+                state: syncverse_ui::event::PartyConnectionState::Connected
+            }
+        )),
+        "must NOT emit Connected when no host responds"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            UiEvent::NewChatRecord(rec) if String::from_utf8_lossy(&rec.payload).contains("Connected to")
+        )),
+        "must NOT emit premature Connected chat message"
+    );
+
+    running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+}

@@ -93,6 +93,15 @@ pub enum PartyFailReason {
     /// The host did not acknowledge the handshake in time.
     #[error("host did not respond")]
     HandshakeTimeout,
+    /// Room password / authentication failed.
+    #[error("authentication failed (wrong password)")]
+    AuthFailed,
+    /// Room has reached its maximum client capacity.
+    #[error("room is full")]
+    HostFull,
+    /// Wire protocol version mismatch between client and host.
+    #[error("incompatible protocol version")]
+    VersionUnsupported,
     /// The host address could not be parsed or resolved.
     #[error("invalid host address")]
     InvalidAddress,

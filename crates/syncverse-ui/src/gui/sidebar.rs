@@ -273,6 +273,8 @@ pub struct SidebarState {
     pub pending_seek_ms: Option<u64>,
     /// When true, suppresses rendering the collapsed floating toggle handle (e.g., behind modals or hidden fullscreen controls).
     pub suppress_floating_handle: bool,
+    /// Verified client-side watch-party connection state (WP3).
+    pub party_connection_state: Option<crate::event::PartyConnectionState>,
 }
 
 impl Default for SidebarState {
@@ -302,6 +304,7 @@ impl Default for SidebarState {
             pending_clear_chat: false,
             pending_seek_ms: None,
             suppress_floating_handle: false,
+            party_connection_state: None,
         }
     }
 }
@@ -381,6 +384,28 @@ impl SidebarState {
         // --- 1. HEADER & COLLAPSE BUTTON ---
         ui.horizontal(|ui| {
             ui.heading("Watch Party");
+            if let Some(ref conn_state) = self.party_connection_state {
+                let (label, color) = match conn_state {
+                    crate::event::PartyConnectionState::Connecting => {
+                        ("Connecting...".to_string(), Color32::from_rgb(250, 204, 21))
+                    }
+                    crate::event::PartyConnectionState::Connected => {
+                        ("Connected".to_string(), Color32::from_rgb(74, 222, 128))
+                    }
+                    crate::event::PartyConnectionState::Reconnecting { attempt } => (
+                        format!("Reconnecting... (attempt {})", attempt),
+                        Color32::from_rgb(251, 146, 60),
+                    ),
+                    crate::event::PartyConnectionState::Failed { reason } => (
+                        format!("Failed: {}", reason),
+                        Color32::from_rgb(248, 113, 113),
+                    ),
+                    crate::event::PartyConnectionState::Closed => {
+                        ("Disconnected".to_string(), Color32::from_rgb(148, 163, 184))
+                    }
+                };
+                ui.label(egui::RichText::new(label).small().strong().color(color));
+            }
             ui.label(format!("({})", self.members.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("▶").on_hover_text("Collapse sidebar (Tab)").clicked() {

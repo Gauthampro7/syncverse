@@ -28,10 +28,12 @@ use syncverse_codecs::{
 use syncverse_common::subtitles::{SubtitleSource, SubtitleTrack as CommonSubtitleTrack};
 use syncverse_common::userdata::{keys, FileKey, Settings, UserDirs};
 use syncverse_demux::{DemuxPacket, Demuxer, TrackInfo, TrackType, UniversalDemuxer};
+use syncverse_sync::client::{ClientConnectionState, ConnectFailReason, ConnectionEvent};
 use syncverse_sync::{
     spawn_upnp_mapping, ClientNode, HostServer, MediaFingerprint, PeerControlAction,
     PeerStatusPayload, RoomCryptoSession,
 };
+use syncverse_ui::event::{PartyConnectionState, PartyFailReason};
 use syncverse_ui::{
     evaluate_file_match, FileMatchStatus, PlayerCommand, PlayerUiSnapshot, RoomMember,
     TripleBufferSnapshotExchange, UiEvent, SNAPSHOT_FLAG_FORCE_PLAY, SNAPSHOT_FLAG_GATE_BLOCKED,
@@ -1404,6 +1406,8 @@ pub fn run_playback_worker_with_hw_and_dirs(
     let mut pending_resume_pos_ms: Option<u64> = None;
     let mut current_aspect: String = "auto".to_string();
     let mut pts_hist = PtsHistory::new();
+    let mut client_initial_connected_announced: bool = false;
+    let mut client_connect_addr: String = String::new();
     let mut local_ready: bool = false;
     let mut force_play: bool = false;
     let mut gate_blocked: bool = false;
@@ -2753,36 +2757,13 @@ pub fn run_playback_worker_with_hw_and_dirs(
                         match ClientNode::bind_for_target(target, client_id) {
                             Ok(mut client) => {
                                 client.set_crypto(crypto.clone());
+                                client.begin_join(&username);
+                                let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                    state: PartyConnectionState::Connecting,
+                                });
 
                                 let now = Instant::now();
-                                let wall_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-                                let current_pts = clock.current_pts(now).max(0.0) as u64;
                                 let dur_ms = session.as_ref().map(|s| s.duration_ms);
-
-                                // Send immediate join handshake: peer status, initial NTP probe, sync snapshot request, and join chat
-                                let _ = client.send_peer_status_with_hash(
-                                    session.is_some(),
-                                    local_ready,
-                                    dur_ms.unwrap_or(0),
-                                    current_file_size,
-                                    &username,
-                                    current_file_name.as_deref().unwrap_or(""),
-                                    current_media_hash,
-                                );
-                                let _ = client.send_ntp_probe();
-                                let _ = client.request_sync_snapshot();
-
-                                let join_rec = ChatRecord::new_text(
-                                    wall_ms,
-                                    current_pts,
-                                    [0u8; 16],
-                                    username.clone(),
-                                    &format!("👋 Joined room '{}'", room),
-                                );
-                                let _ = client.send_chat_message_with_pts(&join_rec.to_network_bytes(), current_pts);
 
                                 let _ = event_tx.send(UiEvent::RoomMembersUpdated(vec![RoomMember::with_media(
                                     username.clone(),
@@ -2794,16 +2775,6 @@ pub fn run_playback_worker_with_hw_and_dirs(
                                     if session.is_some() { Some(current_file_size) } else { None },
                                     local_ready,
                                 )]));
-
-                                let enc_notice = if crypto.is_some() { " [E2E Encrypted 🔒]" } else { "" };
-                                let rec = ChatRecord::new_text(
-                                    wall_ms,
-                                    current_pts,
-                                    [0u8; 16],
-                                    "System".to_string(),
-                                    &format!("🔗 Connected to {} (Room '{}'{})", addr, room, enc_notice),
-                                );
-                                let _ = event_tx.send(UiEvent::NewChatRecord(rec));
 
                                 party_role = WatchPartyRole::Client {
                                     client,
@@ -2817,11 +2788,18 @@ pub fn run_playback_worker_with_hw_and_dirs(
                                     initial_sync_locked: false,
                                     last_pll_update: now,
                                 };
+                                client_initial_connected_announced = false;
+                                client_connect_addr = addr;
                                 resume_tracker.set_in_party(true);
                                 pending_resume_pos_ms = None;
                             }
                             Err(e) => {
                                 eprintln!("[ERROR] Failed to bind ClientNode to {}: {}", addr, e);
+                                let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                    state: PartyConnectionState::Failed {
+                                        reason: PartyFailReason::Socket(e.to_string()),
+                                    },
+                                });
                                 let wall_ms = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
@@ -2838,6 +2816,11 @@ pub fn run_playback_worker_with_hw_and_dirs(
                         }
                     } else {
                         eprintln!("[ERROR] Invalid address format: {}", addr);
+                        let _ = event_tx.send(UiEvent::PartyConnectionState {
+                            state: PartyConnectionState::Failed {
+                                reason: PartyFailReason::InvalidAddress,
+                            },
+                        });
                         let wall_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
@@ -2879,6 +2862,18 @@ pub fn run_playback_worker_with_hw_and_dirs(
                     }
                 }
                 PlayerCommand::DisconnectParty => {
+                    match &mut party_role {
+                        WatchPartyRole::Client { client, .. } => {
+                            client.leave();
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Closed,
+                            });
+                        }
+                        WatchPartyRole::Host { server, .. } => {
+                            server.close_room();
+                        }
+                        WatchPartyRole::None => {}
+                    }
                     party_role = WatchPartyRole::None;
                     resume_tracker.set_in_party(false);
                     gate_blocked = false;
@@ -3485,7 +3480,26 @@ pub fn run_playback_worker_with_hw_and_dirs(
                 }
 
                 // Prune stale / disconnected peers
-                server.prune_stale_clients(Duration::from_secs(12));
+                server.prune_stale();
+                for departed in server.drain_departed_peers() {
+                    let departed_name = client_names
+                        .remove(&departed.addr)
+                        .filter(|n| !n.is_empty())
+                        .or_else(|| (!departed.username.is_empty()).then_some(departed.username))
+                        .unwrap_or_else(|| departed.addr.to_string());
+                    let wall_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let rec = ChatRecord::new_text(
+                        wall_ms,
+                        clock.current_pts(Instant::now()).max(0.0) as u64,
+                        [0u8; 16],
+                        "System".to_string(),
+                        &format!("👋 {} left the room", departed_name),
+                    );
+                    let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                }
 
                 let now = Instant::now();
                 // Send NTP probes to clients (~1 Hz) to measure RTT
@@ -3582,19 +3596,172 @@ pub fn run_playback_worker_with_hw_and_dirs(
             }
             WatchPartyRole::Client {
                 client,
-                _room: _,
+                _room: room_name,
                 local_username,
                 host_username,
                 last_probe_sent,
                 last_member_update,
                 last_peer_count,
-                _crypto: _,
+                _crypto: crypto,
                 initial_sync_locked,
                 last_pll_update,
             } => {
                 // Poll incoming UDP datagrams
                 while let Ok(Some(_)) = client.poll_and_process() {
                     did_work = true;
+                }
+
+                // Drain departed peers reported by host Bye/RoomState
+                let _ = client.poll_departed_peers();
+
+                // Process WP3 client connection state machine events
+                let now_conn = Instant::now();
+                let mut reset_party_to_none = false;
+                for ev in client.poll_connection_events() {
+                    match ev {
+                        ConnectionEvent::StateChanged(ClientConnectionState::Connecting) => {
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Connecting,
+                            });
+                        }
+                        ConnectionEvent::StateChanged(ClientConnectionState::Connected) => {
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Connected,
+                            });
+                            if !client_initial_connected_announced {
+                                client_initial_connected_announced = true;
+                                let wall_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let current_pts = clock.current_pts(now_conn).max(0.0) as u64;
+                                let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                                let _ = client.send_peer_status_with_hash(
+                                    session.is_some(),
+                                    local_ready,
+                                    dur_ms.unwrap_or(0),
+                                    current_file_size,
+                                    local_username,
+                                    current_file_name.as_deref().unwrap_or(""),
+                                    current_media_hash,
+                                );
+                                let _ = client.send_ntp_probe();
+                                let _ = client.request_sync_snapshot();
+                                let join_rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    current_pts,
+                                    [0u8; 16],
+                                    local_username.clone(),
+                                    &format!("👋 Joined room '{}'", room_name),
+                                );
+                                let _ = client.send_chat_message_with_pts(
+                                    &join_rec.to_network_bytes(),
+                                    current_pts,
+                                );
+                                let enc_notice = if crypto.is_some() {
+                                    " [E2E Encrypted 🔒]"
+                                } else {
+                                    ""
+                                };
+                                let rec = ChatRecord::new_text(
+                                    wall_ms,
+                                    current_pts,
+                                    [0u8; 16],
+                                    "System".to_string(),
+                                    &format!(
+                                        "🔗 Connected to {} (Room '{}'{})",
+                                        client_connect_addr, room_name, enc_notice
+                                    ),
+                                );
+                                let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                            }
+                        }
+                        ConnectionEvent::LegacyHostFallback => {
+                            let wall_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let rec = ChatRecord::new_text(
+                                wall_ms,
+                                clock.current_pts(now_conn).max(0.0) as u64,
+                                [0u8; 16],
+                                "System".to_string(),
+                                "ℹ️ Legacy v0.4 host detected; connected in compatibility mode.",
+                            );
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        ConnectionEvent::StateChanged(ClientConnectionState::Reconnecting {
+                            attempt,
+                        }) => {
+                            clock.reanchor(now_conn, 1.0);
+                            let _ = audio_tx.send(AudioWorkerCommand::SetSpeed(1.0));
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Reconnecting { attempt },
+                            });
+                        }
+                        ConnectionEvent::Rejoined { .. } => {
+                            let dur_ms = session.as_ref().map(|s| s.duration_ms);
+                            let _ = client.send_peer_status_with_hash(
+                                session.is_some(),
+                                local_ready,
+                                dur_ms.unwrap_or(0),
+                                current_file_size,
+                                local_username,
+                                current_file_name.as_deref().unwrap_or(""),
+                                current_media_hash,
+                            );
+                            let _ = client.send_ntp_probe();
+                            let _ = client.request_sync_snapshot();
+                            let wall_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let rec = ChatRecord::new_text(
+                                wall_ms,
+                                clock.current_pts(now_conn).max(0.0) as u64,
+                                [0u8; 16],
+                                "System".to_string(),
+                                "🔄 Rejoined watch-party room.",
+                            );
+                            let _ = event_tx.send(UiEvent::NewChatRecord(rec));
+                        }
+                        ConnectionEvent::StateChanged(ClientConnectionState::Failed(r)) => {
+                            let reason = match r {
+                                ConnectFailReason::Timeout => PartyFailReason::HandshakeTimeout,
+                                ConnectFailReason::AuthFailed => PartyFailReason::AuthFailed,
+                                ConnectFailReason::HostFull => PartyFailReason::HostFull,
+                                ConnectFailReason::VersionUnsupported => {
+                                    PartyFailReason::VersionUnsupported
+                                }
+                                ConnectFailReason::HostLost => PartyFailReason::HostLost,
+                            };
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: format!("Watch party failed: {reason}"),
+                                timestamp: now_conn,
+                            });
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Failed { reason },
+                            });
+                            reset_party_to_none = true;
+                        }
+                        ConnectionEvent::StateChanged(ClientConnectionState::Closed(_)) => {
+                            let _ = event_tx.send(UiEvent::HudNotification {
+                                text: "Host closed the room".to_string(),
+                                timestamp: now_conn,
+                            });
+                            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                                state: PartyConnectionState::Closed,
+                            });
+                            reset_party_to_none = true;
+                        }
+                        ConnectionEvent::StateChanged(ClientConnectionState::Idle) => {}
+                    }
+                }
+                if reset_party_to_none {
+                    party_role = WatchPartyRole::None;
+                    resume_tracker.set_in_party(false);
+                    gate_blocked = false;
+                    continue;
                 }
 
                 // Process pending chat messages
@@ -4053,6 +4220,20 @@ pub fn run_playback_worker_with_hw_and_dirs(
             let sleep_ms = if clock.is_playing() { 1 } else { 4 };
             thread::sleep(Duration::from_millis(sleep_ms));
         }
+    }
+
+    // Cleanly leave/close watch party on worker exit.
+    match &mut party_role {
+        WatchPartyRole::Client { client, .. } => {
+            client.leave();
+            let _ = event_tx.send(UiEvent::PartyConnectionState {
+                state: PartyConnectionState::Closed,
+            });
+        }
+        WatchPartyRole::Host { server, .. } => {
+            server.close_room();
+        }
+        WatchPartyRole::None => {}
     }
 
     // Flush resume position and persist global settings on worker exit.

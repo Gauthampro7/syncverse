@@ -152,3 +152,43 @@ fn wp1_video_dialog_hwdec_mode_persists_in_settings() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wp3_party_connection_state_updates_sidebar_badge() {
+    let exchange = Arc::new(TripleBufferSnapshotExchange::new());
+    let video_ring = Arc::new(SpscRingBuffer::<VideoFrameRGBA, 32>::new());
+    let clock = Arc::new(MasterClock::new(0.0, 1.0, PlaybackState::Paused));
+    let (command_tx, _command_rx) = channel::<PlayerCommand>();
+    let (event_tx, event_rx) = channel::<UiEvent>();
+
+    let mut app =
+        SyncverseApp::with_headless_subsystems(exchange, video_ring, clock, command_tx, event_rx);
+
+    event_tx
+        .send(UiEvent::PartyConnectionState {
+            state: syncverse_ui::event::PartyConnectionState::Reconnecting { attempt: 3 },
+        })
+        .unwrap();
+
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.render_ui(ui);
+    });
+    out.textures_delta.clear();
+
+    assert_eq!(
+        app.sidebar_state().party_connection_state,
+        Some(syncverse_ui::event::PartyConnectionState::Reconnecting { attempt: 3 })
+    );
+
+    event_tx
+        .send(UiEvent::PartyConnectionState {
+            state: syncverse_ui::event::PartyConnectionState::Closed,
+        })
+        .unwrap();
+    let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.render_ui(ui);
+    });
+    out2.textures_delta.clear();
+    assert_eq!(app.sidebar_state().party_connection_state, None);
+}
