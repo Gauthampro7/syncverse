@@ -7,13 +7,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::digest::{digest, SHA256};
 
-use crate::error::SyncError;
+use crate::error::{CryptoErrorKind, SyncError};
 
 /// Tag length in bytes for Poly1305 authentication (16 bytes).
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Nonce length in bytes for ChaCha20-Poly1305 (12 bytes: 4 bytes salt + 8 bytes counter).
 pub const AEAD_NONCE_LEN: usize = 12;
+
+/// Returns 8 random bytes from the OS CSPRNG, falling back to clock jitter if unavailable.
+fn random_u64() -> u64 {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 8];
+    if SystemRandom::new().fill(&mut bytes).is_ok() {
+        u64::from_le_bytes(bytes)
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+    }
+}
+
+/// Returns a random `u32` (join nonces, host epochs).
+pub(crate) fn random_u32() -> u32 {
+    (random_u64() >> 16) as u32
+}
 
 /// Cryptographic session managing ChaCha20-Poly1305 AEAD sealing and opening for a watch-party room.
 pub struct RoomCryptoSession {
@@ -36,7 +55,7 @@ impl RoomCryptoSession {
 
         let key_digest = digest(&SHA256, &context);
         let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key_digest.as_ref())
-            .map_err(|_| SyncError::Crypto("Failed to create ChaCha20-Poly1305 unbound key".to_string()))?;
+            .map_err(|_| SyncError::Crypto(CryptoErrorKind::KeyCreationFailed))?;
 
         // Generate 4-byte session salt from key hash prefix
         let salt_digest = digest(&SHA256, key_digest.as_ref());
@@ -46,7 +65,10 @@ impl RoomCryptoSession {
         Ok(Self {
             sealing_key: LessSafeKey::new(unbound_key),
             salt,
-            packet_counter: AtomicU64::new(1),
+            // Random start: host and client share the room key, so a fixed start of 1 would make
+            // both directions reuse the same (key, nonce) pairs (keystream reuse). Wrapping
+            // collision odds with a random 64-bit start are negligible.
+            packet_counter: AtomicU64::new(random_u64()),
         })
     }
 
@@ -66,12 +88,12 @@ impl RoomCryptoSession {
         let counter = self.packet_counter.fetch_add(1, Ordering::Relaxed);
         let nonce_bytes = self.make_nonce(counter);
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-            .map_err(|_| SyncError::Crypto("Nonce uniqueness assumption failed".to_string()))?;
+            .map_err(|_| SyncError::Crypto(CryptoErrorKind::NonceUniquenessFailed))?;
 
         let mut in_out = plaintext.to_vec();
         self.sealing_key
             .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| SyncError::Crypto("ChaCha20-Poly1305 encryption failed".to_string()))?;
+            .map_err(|_| SyncError::Crypto(CryptoErrorKind::EncryptionFailed))?;
 
         Ok((counter, in_out))
     }
@@ -82,18 +104,18 @@ impl RoomCryptoSession {
     /// or `SyncError::Crypto` if verification fails.
     pub fn decrypt(&self, counter: u64, ciphertext_and_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>, SyncError> {
         if ciphertext_and_tag.len() < AEAD_TAG_LEN {
-            return Err(SyncError::Crypto("Ciphertext too short for Poly1305 tag".to_string()));
+            return Err(SyncError::Crypto(CryptoErrorKind::CiphertextTooShort));
         }
 
         let nonce_bytes = self.make_nonce(counter);
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-            .map_err(|_| SyncError::Crypto("Nonce uniqueness assumption failed".to_string()))?;
+            .map_err(|_| SyncError::Crypto(CryptoErrorKind::NonceUniquenessFailed))?;
 
         let mut in_out = ciphertext_and_tag.to_vec();
         let decrypted_slice = self
             .sealing_key
             .open_in_place(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| SyncError::Crypto("ChaCha20-Poly1305 authentication failed: invalid tag or corrupted ciphertext".to_string()))?;
+            .map_err(|_| SyncError::Crypto(CryptoErrorKind::AuthenticationFailed))?;
 
         Ok(decrypted_slice.to_vec())
     }

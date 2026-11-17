@@ -450,6 +450,18 @@ fn test_cross_peer_playback_start_alignment() {
     );
 }
 
+fn poll_err(
+    host: &mut HostServer,
+) -> Result<Option<(WirePacket, std::net::SocketAddr)>, syncverse_sync::SyncError> {
+    match host.poll_and_process()? {
+        Some(v) => Ok(Some(v)),
+        None => match host.take_last_decode_error() {
+            Some(e) => Err(e),
+            None => Ok(None),
+        },
+    }
+}
+
 #[test]
 fn test_corrupted_datagram_rejection_without_panicking() {
     let mut host = HostServer::bind("127.0.0.1:0").expect("host bind");
@@ -468,18 +480,14 @@ fn test_corrupted_datagram_rejection_without_panicking() {
     bad_magic[0] = b'X';
     raw_sock.send_to(&bad_magic, host_addr).expect("send");
     thread::sleep(Duration::from_millis(2));
-    let err = host
-        .poll_and_process()
-        .expect_err("should reject invalid magic");
+    let err = poll_err(&mut host).expect_err("should reject invalid magic");
     assert!(matches!(err, syncverse_sync::SyncError::InvalidMagic(_)));
 
     // 2. Truncated header (0 to 11 bytes)
     for len in 0..12 {
         raw_sock.send_to(&valid_bytes[..len], host_addr).expect("send");
         thread::sleep(Duration::from_millis(1));
-        let err = host
-            .poll_and_process()
-            .expect_err("should reject truncated header");
+        let err = poll_err(&mut host).expect_err("should reject truncated header");
         assert!(matches!(err, syncverse_sync::SyncError::PacketTooShort(_)));
     }
 
@@ -491,9 +499,7 @@ fn test_corrupted_datagram_rejection_without_panicking() {
             .send_to(&bad_type_bytes, host_addr)
             .expect("send");
         thread::sleep(Duration::from_millis(1));
-        let err = host
-            .poll_and_process()
-            .expect_err("should reject unknown packet type");
+        let err = poll_err(&mut host).expect_err("should reject unknown packet type");
         assert!(matches!(
             err,
             syncverse_sync::SyncError::UnknownPacketType(_)
@@ -507,9 +513,7 @@ fn test_corrupted_datagram_rejection_without_panicking() {
         .send_to(&truncated_payload, host_addr)
         .expect("send");
     thread::sleep(Duration::from_millis(1));
-    let err = host
-        .poll_and_process()
-        .expect_err("should reject truncated payload");
+    let err = poll_err(&mut host).expect_err("should reject truncated payload");
     assert!(matches!(
         err,
         syncverse_sync::SyncError::PayloadTruncated { .. }
@@ -520,9 +524,7 @@ fn test_corrupted_datagram_rejection_without_panicking() {
     bad_crc[8] ^= 0xFF;
     raw_sock.send_to(&bad_crc, host_addr).expect("send");
     thread::sleep(Duration::from_millis(1));
-    let err = host
-        .poll_and_process()
-        .expect_err("should reject CRC mismatch");
+    let err = poll_err(&mut host).expect_err("should reject CRC mismatch");
     assert!(matches!(err, syncverse_sync::SyncError::CrcMismatch { .. }));
 
     // 6. Payload single-bit tampering (all 96 bits of 12-byte payload)
@@ -532,12 +534,11 @@ fn test_corrupted_datagram_rejection_without_panicking() {
             flipped[byte_idx] ^= 1 << bit;
             raw_sock.send_to(&flipped, host_addr).expect("send");
             thread::sleep(Duration::from_millis(1));
-            let err = host
-                .poll_and_process()
-                .expect_err("should reject tampered payload");
+            let err = poll_err(&mut host).expect_err("should reject tampered payload");
             assert!(matches!(err, syncverse_sync::SyncError::CrcMismatch { .. }));
         }
     }
+    assert!(host.dropped_datagrams() > 0);
 
     // 7. Fuzzing with 200 random byte datagrams of various lengths
     let mut lfsr: u32 = 0x12345678;

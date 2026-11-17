@@ -10,15 +10,30 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::barrier::{compute_target_unpause_server, BarrierPhase, BarrierStateMachine};
-use crate::crypto::RoomCryptoSession;
+use crate::client::{
+    ClientConnectionState, ConnectionEvent, DepartedPeer, LinkAction, LinkMachine,
+    ResilienceConfig,
+};
+use crate::crypto::{random_u32, RoomCryptoSession};
 use crate::error::SyncError;
 use crate::ntp::{ProbeSample, Rfc5905Filter};
 use crate::pll::{PllCorrection, PllSpeedController, PllZone};
 use crate::timeline::RoomState;
 use crate::wire::{
-    ChatMessagePayload, PacketPayload, PacketType, PeerControlAction, PeerControlPayload, PeerStatusPayload,
-    ReactionPayload, WirePacket, FLAG_BARRIER_COMMIT,
+    ByeReason, ChatMessagePayload, HelloPayload, HelloStatus, PacketPayload, PacketType,
+    PeerControlAction, PeerControlPayload, PeerStatusPayload, ReactionPayload, WirePacket,
+    FLAG_BARRIER_COMMIT,
 };
+
+/// How long a peer that said `Bye` is ignored by implicit (v0.4-style) registration, so
+/// in-flight datagrams cannot resurrect a session that was just closed.
+const BYE_TOMBSTONE: Duration = Duration::from_secs(1);
+
+/// Minimum spacing of plaintext auth-failure replies to one address.
+const REJECT_COOLDOWN: Duration = Duration::from_millis(250);
+
+/// Default cap on simultaneously registered peers.
+const DEFAULT_MAX_CLIENTS: usize = 64;
 
 fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -252,6 +267,28 @@ pub struct ClientSession {
     pub username: String,
     /// SHA-256 fingerprint hash of the loaded media.
     pub media_hash: [u8; 32],
+    /// Nonce of the `Hello` this session was last (re)joined with (`0` = implicit join).
+    pub hello_nonce: u32,
+}
+
+impl ClientSession {
+    fn new(addr: SocketAddr, client_id: u32, rtt_ms: u64) -> Self {
+        Self {
+            client_id,
+            addr,
+            rtt_ms,
+            last_seen: Instant::now(),
+            barrier_preroll_ready: false,
+            is_user_ready: false,
+            has_media: false,
+            filename: String::new(),
+            duration_ms: 0,
+            file_size_bytes: 0,
+            username: String::new(),
+            media_hash: [0u8; 32],
+            hello_nonce: 0,
+        }
+    }
 }
 
 /// Host watch-party server managing UDP transport, NTP timekeeping, and barrier synchronization.
@@ -275,6 +312,14 @@ pub struct HostServer {
     reactions: Vec<ReactionPayload>,
     pending_probes: HashMap<u32, (SocketAddr, u64)>,
     next_probe_id: u32,
+    barrier_preroll_budget_ms: u32,
+    resilience: ResilienceConfig,
+    host_epoch: u32,
+    next_client_id: u32,
+    max_clients: usize,
+    departed: Vec<DepartedPeer>,
+    tombstones: HashMap<SocketAddr, Instant>,
+    reject_cooldown: HashMap<SocketAddr, Instant>,
 }
 
 impl HostServer {
@@ -301,7 +346,56 @@ impl HostServer {
             reactions: Vec::new(),
             pending_probes: HashMap::new(),
             next_probe_id: 1,
+            barrier_preroll_budget_ms: 0,
+            resilience: ResilienceConfig::default(),
+            host_epoch: random_u32(),
+            next_client_id: 1,
+            max_clients: DEFAULT_MAX_CLIENTS,
+            departed: Vec::new(),
+            tombstones: HashMap::new(),
+            reject_cooldown: HashMap::new(),
         })
+    }
+
+    /// Replaces the resilience timeouts (only `host_prune_timeout` is used host-side).
+    pub fn set_resilience(&mut self, cfg: ResilienceConfig) {
+        self.resilience = cfg;
+    }
+
+    /// Builder-style variant of [`HostServer::set_resilience`].
+    pub fn with_resilience(mut self, cfg: ResilienceConfig) -> Self {
+        self.resilience = cfg;
+        self
+    }
+
+    /// Returns the active resilience configuration.
+    pub fn resilience(&self) -> &ResilienceConfig {
+        &self.resilience
+    }
+
+    /// Caps the number of simultaneously registered peers (further `Hello`s get `HostFull`).
+    pub fn set_max_clients(&mut self, max_clients: usize) {
+        self.max_clients = max_clients;
+    }
+
+    /// Random identifier of this host run, announced in every `HelloAck`.
+    pub fn host_epoch(&self) -> u32 {
+        self.host_epoch
+    }
+
+    /// Allocates a client id: the requested one if free, otherwise the next unused value of a
+    /// strictly monotonic counter (never `len() + 1`, which collides after a prune).
+    fn alloc_client_id(&mut self, requested: u32) -> u32 {
+        if requested != 0 && !self.clients.values().any(|c| c.client_id == requested) {
+            return requested;
+        }
+        loop {
+            let id = self.next_client_id;
+            self.next_client_id = self.next_client_id.wrapping_add(1).max(1);
+            if !self.clients.values().any(|c| c.client_id == id) {
+                return id;
+            }
+        }
     }
 
     /// Configures or clears the room encryption session on the host transport.
@@ -368,23 +462,8 @@ impl HostServer {
 
     /// Registers or updates a client connection with known RTT.
     pub fn register_client(&mut self, addr: SocketAddr, client_id: u32, rtt_ms: u64) {
-        self.clients.insert(
-            addr,
-            ClientSession {
-                client_id,
-                addr,
-                rtt_ms,
-                last_seen: Instant::now(),
-                barrier_preroll_ready: false,
-                is_user_ready: false,
-                has_media: false,
-                filename: String::new(),
-                duration_ms: 0,
-                file_size_bytes: 0,
-                username: String::new(),
-                media_hash: [0u8; 32],
-            },
-        );
+        self.clients
+            .insert(addr, ClientSession::new(addr, client_id, rtt_ms));
     }
 
     /// Updates the measured RTT for a connected client address.
@@ -436,29 +515,56 @@ impl HostServer {
     /// Polls for incoming UDP datagrams, automatically handling NTP probes, barrier acks, and seeks.
     pub fn poll_and_process(&mut self) -> Result<Option<(WirePacket, SocketAddr)>, SyncError> {
         let res = self.transport.poll_packet()?;
+        self.flush_auth_rejects();
         if let Some((ref packet, addr)) = res {
             let now = Instant::now();
-            let next_client_id = (self.clients.len() + 1) as u32;
+
+            // Session-control packets never create a session implicitly.
+            match &packet.payload {
+                PacketPayload::Hello(hello) => {
+                    self.handle_hello(addr, hello);
+                    return Ok(res);
+                }
+                PacketPayload::Heartbeat(hb) => {
+                    if let Some(client) = self.clients.get_mut(&addr) {
+                        client.last_seen = now;
+                        if !hb.is_reply {
+                            let _ = self
+                                .transport
+                                .send_packet(&WirePacket::heartbeat(hb.seq, true), addr);
+                        }
+                    } else if !hb.is_reply {
+                        // Unknown (restarted host / pruned peer): tell it to rejoin.
+                        let _ = self
+                            .transport
+                            .send_packet(&WirePacket::bye(ByeReason::NotJoined, 0), addr);
+                    }
+                    return Ok(res);
+                }
+                PacketPayload::Bye(bye) => {
+                    if bye.reason == ByeReason::Leave {
+                        self.remove_client(addr, ByeReason::Leave);
+                    }
+                    return Ok(res);
+                }
+                PacketPayload::HelloAck(_) => return Ok(res),
+                _ => {}
+            }
+
+            if self
+                .tombstones
+                .get(&addr)
+                .is_some_and(|t| t.elapsed() < BYE_TOMBSTONE)
+            {
+                return Ok(res);
+            }
             let is_new_client = !self.clients.contains_key(&addr);
-            self.clients
-                .entry(addr)
-                .and_modify(|c| c.last_seen = now)
-                .or_insert_with(|| ClientSession {
-                    client_id: next_client_id,
-                    addr,
-                    rtt_ms: 0,
-                    last_seen: now,
-                    barrier_preroll_ready: false,
-                    is_user_ready: false,
-                    has_media: false,
-                    filename: String::new(),
-                    duration_ms: 0,
-                    file_size_bytes: 0,
-                    username: String::new(),
-                    media_hash: [0u8; 32],
-                });
             if is_new_client {
+                let id = self.alloc_client_id(0);
+                self.clients.insert(addr, ClientSession::new(addr, id, 0));
                 self.newly_joined_peers.push(addr);
+            } else if let Some(c) = self.clients.get_mut(&addr) {
+                c.last_seen = now;
             }
 
             match &packet.payload {
@@ -564,6 +670,145 @@ impl HostServer {
         Ok(res)
     }
 
+    /// Sends plaintext `AuthFailed` rejections to peers whose `Hello` failed encryption checks.
+    fn flush_auth_rejects(&mut self) {
+        for addr in self.transport.take_pending_auth_rejects() {
+            let recently = self
+                .reject_cooldown
+                .get(&addr)
+                .is_some_and(|t| t.elapsed() < REJECT_COOLDOWN);
+            if recently {
+                continue;
+            }
+            if self.reject_cooldown.len() > 256 {
+                self.reject_cooldown.clear();
+            }
+            self.reject_cooldown.insert(addr, Instant::now());
+            let reject = WirePacket::hello_ack(0, HelloStatus::AuthFailed, 0, self.host_epoch);
+            let _ = self.transport.send_packet_plain(&reject, addr);
+        }
+    }
+
+    /// Processes a join handshake (new peer or a rejoin of a known one).
+    fn handle_hello(&mut self, addr: SocketAddr, hello: &HelloPayload) {
+        let now = Instant::now();
+        if hello.version == 0 {
+            let reject = WirePacket::hello_ack(
+                hello.nonce,
+                HelloStatus::VersionUnsupported,
+                0,
+                self.host_epoch,
+            );
+            let _ = self.transport.send_packet(&reject, addr);
+            return;
+        }
+        self.tombstones.remove(&addr);
+        let client_id = if let Some(client) = self.clients.get_mut(&addr) {
+            client.last_seen = now;
+            if client.hello_nonce != hello.nonce {
+                // Genuine rejoin: stale barrier readiness is void, and the peer needs a welcome.
+                client.hello_nonce = hello.nonce;
+                client.barrier_preroll_ready = false;
+                if client.username.is_empty() {
+                    client.username = hello.username.clone();
+                }
+                if !self.newly_joined_peers.contains(&addr) {
+                    self.newly_joined_peers.push(addr);
+                }
+            }
+            client.client_id
+        } else {
+            if self.clients.len() >= self.max_clients {
+                let reject =
+                    WirePacket::hello_ack(hello.nonce, HelloStatus::HostFull, 0, self.host_epoch);
+                let _ = self.transport.send_packet(&reject, addr);
+                return;
+            }
+            let id = self.alloc_client_id(hello.requested_client_id);
+            let mut session = ClientSession::new(addr, id, 0);
+            session.hello_nonce = hello.nonce;
+            session.username = hello.username.clone();
+            self.clients.insert(addr, session);
+            self.newly_joined_peers.push(addr);
+            id
+        };
+        let ack = WirePacket::hello_ack(
+            hello.nonce,
+            HelloStatus::Accepted,
+            client_id,
+            self.host_epoch,
+        );
+        let _ = self.transport.send_packet(&ack, addr);
+        self.resend_barrier_prepare_to(addr);
+    }
+
+    /// If a barrier is mid-Prepare, (re)sends the Prepare to one peer so a rejoining client can
+    /// answer `BarrierReady` instead of stalling the unpause.
+    fn resend_barrier_prepare_to(&self, addr: SocketAddr) {
+        if self.barrier_prepare_started_at.is_some() {
+            if let Some(target) = self.scheduled_unpause_server_ms {
+                let packet = WirePacket::barrier_prepare(
+                    self.barrier_session_id,
+                    target,
+                    self.barrier_preroll_budget_ms,
+                    false,
+                );
+                let _ = self.transport.send_packet(&packet, addr);
+            }
+        }
+    }
+
+    /// Removes a peer, records it as departed and tells the remaining peers it left.
+    fn remove_client(&mut self, addr: SocketAddr, reason: ByeReason) -> Option<u32> {
+        let client = self.clients.remove(&addr)?;
+        self.newly_joined_peers.retain(|a| *a != addr);
+        self.pending_probes.retain(|_, (a, _)| *a != addr);
+        if reason == ByeReason::Leave {
+            if self.tombstones.len() > 256 {
+                self.tombstones.clear();
+            }
+            self.tombstones.insert(addr, Instant::now());
+        }
+        let notice = WirePacket::bye(ByeReason::Leave, client.client_id);
+        let others: Vec<SocketAddr> = self.clients.keys().copied().collect();
+        for other in others {
+            let _ = self.transport.send_packet(&notice, other);
+        }
+        let id = client.client_id;
+        self.departed.push(DepartedPeer {
+            client_id: id,
+            addr,
+            username: client.username,
+            reason,
+        });
+        Some(id)
+    }
+
+    /// Drains peers that left (`Bye`) or were pruned since the last call.
+    pub fn drain_departed_peers(&mut self) -> Vec<DepartedPeer> {
+        std::mem::take(&mut self.departed)
+    }
+
+    /// Announces that the room is closing (`Bye(HostClosed)`, sent twice against loss) and
+    /// forgets all peers. Call on host shutdown; dropping a `HostServer` sends nothing.
+    pub fn close_room(&mut self) {
+        let bye = WirePacket::bye(ByeReason::HostClosed, 0);
+        let addrs: Vec<SocketAddr> = self.clients.keys().copied().collect();
+        for addr in &addrs {
+            let _ = self.transport.send_packet(&bye, *addr);
+            let _ = self.transport.send_packet(&bye, *addr);
+        }
+        self.clients.clear();
+        self.newly_joined_peers.clear();
+        self.pending_probes.clear();
+    }
+
+    /// Prunes peers silent for longer than `resilience().host_prune_timeout`.
+    pub fn prune_stale(&mut self) -> Vec<u32> {
+        let timeout = self.resilience.host_prune_timeout;
+        self.prune_stale_clients(timeout)
+    }
+
     /// Drains and returns all pending received reactions from connected peers.
     pub fn poll_reactions(&mut self) -> Vec<ReactionPayload> {
         std::mem::take(&mut self.reactions)
@@ -591,20 +836,21 @@ impl HostServer {
     ///
     /// Returns the client IDs of pruned peers.
     pub fn prune_stale_clients(&mut self, timeout: std::time::Duration) -> Vec<u32> {
+        let stale: Vec<SocketAddr> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.last_seen.elapsed() > timeout)
+            .map(|(a, _)| *a)
+            .collect();
         let mut pruned = Vec::new();
-        let mut pruned_addrs = Vec::new();
-        self.clients.retain(|addr, client| {
-            if client.last_seen.elapsed() > timeout {
-                pruned.push(client.client_id);
-                pruned_addrs.push(*addr);
-                false
-            } else {
-                true
+        for addr in stale {
+            // Tell the peer it was dropped so a peer that merely blipped rejoins immediately.
+            let _ = self
+                .transport
+                .send_packet(&WirePacket::bye(ByeReason::Timeout, 0), addr);
+            if let Some(id) = self.remove_client(addr, ByeReason::Timeout) {
+                pruned.push(id);
             }
-        });
-        if !pruned_addrs.is_empty() {
-            self.newly_joined_peers
-                .retain(|a| !pruned_addrs.contains(a));
         }
         pruned
     }
@@ -680,6 +926,7 @@ impl HostServer {
         let room_pkt = self.build_room_state_packet();
         self.transport.send_packet(&room_pkt, peer_addr)?;
         sent_packets += 1;
+        self.resend_barrier_prepare_to(peer_addr);
 
         Ok(sent_packets)
     }
@@ -760,6 +1007,7 @@ impl HostServer {
             compute_target_unpause_server(now_ms, max_rtt, preroll_budget_ms as u64);
 
         self.barrier_session_id = self.barrier_session_id.wrapping_add(1);
+        self.barrier_preroll_budget_ms = preroll_budget_ms;
         self.barrier_prepare_started_at = Some(Instant::now());
         self.scheduled_unpause_server_ms = Some(target_unpause_server_ms);
 
@@ -937,6 +1185,22 @@ pub struct ClientNode {
     pending_peer_statuses: Vec<PeerStatusPayload>,
     probes_sent: usize,
     ntp_accepted_count: usize,
+    link: LinkMachine,
+    join_username: String,
+    cached_status: Option<CachedPeerStatus>,
+    departed_peers: Vec<u32>,
+}
+
+/// Last locally announced peer status, replayed to the host after a rejoin.
+#[derive(Debug, Clone)]
+struct CachedPeerStatus {
+    has_media: bool,
+    is_ready: bool,
+    duration_ms: u64,
+    file_size_bytes: u64,
+    username: String,
+    filename: String,
+    media_hash: [u8; 32],
 }
 
 impl ClientNode {
@@ -986,7 +1250,166 @@ impl ClientNode {
             pending_peer_statuses: Vec::new(),
             probes_sent: 0,
             ntp_accepted_count: 0,
+            link: LinkMachine::new(ResilienceConfig::default(), Instant::now()),
+            join_username: String::new(),
+            cached_status: None,
+            departed_peers: Vec::new(),
         })
+    }
+
+    /// Replaces the resilience timeouts (handshake, heartbeat, silence, back-off).
+    pub fn set_resilience(&mut self, cfg: ResilienceConfig) {
+        self.link.set_config(cfg);
+    }
+
+    /// Builder-style variant of [`ClientNode::set_resilience`].
+    pub fn with_resilience(mut self, cfg: ResilienceConfig) -> Self {
+        self.link.set_config(cfg);
+        self
+    }
+
+    /// Returns the active resilience configuration.
+    pub fn resilience(&self) -> &ResilienceConfig {
+        self.link.config()
+    }
+
+    /// Starts the join handshake: sends `Hello` and moves to `Connecting`.
+    ///
+    /// The state becomes `Connected` only after a `HelloAck`; drive it by calling
+    /// [`ClientNode::poll_and_process`] regularly. Calling it again restarts the attempt
+    /// (manual retry after `Failed`).
+    pub fn begin_join(&mut self, username: &str) {
+        self.join_username = username.to_string();
+        let actions = self.link.begin_join(Instant::now());
+        self.run_link_actions(actions);
+    }
+
+    /// Returns the current link state.
+    pub fn connection_state(&self) -> ClientConnectionState {
+        self.link.state()
+    }
+
+    /// `true` once the host acknowledged the join and the link is healthy.
+    pub fn is_connected(&self) -> bool {
+        self.link.state() == ClientConnectionState::Connected
+    }
+
+    /// `true` while the host reference is stale (`Reconnecting`): PLL steering and snap-seeks
+    /// must be suspended and local playback simply continues at the nominal rate.
+    pub fn is_link_stale(&self) -> bool {
+        matches!(
+            self.link.state(),
+            ClientConnectionState::Reconnecting { .. }
+        )
+    }
+
+    /// `true` if the host is a v0.4 peer without handshake (implicit-join fallback).
+    pub fn is_legacy_host(&self) -> bool {
+        self.link.is_legacy()
+    }
+
+    /// Time until the next reconnect attempt while `Reconnecting`.
+    pub fn reconnect_retry_in(&self) -> Option<Duration> {
+        self.link.retry_in(Instant::now())
+    }
+
+    /// Random identifier of the host run learnt from the last `HelloAck`.
+    pub fn host_epoch(&self) -> Option<u32> {
+        self.link.host_epoch()
+    }
+
+    /// Drains connection events (state changes, legacy fallback notice, rejoin notices).
+    pub fn poll_connection_events(&mut self) -> Vec<ConnectionEvent> {
+        self.link.drain_events()
+    }
+
+    /// Drains ids of room peers the host reported as departed.
+    pub fn poll_departed_peers(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.departed_peers)
+    }
+
+    /// Leaves the room explicitly: sends `Bye` (twice, against loss) and moves to `Closed`.
+    pub fn leave(&mut self) {
+        if matches!(
+            self.link.state(),
+            ClientConnectionState::Failed(_) | ClientConnectionState::Closed(_)
+        ) {
+            return;
+        }
+        let bye = WirePacket::bye(ByeReason::Leave, self.client_id);
+        let _ = self.transport.send_packet(&bye, self.host_addr);
+        let _ = self.transport.send_packet(&bye, self.host_addr);
+        self.link.leave();
+    }
+
+    /// Advances connection timers (heartbeat, retransmit, silence, back-off).
+    ///
+    /// Called automatically at the end of every [`ClientNode::poll_and_process`].
+    pub fn tick(&mut self) {
+        let actions = self.link.tick(Instant::now());
+        self.run_link_actions(actions);
+    }
+
+    fn run_link_actions(&mut self, actions: Vec<LinkAction>) {
+        for action in actions {
+            match action {
+                LinkAction::Hello { nonce } => {
+                    let pkt = WirePacket::hello(nonce, self.client_id, self.join_username.clone());
+                    let _ = self.transport.send_packet(&pkt, self.host_addr);
+                }
+                LinkAction::Heartbeat(seq) => {
+                    let _ = self
+                        .transport
+                        .send_packet(&WirePacket::heartbeat(seq, false), self.host_addr);
+                }
+                LinkAction::HeartbeatReply(seq) => {
+                    let _ = self
+                        .transport
+                        .send_packet(&WirePacket::heartbeat(seq, true), self.host_addr);
+                }
+                LinkAction::LegacyProbe => {
+                    let _ = self.send_ntp_probe();
+                }
+                LinkAction::AdoptClientId(id) => {
+                    if id != 0 {
+                        self.client_id = id;
+                    }
+                }
+                LinkAction::Rejoin { host_restarted } => self.restore_after_rejoin(host_restarted),
+            }
+        }
+    }
+
+    /// Resets reference state that is invalid after an outage and replays local state.
+    fn restore_after_rejoin(&mut self, host_restarted: bool) {
+        // A restarted host restarts its room sequence and clock: stale values must not
+        // out-vote the fresh snapshot.
+        self.latest_room_state = None;
+        self.pll.reset();
+        self.barrier = BarrierStateMachine::default();
+        self.scheduled_unpause_local_ms = None;
+        self.pending_probes.clear();
+        self.peer_statuses.clear();
+        if host_restarted {
+            self.filter = Rfc5905Filter::default();
+            self.ntp_accepted_count = 0;
+            self.probes_sent = 0;
+        }
+        if let Some(st) = self.cached_status.clone() {
+            let packet = WirePacket::peer_status_with_hash(
+                self.client_id,
+                st.has_media,
+                st.is_ready,
+                st.duration_ms,
+                st.file_size_bytes,
+                st.username,
+                st.filename,
+                st.media_hash,
+            );
+            let _ = self.transport.send_packet(&packet, self.host_addr);
+        }
+        let _ = self.send_ntp_probe();
+        let _ = self.request_sync_snapshot();
     }
 
     /// Binds a new `ClientNode` using the address family matching `server_addr` (`[::]:0` vs `0.0.0.0:0`).
@@ -1118,9 +1541,10 @@ impl ClientNode {
         is_playing: bool,
         initial_sync_locked: bool,
     ) -> bool {
-        (!initial_sync_locked && drift_ms > 40)
-            || (!is_playing && drift_ms > 40)
-            || drift_ms > 1500
+        !self.is_link_stale()
+            && ((!initial_sync_locked && drift_ms > 40)
+                || (!is_playing && drift_ms > 40)
+                || drift_ms > 1500)
     }
 
     /// Returns the estimated filtered clock offset $\hat{\theta}$ in nanoseconds from the RFC 5905 filter.
@@ -1174,6 +1598,8 @@ impl ClientNode {
         let res = self.transport.poll_packet()?;
         if let Some((ref packet, addr)) = res {
             if addr == self.host_addr {
+                let actions = self.link.on_host_packet(Instant::now(), packet);
+                self.run_link_actions(actions);
                 match &packet.payload {
                     PacketPayload::NtpProbeResponse(resp) => {
                         let t1 = self
@@ -1250,10 +1676,18 @@ impl ClientNode {
                     PacketPayload::Reaction(reaction) => {
                         self.reactions.push(reaction.clone());
                     }
+                    PacketPayload::Bye(bye)
+                        if bye.reason == ByeReason::Leave && bye.client_id != self.client_id =>
+                    {
+                        // Host relays "peer X left" so room lists drop departed peers.
+                        self.peer_statuses.remove(&bye.client_id);
+                        self.departed_peers.push(bye.client_id);
+                    }
                     _ => {}
                 }
             }
         }
+        self.tick();
         Ok(res.map(|(p, _)| p))
     }
 
@@ -1291,6 +1725,15 @@ impl ClientNode {
             .and_then(|n| n.to_str())
             .unwrap_or(filename);
 
+        self.cached_status = Some(CachedPeerStatus {
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username: username.to_string(),
+            filename: clean_filename.to_string(),
+            media_hash,
+        });
         let packet = WirePacket::peer_status_with_hash(
             self.client_id,
             has_media,
@@ -1342,6 +1785,15 @@ impl ClientNode {
             .and_then(|n| n.to_str())
             .unwrap_or(filename);
 
+        self.cached_status = Some(CachedPeerStatus {
+            has_media,
+            is_ready,
+            duration_ms,
+            file_size_bytes,
+            username: username.to_string(),
+            filename: clean_filename.to_string(),
+            media_hash: [0u8; 32],
+        });
         let packet = WirePacket::peer_status(
             self.client_id,
             has_media,
@@ -1424,6 +1876,15 @@ impl ClientNode {
         let room = self.latest_room_state.as_ref()?;
         if room.is_paused {
             return None;
+        }
+        if self.is_link_stale() {
+            // Stale reference: never steer or seek against it; hold the nominal rate.
+            return Some(PllCorrection {
+                speed_multiplier: room.r_target,
+                hard_seek_target: None,
+                phase_error_ms: 0.0,
+                zone: PllZone::Deadband,
+            });
         }
 
         let theta_hat = self.filter.get_filtered_offset().unwrap_or(0.0);

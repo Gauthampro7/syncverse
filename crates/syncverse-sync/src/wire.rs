@@ -5,7 +5,7 @@
 use syncverse_common::Crc32;
 
 use crate::crypto::RoomCryptoSession;
-use crate::error::SyncError;
+use crate::error::{CryptoErrorKind, SyncError};
 
 /// 4-byte magic signature for SyncPlay Network Transport.
 pub const WIRE_MAGIC: [u8; 4] = *b"SPNT";
@@ -1024,9 +1024,7 @@ impl WirePacket {
         }
 
         if (flags & FLAG_ENCRYPTED) != 0 {
-            let crypto_sess = crypto.ok_or_else(|| {
-                SyncError::Crypto("Received encrypted packet but room password is not configured".to_string())
-            })?;
+            let crypto_sess = crypto.ok_or(SyncError::Crypto(CryptoErrorKind::MissingRoomKey))?;
 
             if payload_slice.len() < 8 + crate::crypto::AEAD_TAG_LEN {
                 return Err(SyncError::MalformedPayload(
@@ -1051,9 +1049,7 @@ impl WirePacket {
             })
         } else {
             if crypto.is_some() {
-                return Err(SyncError::Crypto(
-                    "Unencrypted packet rejected on encrypted room session".to_string(),
-                ));
+                return Err(SyncError::Crypto(CryptoErrorKind::PlaintextRejected));
             }
             let payload = PacketPayload::deserialize(packet_type, payload_slice)?;
             Ok(WirePacket {
