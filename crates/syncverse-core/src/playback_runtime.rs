@@ -2709,6 +2709,11 @@ pub fn run_playback_worker(
                 PlayerCommand::SetAudioStereoPan(pan) => {
                     let _ = audio_tx.send(AudioWorkerCommand::SetStereoPan(pan));
                 }
+                // v0.5.0 scaffold: no behaviour yet (nat / resume work packages).
+                PlayerCommand::DetectPublicAddress
+                | PlayerCommand::PunchPeer(_)
+                | PlayerCommand::ResumeAccept
+                | PlayerCommand::ResumeDecline => {}
             }
         }
 

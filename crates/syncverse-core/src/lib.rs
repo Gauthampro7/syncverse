@@ -7,9 +7,11 @@
 pub mod aggregator;
 pub mod audio_sink;
 pub mod coordinator;
+pub mod frame_step;
 pub mod error;
 pub mod interactive;
 pub mod playback_runtime;
+pub mod resume;
 mod subtitle_runtime;
 mod sync_runtime;
 

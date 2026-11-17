@@ -1335,6 +1335,10 @@ impl SyncverseApp {
                         self.play_next_file(now);
                     }
                 }
+                // v0.5.0 scaffold: handled by later work packages (nat, party state, resume).
+                UiEvent::NatReport { .. }
+                | UiEvent::PartyConnectionState { .. }
+                | UiEvent::ResumeAvailable { .. } => {}
             }
         }
 

@@ -215,7 +215,11 @@ impl PlayerCoordinator {
             | PlayerCommand::SetLoop(_)
             | PlayerCommand::SetAudioEqualizer(_)
             | PlayerCommand::SetAudioCompressor { .. }
-            | PlayerCommand::SetAudioStereoPan(_) => {
+            | PlayerCommand::SetAudioStereoPan(_)
+            | PlayerCommand::DetectPublicAddress
+            | PlayerCommand::PunchPeer(_)
+            | PlayerCommand::ResumeAccept
+            | PlayerCommand::ResumeDecline => {
                 // Handled in watch-party networking integration / playback runtime
             }
         }

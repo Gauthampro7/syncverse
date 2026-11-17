@@ -5,6 +5,7 @@
 #![deny(unsafe_code)]
 
 pub mod crc;
+pub mod userdata;
 pub mod error;
 pub mod path;
 pub mod reader;

@@ -60,9 +60,96 @@ pub enum TrackSubtitleEvent {
     },
 }
 
+/// Coarse NAT behaviour classification derived from STUN probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatKind {
+    /// Not yet probed, or probing produced no usable answer.
+    Unknown,
+    /// Host has a public address (no NAT in the path).
+    Open,
+    /// Endpoint-independent mapping: hole punching is expected to work.
+    EndpointIndependent,
+    /// Address/port-dependent (symmetric) mapping: hole punching is unlikely to work.
+    Symmetric,
+}
+
+/// Why a NAT probe failed.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum NatProbeError {
+    /// No STUN server answered before the timeout.
+    #[error("no STUN server responded")]
+    NoResponse,
+    /// A STUN server answered with a malformed or unsupported message.
+    #[error("malformed STUN response")]
+    BadResponse,
+    /// Local socket error while probing (OS error description).
+    #[error("socket error: {0}")]
+    Socket(String),
+}
+
+/// Why a party connection attempt failed.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum PartyFailReason {
+    /// The host did not acknowledge the handshake in time.
+    #[error("host did not respond")]
+    HandshakeTimeout,
+    /// The host address could not be parsed or resolved.
+    #[error("invalid host address")]
+    InvalidAddress,
+    /// The host stopped responding after a successful connection and retries ran out.
+    #[error("host lost")]
+    HostLost,
+    /// Local socket error (OS error description).
+    #[error("socket error: {0}")]
+    Socket(String),
+}
+
+/// Verified client-side connection state of the watch-party link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartyConnectionState {
+    /// Handshake sent, waiting for the host acknowledgement.
+    Connecting,
+    /// Host acknowledged; the link is alive.
+    Connected,
+    /// Host went silent; retrying. `attempt` starts at 1.
+    Reconnecting {
+        /// 1-based retry attempt counter.
+        attempt: u32,
+    },
+    /// Gave up; see `reason`.
+    Failed {
+        /// Cause of the failure.
+        reason: PartyFailReason,
+    },
+    /// Cleanly closed (local leave or host Bye).
+    Closed,
+}
+
 /// Events delivered from the background engine to the graphical UI thread.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
+    /// Result of a STUN / NAT probe started by [`crate::PlayerCommand::DetectPublicAddress`].
+    NatReport {
+        /// Classified NAT behaviour (`NatKind::Unknown` when `error` is set).
+        kind: NatKind,
+        /// Public endpoint as a `"ip:port"` string, if discovered.
+        public_addr: Option<String>,
+        /// Probe failure, if any.
+        error: Option<NatProbeError>,
+    },
+    /// Client-side watch-party connection state changed.
+    PartyConnectionState {
+        /// The new state.
+        state: PartyConnectionState,
+    },
+    /// A saved position exists for the loaded file; UI should offer to resume, answering with
+    /// [`crate::PlayerCommand::ResumeAccept`] or [`crate::PlayerCommand::ResumeDecline`].
+    ResumeAvailable {
+        /// Saved playback position in milliseconds.
+        pos_ms: u64,
+        /// Media duration in milliseconds (`0` if unknown).
+        duration_ms: u64,
+    },
     /// New chat message to append to the sidebar chat history.
     NewChatRecord(ChatRecord),
     /// Updated list of watch-party room members.

@@ -5,6 +5,7 @@
 
 pub mod audio;
 pub mod color;
+pub mod hwaccel;
 pub mod error;
 pub mod frame;
 pub mod h264;

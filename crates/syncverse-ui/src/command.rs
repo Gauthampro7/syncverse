@@ -5,6 +5,16 @@ use std::path::PathBuf;
 /// Command emitted by the UI event thread into the command queue or coordinator channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerCommand {
+    /// Ask the runtime to discover this machine's public UDP endpoint via STUN; the result is
+    /// reported asynchronously as [`crate::UiEvent::NatReport`].
+    DetectPublicAddress,
+    /// Start UDP hole punching towards a peer given as a `"host:port"` socket-address string
+    /// (typically the peer's public endpoint from its NAT report).
+    PunchPeer(String),
+    /// Accept the offer raised by [`crate::UiEvent::ResumeAvailable`]: seek to the offered position.
+    ResumeAccept,
+    /// Decline the resume offer and start from the beginning (the saved position is discarded).
+    ResumeDecline,
     /// Toggle playback between Playing and Paused.
     TogglePause,
     /// Seek presentation to target PTS in milliseconds.

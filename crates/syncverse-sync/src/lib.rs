@@ -10,9 +10,11 @@ pub mod crypto;
 pub mod error;
 pub mod fingerprint;
 pub mod host;
+pub mod nat;
 pub mod ntp;
 pub mod pll;
 pub mod timeline;
+pub mod stun;
 pub mod transport;
 pub mod upnp;
 pub mod wire;
@@ -22,6 +24,10 @@ pub use crypto::RoomCryptoSession;
 pub use error::SyncError;
 pub use fingerprint::{MediaFingerprint, MediaMatchStatus};
 pub use ntp::{ProbeSample, Rfc5905Filter};
+#[allow(unused_imports)] // scaffold: module is empty until the NAT work package lands
+pub use nat::*;
+#[allow(unused_imports)] // scaffold: module is empty until the NAT work package lands
+pub use stun::*;
 pub use pll::{PllCorrection, PllSpeedController, PllZone};
 pub use timeline::RoomState;
 pub use transport::{ClientNode, ClientSession, HostServer, UdpSyncTransport};
